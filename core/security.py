@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import string
@@ -16,30 +17,42 @@ BCRYPT_MAX_PASSWORD_BYTES = 72
 
 
 class PasswordHasher:
-    """Wraps password hashing/verification so callers never touch bcrypt directly."""
+    """Wraps password hashing/verification so callers never touch bcrypt directly.
+
+    bcrypt is deliberately CPU-slow (~100ms+ per call), so hash()/verify() are
+    async and run the actual work in a worker thread via asyncio.to_thread -
+    calling bcrypt inline on the event loop would stall every other in-flight
+    request on this worker for the duration of each hash/verify.
+    """
 
     def __init__(self) -> None:
         self._context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-    def hash(self, plain_password: str) -> str:
-        if not isinstance(plain_password, str) or not plain_password:
-            raise ValueError("Password must be a non-empty string")
-        if len(plain_password.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
-            raise ValueError(f"Password must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes long")
+    def _hash_sync(self, plain_password: str) -> str:
         try:
             return self._context.hash(plain_password)
         except (ValueError, PasslibSecurityError) as exc:
             logger.error("Password hashing failed", exc_info=True)
             raise ValueError("Could not process this password") from exc
 
-    def verify(self, plain_password: str, password_hash: str) -> bool:
-        if not plain_password or not password_hash:
-            return False
+    def _verify_sync(self, plain_password: str, password_hash: str) -> bool:
         try:
             return self._context.verify(plain_password, password_hash)
         except (ValueError, PasslibSecurityError):
             logger.warning("Password verification failed due to malformed hash or input", exc_info=True)
             return False
+
+    async def hash(self, plain_password: str) -> str:
+        if not isinstance(plain_password, str) or not plain_password:
+            raise ValueError("Password must be a non-empty string")
+        if len(plain_password.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+            raise ValueError(f"Password must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes long")
+        return await asyncio.to_thread(self._hash_sync, plain_password)
+
+    async def verify(self, plain_password: str, password_hash: str) -> bool:
+        if not plain_password or not password_hash:
+            return False
+        return await asyncio.to_thread(self._verify_sync, plain_password, password_hash)
 
 
 class JWTHandler:

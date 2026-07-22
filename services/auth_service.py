@@ -49,7 +49,7 @@ class AuthService:
             raise ConflictError("An account with this email already exists")
 
         try:
-            password_hash = self._password_hasher.hash(password)
+            password_hash = await self._password_hasher.hash(password)
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
 
@@ -79,7 +79,7 @@ class AuthService:
             raise ValidationError("Email and password are required")
 
         user = await self._users.get_by_email(email)
-        if user is None or not self._password_hasher.verify(password, user.password_hash):
+        if user is None or not await self._password_hasher.verify(password, user.password_hash):
             raise UnauthorizedError("Invalid email or password")
         if not user.is_active:
             raise UnauthorizedError("This account has been disabled")
