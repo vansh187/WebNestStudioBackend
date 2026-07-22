@@ -6,6 +6,8 @@ All paths below are relative to this base URL. All request/response bodies are J
 
 > **Note:** This is a free Render instance, so the first request after idle time can take 30-50 seconds while the server spins up ("cold start"). Retry once if the first request times out.
 
+> **⚠️ Email verification is temporarily OFF** (sending domain pending). Right now: `POST /api/auth/signup` returns an account with `is_verified: true` immediately, and you can call `POST /api/auth/login` right after signup with no OTP step at all. `verify-otp` / `resend-otp` will return a `422` explaining they're disabled if called. This will be re-enabled once the domain is ready — build the signup → verify-otp → login flow in the UI as normal, it'll just be a no-op for verify-otp until then.
+
 ---
 
 ## Authentication
@@ -18,7 +20,7 @@ Authorization: Bearer <access_token>
 
 Get `access_token` from `POST /api/auth/login` (or `/api/auth/refresh`). Access tokens expire in **15 minutes** — use the refresh token to get a new one. Refresh tokens last **30 days**.
 
-**Login requires a verified, active account.** If a user hasn't completed OTP verification, login returns `401`.
+**Login requires a verified, active account** (currently suspended — see the email-verification note above). If a user hasn't completed OTP verification, login returns `401` once verification is re-enabled.
 
 ---
 

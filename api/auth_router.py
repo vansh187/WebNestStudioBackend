@@ -27,9 +27,10 @@ async def signup(
     email_service: EmailService = Depends(get_email_service),
 ) -> User:
     user, otp_code = await auth_service.signup(payload.full_name, payload.email, payload.phone_number, payload.password)
-    # Sending the OTP email is a slow, best-effort network call - it must never
-    # block this response (Render's outbound SMTP can hang for tens of seconds).
-    background_tasks.add_task(email_service.send_otp_email, user.email, otp_code, "signup")
+    if otp_code is not None:
+        # Sending the OTP email is a slow, best-effort network call - it must never
+        # block this response (Render's outbound SMTP can hang for tens of seconds).
+        background_tasks.add_task(email_service.send_otp_email, user.email, otp_code, "signup")
     return user
 
 

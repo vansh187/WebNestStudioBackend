@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
     otp_expire_minutes: int = 10
 
+    # Temporary switch while the sending domain is pending at the registrar:
+    # False disables all outbound email (OTP + lead notifications) and makes
+    # signup auto-verify accounts / login skip the verification check, so the
+    # product keeps working without email. Flip to True (env var only, no
+    # code change) once the domain is verified with the email provider.
+    email_enabled: bool = False
+
     resend_api_key: str = ""
     resend_from_address: str = "onboarding@resend.dev"
     team_notification_email: str = ""

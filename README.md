@@ -80,10 +80,13 @@ Health check: `GET /health` -> `{"status": "ok"}`.
 
 ## Authentication
 
+> **Email verification is currently disabled (`EMAIL_ENABLED=false` in `.env`)** while the sending domain is pending at the registrar. While disabled: signup auto-verifies every account immediately (no OTP is created or sent), login never checks `is_verified`, and `POST /api/auth/verify-otp` / `POST /api/auth/resend-otp` both return a clear `422` explaining verification is off rather than doing anything. **Set `EMAIL_ENABLED=true`** (env var only, no code change) once the domain is verified with Resend to restore the full OTP flow described below.
+
 - Signup issues a 6-digit email OTP (10 min expiry) and creates the user as unverified.
 - `POST /api/auth/verify-otp` marks the account verified.
+- `POST /api/auth/resend-otp` issues a fresh OTP for an account whose original code expired (rate-limited to 1 per 60s per email).
 - Login returns a short-lived access token (15 min, JWT) and a long-lived refresh token (30 days). The refresh token is only ever stored server-side as a SHA-256 hash (`refresh_tokens` table) and rotates on every `/api/auth/refresh` call.
-- **Login requires a verified, active account** — an unverified email or a disabled (`is_active=false`) account gets a 401 with a specific message rather than a token.
+- **Login requires a verified, active account** — an unverified email or a disabled (`is_active=false`) account gets a 401 with a specific message rather than a token. (Suspended while `EMAIL_ENABLED=false`, see above.)
 - Protected endpoints expect `Authorization: Bearer <access_token>`.
 - Roles: `client`, `admin`, `editor` (only `client`/`admin` are enforced by route guards currently — see `core/dependencies.py: RoleChecker`).
 

@@ -37,6 +37,11 @@ class EmailService:
         return "resend", self._settings.resend_from_address, self.is_configured()
 
     async def _send(self, to_address: str, subject: str, body: str) -> tuple[bool, str]:
+        if not self._settings.email_enabled:
+            message = "Skipping email: EMAIL_ENABLED is false (email temporarily disabled)"
+            logger.info("%s (to=%s)", message, to_address)
+            return False, message
+
         if not self.is_configured():
             message = "Skipping email: RESEND_API_KEY is not configured"
             logger.warning("%s (to=%s)", message, to_address)

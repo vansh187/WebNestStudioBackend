@@ -45,7 +45,7 @@ class AuthService:
             raise ValidationError("A valid token string is required")
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    async def signup(self, full_name: str | None, email: str, phone_number: str | None, password: str) -> tuple[User, str]:
+    async def signup(self, full_name: str | None, email: str, phone_number: str | None, password: str) -> tuple[User, str | None]:
         existing = await self._users.get_by_email(email)
         if existing is not None:
             raise ConflictError("An account with this email already exists")
@@ -57,11 +57,20 @@ class AuthService:
 
         user = await self._users.create(full_name, email, phone_number, password_hash)
 
+        if not self._settings.email_enabled:
+            # Email verification is temporarily disabled (e.g. sending domain
+            # pending) - auto-verify so the account is usable immediately.
+            user = await self._users.mark_verified(user)
+            return user, None
+
         otp_code = self._otp_generator.generate_code()
         await self._otps.create(email=email, otp_code=otp_code, purpose="signup", expires_at=self._otp_generator.expiry(), user_id=user.id)
         return user, otp_code
 
     async def verify_otp(self, email: str, otp_code: str, purpose: str = "signup") -> User:
+        if not self._settings.email_enabled:
+            raise ValidationError("Email verification is currently disabled; accounts are auto-verified at signup")
+
         otp = await self._otps.get_latest_active(email, purpose)
         if otp is None or otp.otp_code != otp_code:
             raise ValidationError("Invalid or expired OTP code")
@@ -78,7 +87,10 @@ class AuthService:
         """Issues a fresh OTP for an existing account (e.g. the original signup
         code expired before the user could verify). Rate-limited per email+purpose
         to stop a resend loop from spamming the recipient's inbox or exhausting
-        the SMTP provider's send limits."""
+        the email provider's send limits."""
+        if not self._settings.email_enabled:
+            raise ValidationError("Email verification is currently disabled; accounts are auto-verified at signup")
+
         user = await self._users.get_by_email(email)
         if user is None:
             raise NotFoundError("No account found for this email")
@@ -109,7 +121,7 @@ class AuthService:
             raise UnauthorizedError("Invalid email or password")
         if not user.is_active:
             raise UnauthorizedError("This account has been disabled")
-        if not user.is_verified:
+        if self._settings.email_enabled and not user.is_verified:
             raise UnauthorizedError("Please verify your email address before logging in")
 
         try:
