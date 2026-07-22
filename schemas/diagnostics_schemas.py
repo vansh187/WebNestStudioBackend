@@ -8,7 +8,7 @@ class EmailTestRequest(BaseModel):
 class EmailTestResponse(BaseModel):
     sent: bool
     to_address: str
-    smtp_host: str
-    smtp_port: int
-    smtp_user_configured: bool
+    provider: str
+    from_address: str
+    api_key_configured: bool
     detail: str

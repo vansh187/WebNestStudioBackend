@@ -744,25 +744,37 @@ Upserts (creates or updates) a client's project status.
 ### Email diagnostics
 
 #### `POST /api/admin/test-email`
-Synchronously attempts an SMTP send and reports the real result — unlike signup/lead-capture (where email is fire-and-forget in the background), this endpoint waits for the actual attempt so you can verify SMTP delivery end-to-end without needing server log access.
+Synchronously attempts a real send via Resend and reports the actual result — unlike signup/lead-capture (where email is fire-and-forget in the background), this endpoint waits for the attempt so you can verify email delivery end-to-end without needing server log access.
 
-**Request** (`to_address` optional — defaults to the configured `SMTP_USER`)
+**Request** (`to_address` optional — defaults to the configured `RESEND_FROM_ADDRESS`)
 ```json
 { "to_address": "someone@example.com" }
 ```
 
-**Response `200`**
+**Response `200`** — success
 ```json
 {
   "sent": true,
   "to_address": "someone@example.com",
-  "smtp_host": "smtp.gmail.com",
-  "smtp_port": 587,
-  "smtp_user_configured": true,
+  "provider": "resend",
+  "from_address": "onboarding@resend.dev",
+  "api_key_configured": true,
   "detail": "Email sent successfully."
 }
 ```
-If `sent` is `false`, `detail` explains why (not configured, or check server logs under the `webnest.email` logger for the exact SMTP error).
+
+**Response `200`** — failure (the `detail` field carries Resend's own error message, e.g. sandbox-mode recipient restriction)
+```json
+{
+  "sent": false,
+  "to_address": "someone@example.com",
+  "provider": "resend",
+  "from_address": "onboarding@resend.dev",
+  "api_key_configured": true,
+  "detail": "Resend API returned HTTP 403: {\"statusCode\":403,\"name\":\"validation_error\",\"message\":\"You can only send testing emails to your own email address...\"}"
+}
+```
+Note: with the sandbox sender (`onboarding@resend.dev`), Resend only delivers to the email address the Resend account itself was registered with — every other recipient gets rejected until a domain is verified at resend.com/domains.
 
 ---
 

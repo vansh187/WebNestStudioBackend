@@ -1,83 +1,88 @@
 import logging
-import smtplib
 import time
-from email.mime.text import MIMEText
+
+import httpx
 
 from core.config import Settings
 
 logger = logging.getLogger("webnest.email")
 
+RESEND_API_URL = "https://api.resend.com/emails"
+REQUEST_TIMEOUT_SECONDS = 10.0
+
 
 class EmailService:
-    """Sends transactional emails (OTP, lead notifications) over SMTP.
+    """Sends transactional emails (OTP, lead notifications) via the Resend HTTP API.
 
-    Delivery is best-effort: a broken SMTP config or a transient send failure
-    must never fail the request that triggered it (signup, lead capture).
-    Every attempt is logged (skip / success / failure) so delivery problems
-    are visible in the server logs even though the caller never sees them.
+    Uses plain HTTPS (port 443) rather than raw SMTP - some hosts (Render's
+    free tier included) throttle or block outbound SMTP ports (25/465/587),
+    which previously caused OTP emails to silently fail to send in production
+    even though the exact same credentials worked from a local machine.
+
+    Delivery is best-effort: a bad API key, network failure, or Resend outage
+    is logged and swallowed so signup/lead-capture never fails because of a
+    downstream email problem. Every attempt is logged (skip / success /
+    failure) with the real reason, so delivery problems are diagnosable from
+    server logs even though the caller never sees them.
     """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def default_from_address(self) -> str:
-        return self._settings.smtp_from_address or self._settings.smtp_user
-
     def is_configured(self) -> bool:
-        return bool(self._settings.smtp_user and self._settings.smtp_app_password)
+        return bool(self._settings.resend_api_key)
 
-    def connection_summary(self) -> tuple[str, int, bool]:
-        """Returns (host, port, is_configured) for diagnostics - never exposes the password."""
-        return self._settings.smtp_host, self._settings.smtp_port, self.is_configured()
+    def connection_summary(self) -> tuple[str, str, bool]:
+        """Returns (provider, from_address, is_configured) for diagnostics - never exposes the API key."""
+        return "resend", self._settings.resend_from_address, self.is_configured()
 
-    def _send(self, to_address: str, subject: str, body: str) -> bool:
-        if not self._settings.smtp_user or not self._settings.smtp_app_password:
-            logger.warning(
-                "Skipping email to %s: SMTP_USER or SMTP_APP_PASSWORD is not configured", to_address
-            )
-            return False
+    async def _send(self, to_address: str, subject: str, body: str) -> tuple[bool, str]:
+        if not self.is_configured():
+            message = "Skipping email: RESEND_API_KEY is not configured"
+            logger.warning("%s (to=%s)", message, to_address)
+            return False, message
 
-        message = MIMEText(body)
-        message["Subject"] = subject
-        message["From"] = self._settings.smtp_from_address or self._settings.smtp_user
-        message["To"] = to_address
-
-        logger.info(
-            "Sending email to %s via %s:%s (subject=%r)",
-            to_address,
-            self._settings.smtp_host,
-            self._settings.smtp_port,
-            subject,
-        )
+        logger.info("Sending email to %s via Resend (subject=%r)", to_address, subject)
         started_at = time.monotonic()
+        payload = {
+            "from": self._settings.resend_from_address,
+            "to": [to_address],
+            "subject": subject,
+            "text": body,
+        }
+        headers = {"Authorization": f"Bearer {self._settings.resend_api_key}"}
         try:
-            with smtplib.SMTP(self._settings.smtp_host, self._settings.smtp_port, timeout=10) as server:
-                server.starttls()
-                server.login(self._settings.smtp_user, self._settings.smtp_app_password)
-                server.send_message(message)
-            logger.info("Email sent to %s in %.2fs", to_address, time.monotonic() - started_at)
-            return True
-        except smtplib.SMTPAuthenticationError:
-            logger.error(
-                "SMTP authentication rejected for %s after %.2fs - check SMTP_USER/SMTP_APP_PASSWORD "
-                "(Gmail requires a 16-character App Password, not the account password)",
-                self._settings.smtp_user,
-                time.monotonic() - started_at,
-                exc_info=True,
-            )
-            return False
-        except (smtplib.SMTPException, OSError, TimeoutError):
-            logger.warning(
-                "Failed to send email to %s after %.2fs", to_address, time.monotonic() - started_at, exc_info=True
-            )
-            return False
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                response = await client.post(RESEND_API_URL, json=payload, headers=headers)
+            elapsed = time.monotonic() - started_at
 
-    def send_otp_email(self, to_address: str, otp_code: str, purpose: str) -> bool:
+            if response.status_code in (200, 201):
+                logger.info("Email sent to %s via Resend in %.2fs", to_address, elapsed)
+                return True, "Email sent successfully."
+
+            error_body = response.text[:500]
+            logger.error(
+                "Resend rejected email to %s after %.2fs: HTTP %s - %s",
+                to_address,
+                elapsed,
+                response.status_code,
+                error_body,
+            )
+            return False, f"Resend API returned HTTP {response.status_code}: {error_body}"
+        except httpx.TimeoutException:
+            logger.warning("Resend request to send email to %s timed out after %.2fs", to_address, time.monotonic() - started_at)
+            return False, "Resend API request timed out"
+        except httpx.HTTPError as exc:
+            logger.warning("Resend request failed for %s: %s", to_address, exc, exc_info=True)
+            return False, f"Resend API request failed: {exc}"
+
+    async def send_otp_email(self, to_address: str, otp_code: str, purpose: str) -> bool:
         subject = "Your WebNest Studio verification code"
         body = f"Your one-time code for {purpose.replace('_', ' ')} is: {otp_code}\nThis code expires in {self._settings.otp_expire_minutes} minutes."
-        return self._send(to_address, subject, body)
+        sent, _detail = await self._send(to_address, subject, body)
+        return sent
 
-    def send_lead_notification_email(
+    async def send_lead_notification_email(
         self,
         full_name: str | None,
         email: str | None,
@@ -96,4 +101,12 @@ class EmailService:
             f"Source: {source}\n"
             f"Message: {message}"
         )
-        return self._send(self._settings.team_notification_email, subject, body)
+        sent, _detail = await self._send(self._settings.team_notification_email, subject, body)
+        return sent
+
+    async def send_test_email(self, to_address: str) -> tuple[bool, str]:
+        """Like send_otp_email, but surfaces the real success/failure detail -
+        used by the admin test-email diagnostic endpoint."""
+        subject = "WebNest Studio - test email"
+        body = "This is a test email from the WebNest Studio backend to verify email delivery is working."
+        return await self._send(to_address, subject, body)

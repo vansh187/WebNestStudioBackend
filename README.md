@@ -54,20 +54,18 @@ ACCESS_TOKEN_EXPIRE_MINUTES=15
 REFRESH_TOKEN_EXPIRE_DAYS=30
 OTP_EXPIRE_MINUTES=10
 
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=
-SMTP_APP_PASSWORD=
-SMTP_FROM_ADDRESS=
+RESEND_API_KEY=<your Resend API key>
+RESEND_FROM_ADDRESS=onboarding@resend.dev
 TEAM_NOTIFICATION_EMAIL=
 
 CORS_ORIGINS=*
 ```
 
 - `SUPABASE_URL` may be given with or without a `postgresql://` scheme — `core/config.py` normalizes it and rewrites it to the `postgresql+asyncpg://` driver automatically.
-- SMTP is optional in development: if `SMTP_USER`/`SMTP_APP_PASSWORD` are blank, or the send fails for any reason, `EmailService` logs a warning and the triggering request still succeeds (signup/lead creation are never blocked by email delivery).
-- Gmail's `SMTP_APP_PASSWORD` must be a 16-character **App Password** (Google Account → Security → App Passwords, requires 2-Step Verification), never the account's normal login password — Gmail rejects the latter with a `535` auth error.
-- Email is sent via FastAPI `BackgroundTasks` **after** the response is returned, never inline in the request. Some hosts (Render's free tier included) throttle or block outbound SMTP (ports 587/465/25); before this change a blocked/slow SMTP connection could hang the whole signup or lead-capture request. Now the API responds immediately regardless of SMTP health — a stuck SMTP connection only delays (or silently drops, after a 10s timeout) the email, never the HTTP response. If OTP emails still aren't arriving in production, check Render's outbound network policy, or switch to an HTTPS-based provider (Resend, SendGrid, Postmark) instead of raw SMTP.
+- Email (OTP + lead notifications) is sent via the **Resend HTTP API** (`api.resend.com`, plain HTTPS on port 443) — not raw SMTP. Render's free tier (and many other hosts) throttle/block outbound SMTP ports (25/465/587); a live test against the deployed Render instance confirmed `smtplib` sends silently failed there even with correct Gmail credentials, while the exact same call succeeded from a local machine. Switching to an HTTPS-based provider sidesteps that entirely.
+- **`RESEND_FROM_ADDRESS=onboarding@resend.dev` is Resend's sandbox sender and only works for testing** — in that mode Resend will only actually deliver to the email address the Resend account itself was registered with, and rejects every other recipient with a 403 (confirmed: rejects `example.com`-style test addresses outright, and returns an explicit "you can only send to your own email" error for real ones). **Before this can send OTPs to real signup users, verify a domain at [resend.com/domains](https://resend.com/domains) and set `RESEND_FROM_ADDRESS` to an address on that domain** (e.g. `noreply@yourdomain.com`).
+- Email is best-effort and non-blocking: if `RESEND_API_KEY` is blank, or the send fails for any reason, `EmailService` logs the exact reason and the triggering request still succeeds (signup/lead creation are never blocked by email delivery). Sending happens via FastAPI `BackgroundTasks` **after** the response is returned, never inline in the request.
+- `POST /api/admin/test-email` (admin-only) sends a real test email synchronously and returns the actual result (including Resend's own error message on failure) — use this to verify email delivery without needing server log access.
 - `CORS_ORIGINS` accepts `*` or a comma-separated list of allowed frontend origins.
 
 Run the API:
@@ -129,9 +127,10 @@ No request can crash the process with a raw traceback — every layer funnels fa
 - **`core/exceptions.py`** defines the domain error hierarchy: `NotFoundError` (404), `ConflictError` (409), `UnauthorizedError` (401), `ForbiddenError` (403), `ValidationError` (422), `DatabaseError` (503). Services raise these; routers never contain `try/except`.
 - **`database/base_persistence.py`** — every `*_persistence.py` class extends `BasePersistence` and routes its queries/commits through `_execute`/`_commit`/`_refresh`/`_delete`. These catch `IntegrityError` (unique constraint violations -> `ConflictError` with a specific message, e.g. "A service with this slug already exists") and any other `SQLAlchemyError` (connection drops, timeouts -> `DatabaseError`, rolling back the session first).
 - **`core/security.py`** — `PasswordHasher`, `JWTHandler` and `OtpGenerator` validate their inputs and catch library-level failures (`PasslibSecurityError`, `JWTError`), converting them into plain `ValueError`s with actionable messages instead of letting bcrypt/jose internals leak out. `services/auth_service.py` catches those and re-raises as the appropriate domain error.
-- **`services/email_service.py`** — SMTP is best-effort: a bad app password, DNS failure, or timeout is logged and swallowed so signup/lead-capture never fails because of a downstream email problem.
+- **`services/email_service.py`** — email (Resend HTTP API) is best-effort: a bad API key, network failure, or provider outage is logged with the real reason and swallowed so signup/lead-capture never fails because of a downstream email problem.
 - **`core/error_handlers.py`** registers handlers for every domain error, for `RequestValidationError` (bad request bodies -> 422 with a field-level `errors` list), for `SQLAlchemyError` (any DB exception that slips past the persistence layer -> 503), and a catch-all `Exception` handler (-> 500 with a generic message, full traceback logged server-side only — internals are never echoed to the client).
 - **`app.py` lifespan** wraps the startup DB connection so a bad `SUPABASE_URL` logs one clear "check your .env" message instead of a raw asyncpg traceback.
+- **`core/logging_config.py`** configures root logging (INFO level, timestamped, stdout) at startup — without this, Python's root logger defaults to WARNING with no handler, so most diagnostics (including email send attempts) would never reach Render's log stream.
 
 ### Corner cases specifically guarded against
 - Duplicate signup email, duplicate slug on services/portfolio/blog, duplicate newsletter subscribe (all -> 409, not a DB crash).

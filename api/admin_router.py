@@ -1,4 +1,3 @@
-import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, Query, status
@@ -55,34 +54,33 @@ async def test_email(
     payload: EmailTestRequest,
     email_service: EmailService = Depends(get_email_service),
 ) -> EmailTestResponse:
-    """Synchronously attempts an SMTP send and reports the real result.
-
-    Unlike signup/lead-capture (where email is fire-and-forget in the
-    background), this endpoint waits for the actual attempt so an admin can
-    verify SMTP delivery end-to-end without needing access to server logs.
+    """Synchronously attempts a real send via the configured email provider
+    (Resend) and reports the actual result - including the provider's own
+    error message on failure. Unlike signup/lead-capture (where email is
+    fire-and-forget in the background), this endpoint waits for the attempt
+    so an admin can verify email delivery end-to-end without needing access
+    to server logs.
     """
-    smtp_host, smtp_port, is_configured = email_service.connection_summary()
-    to_address = payload.to_address or (email_service.default_from_address() if is_configured else None)
+    provider, from_address, is_configured = email_service.connection_summary()
+    to_address = payload.to_address or (from_address if is_configured else None)
     if not to_address:
         return EmailTestResponse(
             sent=False,
             to_address="",
-            smtp_host=smtp_host,
-            smtp_port=smtp_port,
-            smtp_user_configured=is_configured,
-            detail="No to_address given and SMTP_USER is not configured - nothing to send to.",
+            provider=provider,
+            from_address=from_address,
+            api_key_configured=is_configured,
+            detail="No to_address given and RESEND_API_KEY is not configured - nothing to send to.",
         )
 
-    # send_otp_email uses smtplib, which blocks - run it off the event loop
-    # even for this synchronous diagnostic call.
-    sent = await asyncio.to_thread(email_service.send_otp_email, to_address, "000000", "signup")
+    sent, detail = await email_service.send_test_email(to_address)
     return EmailTestResponse(
         sent=sent,
         to_address=to_address,
-        smtp_host=smtp_host,
-        smtp_port=smtp_port,
-        smtp_user_configured=is_configured,
-        detail="Email sent successfully." if sent else "Send failed or was skipped - check server logs (webnest.email logger) for the exact reason.",
+        provider=provider,
+        from_address=from_address,
+        api_key_configured=is_configured,
+        detail=detail,
     )
 
 

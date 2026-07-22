@@ -15,11 +15,8 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
     otp_expire_minutes: int = 10
 
-    smtp_host: str = "smtp.gmail.com"
-    smtp_port: int = 587
-    smtp_user: str = ""
-    smtp_app_password: str = ""
-    smtp_from_address: str = ""
+    resend_api_key: str = ""
+    resend_from_address: str = "onboarding@resend.dev"
     team_notification_email: str = ""
 
     cors_origins: str = "*"
