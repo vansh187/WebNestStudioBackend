@@ -6,7 +6,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
-from core.exceptions import ConflictError, DatabaseError, ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
+from core.exceptions import (
+    ConflictError,
+    DatabaseError,
+    ForbiddenError,
+    NotFoundError,
+    RateLimitedError,
+    UnauthorizedError,
+    ValidationError,
+)
 
 logger = logging.getLogger("webnest.errors")
 
@@ -16,6 +24,7 @@ _STATUS_BY_EXCEPTION = (
     (UnauthorizedError, 401),
     (ForbiddenError, 403),
     (ValidationError, 422),
+    (RateLimitedError, 429),
     (DatabaseError, 503),
 )
 

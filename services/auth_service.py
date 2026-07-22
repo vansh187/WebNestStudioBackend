@@ -1,16 +1,18 @@
 import hashlib
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import Settings
-from core.exceptions import ConflictError, UnauthorizedError, ValidationError
+from core.exceptions import ConflictError, NotFoundError, RateLimitedError, UnauthorizedError, ValidationError
 from core.security import JWTHandler, OtpGenerator, PasswordHasher
 from database.models import User
 from database.otp_persistence import OtpPersistence
 from database.refresh_token_persistence import RefreshTokenPersistence
 from database.user_persistence import UserPersistence
+
+RESEND_OTP_COOLDOWN_SECONDS = 60
 
 
 class AuthService:
@@ -71,6 +73,30 @@ class AuthService:
         if user is None:
             raise ValidationError("No account found for this email")
         return await self._users.mark_verified(user)
+
+    async def resend_otp(self, email: str, purpose: str = "signup") -> str:
+        """Issues a fresh OTP for an existing account (e.g. the original signup
+        code expired before the user could verify). Rate-limited per email+purpose
+        to stop a resend loop from spamming the recipient's inbox or exhausting
+        the SMTP provider's send limits."""
+        user = await self._users.get_by_email(email)
+        if user is None:
+            raise NotFoundError("No account found for this email")
+        if purpose == "signup" and user.is_verified:
+            raise ValidationError("This account is already verified")
+
+        existing = await self._otps.get_latest_active(email, purpose)
+        if existing is not None:
+            age = datetime.now(timezone.utc) - existing.created_at.replace(tzinfo=timezone.utc)
+            if age < timedelta(seconds=RESEND_OTP_COOLDOWN_SECONDS):
+                wait_seconds = RESEND_OTP_COOLDOWN_SECONDS - int(age.total_seconds())
+                raise RateLimitedError(f"Please wait {wait_seconds}s before requesting another code")
+
+        otp_code = self._otp_generator.generate_code()
+        await self._otps.create(
+            email=email, otp_code=otp_code, purpose=purpose, expires_at=self._otp_generator.expiry(), user_id=user.id
+        )
+        return otp_code
 
     async def login(
         self, email: str, password: str, user_agent: str | None, ip_address: str | None

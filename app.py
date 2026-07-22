@@ -14,6 +14,9 @@ from api.leads_router import router as leads_router
 from api.newsletter_router import router as newsletter_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
+from core.logging_config import LoggingConfigurator
+
+LoggingConfigurator().configure()
 
 logger = logging.getLogger("webnest.startup")
 

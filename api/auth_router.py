@@ -6,6 +6,8 @@ from schemas.auth_schemas import (
     LoginRequest,
     LogoutRequest,
     RefreshRequest,
+    ResendOtpRequest,
+    ResendOtpResponse,
     SignupRequest,
     TokenResponse,
     UserResponse,
@@ -34,6 +36,18 @@ async def signup(
 @router.post("/verify-otp", response_model=UserResponse)
 async def verify_otp(payload: VerifyOtpRequest, auth_service: AuthService = Depends(get_auth_service)) -> User:
     return await auth_service.verify_otp(payload.email, payload.otp_code, payload.purpose)
+
+
+@router.post("/resend-otp", response_model=ResendOtpResponse)
+async def resend_otp(
+    payload: ResendOtpRequest,
+    background_tasks: BackgroundTasks,
+    auth_service: AuthService = Depends(get_auth_service),
+    email_service: EmailService = Depends(get_email_service),
+) -> ResendOtpResponse:
+    otp_code = await auth_service.resend_otp(payload.email, payload.purpose)
+    background_tasks.add_task(email_service.send_otp_email, payload.email, otp_code, payload.purpose)
+    return ResendOtpResponse(message="A new verification code has been sent to your email")
 
 
 @router.post("/login", response_model=TokenResponse)

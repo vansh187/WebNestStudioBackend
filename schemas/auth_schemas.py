@@ -35,6 +35,15 @@ class VerifyOtpRequest(BaseModel):
     purpose: Literal["signup", "login", "password_reset"] = "signup"
 
 
+class ResendOtpRequest(BaseModel):
+    email: EmailStr
+    purpose: Literal["signup", "login", "password_reset"] = "signup"
+
+
+class ResendOtpResponse(BaseModel):
+    message: str
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)

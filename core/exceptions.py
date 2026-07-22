@@ -29,3 +29,7 @@ class ValidationError(DomainError):
 class DatabaseError(DomainError):
     """Raised when a database operation fails for reasons outside the caller's control
     (connection drop, constraint violation not otherwise mapped, timeout, etc.)."""
+
+
+class RateLimitedError(DomainError):
+    """Raised when a caller must wait before retrying (e.g. OTP resend cooldown)."""

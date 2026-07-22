@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, Query, status
@@ -5,6 +6,7 @@ from fastapi import APIRouter, Depends, Query, status
 from core.dependencies import (
     get_blog_service,
     get_client_service,
+    get_email_service,
     get_faq_service,
     get_lead_service,
     get_portfolio_service,
@@ -14,6 +16,7 @@ from core.dependencies import (
 )
 from database.models import BlogPost, Faq, Lead, PortfolioItem, ProjectStatus, Service, Testimonial
 from schemas.client_schemas import ProjectStatusResponse, ProjectStatusUpsertRequest
+from schemas.diagnostics_schemas import EmailTestRequest, EmailTestResponse
 from schemas.content_schemas import (
     BlogPostCreateRequest,
     BlogPostResponse,
@@ -34,6 +37,7 @@ from schemas.content_schemas import (
 from schemas.lead_schemas import LeadListResponse, LeadResponse, LeadStatusUpdateRequest
 from services.blog_service import BlogService
 from services.client_service import ClientService
+from services.email_service import EmailService
 from services.faq_service import FaqService
 from services.lead_service import LeadService
 from services.portfolio_service import PortfolioService
@@ -41,6 +45,45 @@ from services.service_catalog_service import ServiceCatalogService
 from services.testimonial_service import TestimonialService
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+
+
+# ---- Diagnostics ----
+
+
+@router.post("/test-email", response_model=EmailTestResponse)
+async def test_email(
+    payload: EmailTestRequest,
+    email_service: EmailService = Depends(get_email_service),
+) -> EmailTestResponse:
+    """Synchronously attempts an SMTP send and reports the real result.
+
+    Unlike signup/lead-capture (where email is fire-and-forget in the
+    background), this endpoint waits for the actual attempt so an admin can
+    verify SMTP delivery end-to-end without needing access to server logs.
+    """
+    smtp_host, smtp_port, is_configured = email_service.connection_summary()
+    to_address = payload.to_address or (email_service.default_from_address() if is_configured else None)
+    if not to_address:
+        return EmailTestResponse(
+            sent=False,
+            to_address="",
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_user_configured=is_configured,
+            detail="No to_address given and SMTP_USER is not configured - nothing to send to.",
+        )
+
+    # send_otp_email uses smtplib, which blocks - run it off the event loop
+    # even for this synchronous diagnostic call.
+    sent = await asyncio.to_thread(email_service.send_otp_email, to_address, "000000", "signup")
+    return EmailTestResponse(
+        sent=sent,
+        to_address=to_address,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_user_configured=is_configured,
+        detail="Email sent successfully." if sent else "Send failed or was skipped - check server logs (webnest.email logger) for the exact reason.",
+    )
 
 
 # ---- Leads (CRM-lite) ----

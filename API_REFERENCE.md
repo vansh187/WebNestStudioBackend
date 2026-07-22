@@ -128,6 +128,36 @@ No auth required. Confirms the 6-digit code emailed at signup.
 
 ---
 
+### `POST /api/auth/resend-otp`
+No auth required. Issues a fresh OTP for an account whose original code expired or was lost — use this instead of retrying signup (retrying signup for an existing email returns `409`).
+
+**Request**
+```json
+{ "email": "jane@example.com", "purpose": "signup" }
+```
+
+**Response `200`**
+```json
+{ "message": "A new verification code has been sent to your email" }
+```
+
+**Error `404`** — no account with that email:
+```json
+{ "detail": "No account found for this email" }
+```
+
+**Error `422`** — account already verified (only checked for `purpose: "signup"`):
+```json
+{ "detail": "This account is already verified" }
+```
+
+**Error `429`** — rate-limited to 1 resend per 60 seconds per email+purpose:
+```json
+{ "detail": "Please wait 42s before requesting another code" }
+```
+
+---
+
 ### `POST /api/auth/login`
 No auth required.
 
@@ -708,6 +738,31 @@ Upserts (creates or updates) a client's project status.
   "updated_at": "2026-07-22T10:00:00Z"
 }
 ```
+
+---
+
+### Email diagnostics
+
+#### `POST /api/admin/test-email`
+Synchronously attempts an SMTP send and reports the real result — unlike signup/lead-capture (where email is fire-and-forget in the background), this endpoint waits for the actual attempt so you can verify SMTP delivery end-to-end without needing server log access.
+
+**Request** (`to_address` optional — defaults to the configured `SMTP_USER`)
+```json
+{ "to_address": "someone@example.com" }
+```
+
+**Response `200`**
+```json
+{
+  "sent": true,
+  "to_address": "someone@example.com",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user_configured": true,
+  "detail": "Email sent successfully."
+}
+```
+If `sent` is `false`, `detail` explains why (not configured, or check server logs under the `webnest.email` logger for the exact SMTP error).
 
 ---
 
