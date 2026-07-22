@@ -25,11 +25,11 @@ class EmailService:
         message["From"] = self._settings.smtp_from_address or self._settings.smtp_user
         message["To"] = to_address
         try:
-            with smtplib.SMTP(self._settings.smtp_host, self._settings.smtp_port) as server:
+            with smtplib.SMTP(self._settings.smtp_host, self._settings.smtp_port, timeout=10) as server:
                 server.starttls()
                 server.login(self._settings.smtp_user, self._settings.smtp_app_password)
                 server.send_message(message)
-        except (smtplib.SMTPException, OSError):
+        except (smtplib.SMTPException, OSError, TimeoutError):
             logger.warning("Failed to send email to %s", to_address, exc_info=True)
 
     def send_otp_email(self, to_address: str, otp_code: str, purpose: str) -> None:

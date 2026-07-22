@@ -66,6 +66,8 @@ CORS_ORIGINS=*
 
 - `SUPABASE_URL` may be given with or without a `postgresql://` scheme — `core/config.py` normalizes it and rewrites it to the `postgresql+asyncpg://` driver automatically.
 - SMTP is optional in development: if `SMTP_USER`/`SMTP_APP_PASSWORD` are blank, or the send fails for any reason, `EmailService` logs a warning and the triggering request still succeeds (signup/lead creation are never blocked by email delivery).
+- Gmail's `SMTP_APP_PASSWORD` must be a 16-character **App Password** (Google Account → Security → App Passwords, requires 2-Step Verification), never the account's normal login password — Gmail rejects the latter with a `535` auth error.
+- Email is sent via FastAPI `BackgroundTasks` **after** the response is returned, never inline in the request. Some hosts (Render's free tier included) throttle or block outbound SMTP (ports 587/465/25); before this change a blocked/slow SMTP connection could hang the whole signup or lead-capture request. Now the API responds immediately regardless of SMTP health — a stuck SMTP connection only delays (or silently drops, after a 10s timeout) the email, never the HTTP response. If OTP emails still aren't arriving in production, check Render's outbound network policy, or switch to an HTTPS-based provider (Resend, SendGrid, Postmark) instead of raw SMTP.
 - `CORS_ORIGINS` accepts `*` or a comma-separated list of allowed frontend origins.
 
 Run the API:

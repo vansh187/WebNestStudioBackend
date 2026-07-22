@@ -11,11 +11,16 @@ from database.models import User
 from database.otp_persistence import OtpPersistence
 from database.refresh_token_persistence import RefreshTokenPersistence
 from database.user_persistence import UserPersistence
-from services.email_service import EmailService
 
 
 class AuthService:
-    """Signup, OTP verification, login, token refresh and logout flows."""
+    """Signup, OTP verification, login, token refresh and logout flows.
+
+    Does not send email itself: OTP delivery is a slow, best-effort network
+    call that must never block the request/response cycle, so callers are
+    expected to schedule it (e.g. via FastAPI BackgroundTasks) using the
+    otp_code this returns.
+    """
 
     def __init__(
         self,
@@ -24,7 +29,6 @@ class AuthService:
         password_hasher: PasswordHasher,
         jwt_handler: JWTHandler,
         otp_generator: OtpGenerator,
-        email_service: EmailService,
     ) -> None:
         self._users = UserPersistence(session)
         self._otps = OtpPersistence(session)
@@ -33,14 +37,13 @@ class AuthService:
         self._password_hasher = password_hasher
         self._jwt_handler = jwt_handler
         self._otp_generator = otp_generator
-        self._email_service = email_service
 
     def _hash_token(self, token: str) -> str:
         if not token or not isinstance(token, str):
             raise ValidationError("A valid token string is required")
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    async def signup(self, full_name: str | None, email: str, phone_number: str | None, password: str) -> User:
+    async def signup(self, full_name: str | None, email: str, phone_number: str | None, password: str) -> tuple[User, str]:
         existing = await self._users.get_by_email(email)
         if existing is not None:
             raise ConflictError("An account with this email already exists")
@@ -54,8 +57,7 @@ class AuthService:
 
         otp_code = self._otp_generator.generate_code()
         await self._otps.create(email=email, otp_code=otp_code, purpose="signup", expires_at=self._otp_generator.expiry(), user_id=user.id)
-        self._email_service.send_otp_email(email, otp_code, "signup")
-        return user
+        return user, otp_code
 
     async def verify_otp(self, email: str, otp_code: str, purpose: str = "signup") -> User:
         otp = await self._otps.get_latest_active(email, purpose)

@@ -50,12 +50,15 @@ def get_auth_service(session: AsyncSession = Depends(get_db_session)) -> AuthSer
         password_hasher=container.password_hasher,
         jwt_handler=container.jwt_handler,
         otp_generator=container.otp_generator,
-        email_service=container.email_service,
     )
 
 
 def get_lead_service(session: AsyncSession = Depends(get_db_session)) -> LeadService:
-    return LeadService(session=session, email_service=container.email_service)
+    return LeadService(session=session)
+
+
+def get_email_service() -> EmailService:
+    return container.email_service
 
 
 def get_newsletter_service(session: AsyncSession = Depends(get_db_session)) -> NewsletterService:

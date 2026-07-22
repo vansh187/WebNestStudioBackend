@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
 
-from core.dependencies import get_auth_service, get_client_ip, get_current_user
+from core.dependencies import get_auth_service, get_client_ip, get_current_user, get_email_service
 from database.models import User
 from schemas.auth_schemas import (
     LoginRequest,
@@ -12,13 +12,23 @@ from schemas.auth_schemas import (
     VerifyOtpRequest,
 )
 from services.auth_service import AuthService
+from services.email_service import EmailService
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def signup(payload: SignupRequest, auth_service: AuthService = Depends(get_auth_service)) -> User:
-    return await auth_service.signup(payload.full_name, payload.email, payload.phone_number, payload.password)
+async def signup(
+    payload: SignupRequest,
+    background_tasks: BackgroundTasks,
+    auth_service: AuthService = Depends(get_auth_service),
+    email_service: EmailService = Depends(get_email_service),
+) -> User:
+    user, otp_code = await auth_service.signup(payload.full_name, payload.email, payload.phone_number, payload.password)
+    # Sending the OTP email is a slow, best-effort network call - it must never
+    # block this response (Render's outbound SMTP can hang for tens of seconds).
+    background_tasks.add_task(email_service.send_otp_email, user.email, otp_code, "signup")
+    return user
 
 
 @router.post("/verify-otp", response_model=UserResponse)

@@ -5,26 +5,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.exceptions import NotFoundError
 from database.lead_persistence import LeadPersistence
 from database.models import Lead
-from services.email_service import EmailService
 
 
 class LeadService:
-    """Handles the single leads pipeline shared by every form entry point."""
+    """Handles the single leads pipeline shared by every form entry point.
 
-    def __init__(self, session: AsyncSession, email_service: EmailService) -> None:
+    Does not send the team notification email itself: that's a slow,
+    best-effort network call that must never block the request/response
+    cycle, so callers are expected to schedule it (e.g. via FastAPI
+    BackgroundTasks) using the Lead this returns.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
         self._leads = LeadPersistence(session)
-        self._email_service = email_service
 
     async def create_lead(self, ip_address: str | None, user_agent: str | None, **fields) -> Lead:
-        lead = await self._leads.create(ip_address=ip_address, user_agent=user_agent, **fields)
-        self._email_service.send_lead_notification_email(
-            full_name=lead.full_name,
-            email=lead.email,
-            phone_number=lead.phone_number,
-            source=lead.source,
-            message=lead.message,
-        )
-        return lead
+        return await self._leads.create(ip_address=ip_address, user_agent=user_agent, **fields)
 
     async def list_leads(self, source: str | None, status: str | None, limit: int, offset: int) -> tuple[list[Lead], int]:
         leads = await self._leads.list_leads(source=source, status=status, limit=limit, offset=offset)
