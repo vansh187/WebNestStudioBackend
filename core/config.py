@@ -28,6 +28,9 @@ class Settings(BaseSettings):
 
     cors_origins: str = "*"
 
+    # Public site origin used to build absolute URLs in sitemap.xml / robots.txt.
+    frontend_base_url: str = "https://webneststudio.co.in"
+
     @property
     def async_database_url(self) -> str:
         raw = self.supabase_url.strip()

@@ -12,6 +12,7 @@ from api.content_router import router as content_router
 from api.home_router import router as home_router
 from api.leads_router import router as leads_router
 from api.newsletter_router import router as newsletter_router
+from api.sitemap_router import router as sitemap_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
@@ -68,6 +69,7 @@ class WebNestStudioApp:
             home_router,
             admin_router,
             client_router,
+            sitemap_router,
         ):
             self.instance.include_router(router)
 
