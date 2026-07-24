@@ -9,6 +9,7 @@ from api.admin_router import router as admin_router
 from api.auth_router import router as auth_router
 from api.client_router import router as client_router
 from api.content_router import router as content_router
+from api.generation_router import router as generation_router
 from api.home_router import router as home_router
 from api.leads_router import router as leads_router
 from api.newsletter_router import router as newsletter_router
@@ -70,6 +71,7 @@ class WebNestStudioApp:
             admin_router,
             client_router,
             sitemap_router,
+            generation_router,
         ):
             self.instance.include_router(router)
 

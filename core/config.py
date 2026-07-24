@@ -31,6 +31,17 @@ class Settings(BaseSettings):
     # Public site origin used to build absolute URLs in sitemap.xml / robots.txt.
     frontend_base_url: str = "https://webneststudio.co.in"
 
+    # AI Page Builder: Gemini (primary) + Groq (fallback) generation.
+    gemini_api_key: str = ""
+    groq_api_key: str = ""
+    gemini_model: str = "gemini-flash-latest"
+    groq_model: str = "llama-3.3-70b-versatile"
+    rate_limit_per_hour: int = 5
+    max_prompt_length: int = 500
+    max_refinement_length: int = 300
+    llm_timeout_seconds: float = 20.0
+    llm_max_output_tokens: int = 8192
+
     @property
     def async_database_url(self) -> str:
         raw = self.supabase_url.strip()

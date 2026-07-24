@@ -14,6 +14,7 @@ from services.blog_service import BlogService
 from services.client_service import ClientService
 from services.email_service import EmailService
 from services.faq_service import FaqService
+from services.generation_service import GenerationService
 from services.lead_service import LeadService
 from services.newsletter_service import NewsletterService
 from services.portfolio_service import PortfolioService
@@ -87,6 +88,10 @@ def get_blog_service(session: AsyncSession = Depends(get_db_session)) -> BlogSer
 
 def get_client_service(session: AsyncSession = Depends(get_db_session)) -> ClientService:
     return ClientService(session=session)
+
+
+def get_generation_service(session: AsyncSession = Depends(get_db_session)) -> GenerationService:
+    return GenerationService(session=session, settings=container.settings)
 
 
 def get_client_ip(request: Request) -> str | None:

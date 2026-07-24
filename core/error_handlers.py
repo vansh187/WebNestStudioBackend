@@ -8,8 +8,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from core.exceptions import (
     ConflictError,
+    ContentRejectedError,
     DatabaseError,
     ForbiddenError,
+    GenerationUnavailableError,
+    InvalidPromptError,
     NotFoundError,
     RateLimitedError,
     UnauthorizedError,
@@ -23,9 +26,12 @@ _STATUS_BY_EXCEPTION = (
     (ConflictError, 409),
     (UnauthorizedError, 401),
     (ForbiddenError, 403),
+    (InvalidPromptError, 400),
     (ValidationError, 422),
+    (ContentRejectedError, 422),
     (RateLimitedError, 429),
     (DatabaseError, 503),
+    (GenerationUnavailableError, 503),
 )
 
 

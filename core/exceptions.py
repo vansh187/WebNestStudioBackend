@@ -33,3 +33,15 @@ class DatabaseError(DomainError):
 
 class RateLimitedError(DomainError):
     """Raised when a caller must wait before retrying (e.g. OTP resend cooldown)."""
+
+
+class InvalidPromptError(DomainError):
+    """Raised when a prompt/refinement fails basic shape validation (empty, too long)."""
+
+
+class ContentRejectedError(DomainError):
+    """Raised when a prompt/refinement is blocked by the content filter."""
+
+
+class GenerationUnavailableError(DomainError):
+    """Raised when every configured LLM provider failed to produce a result."""
