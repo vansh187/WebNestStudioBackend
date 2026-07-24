@@ -49,7 +49,15 @@ class LLMProvider:
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user_message}]}],
             "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "generationConfig": {"maxOutputTokens": self._settings.llm_max_output_tokens},
+            "generationConfig": {
+                "maxOutputTokens": self._settings.gemini_max_output_tokens,
+                # gemini-flash-latest currently resolves to a "thinking" model that
+                # otherwise spends part of maxOutputTokens (and ~60s of latency) on
+                # hidden reasoning before writing any HTML, which was enough to
+                # trigger MAX_TOKENS truncation on CSS-heavy pages even at a large
+                # budget. We don't need chain-of-thought for HTML generation.
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
         }
         headers = {"x-goog-api-key": self._settings.gemini_api_key, "Content-Type": "application/json"}
         response = await self._post(url, payload, headers, provider="Gemini")
@@ -70,7 +78,7 @@ class LLMProvider:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            "max_tokens": self._settings.llm_max_output_tokens,
+            "max_tokens": self._settings.groq_max_output_tokens,
         }
         headers = {"Authorization": f"Bearer {self._settings.groq_api_key}"}
         response = await self._post(GROQ_URL, payload, headers, provider="Groq")

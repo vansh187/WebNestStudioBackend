@@ -39,8 +39,23 @@ class Settings(BaseSettings):
     rate_limit_per_hour: int = 5
     max_prompt_length: int = 500
     max_refinement_length: int = 300
-    llm_timeout_seconds: float = 20.0
-    llm_max_output_tokens: int = 8192
+    # A fully styled single-page site with real CSS/JS routinely needs more than
+    # a couple minutes' worth of typical chat-completion latency to finish
+    # generating - a low timeout here makes a genuinely successful (if slow)
+    # completion look identical to a hung provider.
+    llm_timeout_seconds: float = 45.0
+    # Comfortably under Gemini flash's 65536 per-request cap - a fully styled
+    # single-page site with real CSS/JS can otherwise get cut off mid-generation,
+    # which used to silently produce a truncated/blank page (see
+    # extract_html_document's </html> check, which now catches this class of
+    # failure as a hard error instead).
+    gemini_max_output_tokens: int = 16384
+    # Groq's llama-3.3-70b-versatile supports up to 32768 completion tokens, but
+    # the account-level TPM (tokens-per-minute) budget is what actually binds:
+    # Groq rejects a request outright (413) if the requested max_tokens alone
+    # could exceed the remaining TPM budget, regardless of how much it would
+    # really use. Kept well under the observed 12000 TPM cap on this account.
+    groq_max_output_tokens: int = 8000
 
     @property
     def async_database_url(self) -> str:

@@ -42,10 +42,17 @@ def extract_html_document(raw: str) -> str:
 
     lower = text.lower()
     end = lower.rfind("</html>")
-    if end != -1:
-        text = text[: end + len("</html>")]
-    else:
-        text = _FENCE_PATTERN.sub("", text.strip())
+    if end == -1:
+        # No closing </html> means the model's output was cut off (almost always
+        # a maxOutputTokens truncation) before finishing the document - critically,
+        # this also means any <style>/<script> block opened earlier is left
+        # unterminated. html.parser silently discards everything after an
+        # unterminated CDATA element on close() rather than erroring, so if this
+        # weren't caught here, sanitize_html() would quietly drop the entire rest
+        # of the page and return a mostly-empty "successful" document instead of
+        # failing loudly.
+        raise MalformedOutputError("Model output was truncated before the document was complete")
+    text = text[: end + len("</html>")]
 
     return text.strip()
 
