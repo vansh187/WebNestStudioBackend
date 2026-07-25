@@ -35,6 +35,12 @@ class UserPersistence(BasePersistence):
         await self._refresh(user)
         return user
 
+    async def update_password_hash(self, user: User, password_hash: str) -> User:
+        user.password_hash = password_hash
+        await self._commit()
+        await self._refresh(user)
+        return user
+
     async def update_last_login(self, user: User, when: datetime) -> User:
         user.last_login_at = when
         await self._commit()

@@ -110,6 +110,31 @@ class AuthService:
         )
         return otp_code
 
+    async def reset_password(self, email: str, otp_code: str, new_password: str) -> None:
+        if not self._settings.email_enabled:
+            raise ValidationError("Email verification is currently disabled; accounts are auto-verified at signup")
+
+        otp = await self._otps.get_latest_active(email, "password_reset")
+        if otp is None or otp.otp_code != otp_code:
+            raise ValidationError("Invalid or expired OTP code")
+        if otp.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+            raise ValidationError("Invalid or expired OTP code")
+
+        user = await self._users.get_by_email(email)
+        if user is None:
+            raise NotFoundError("No account found for this email")
+
+        try:
+            password_hash = await self._password_hasher.hash(new_password)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+        await self._otps.mark_consumed(otp)
+        await self._users.update_password_hash(user, password_hash)
+        # A stolen refresh token shouldn't survive its owner resetting their
+        # password because they suspected exactly that.
+        await self._refresh_tokens.revoke_all_for_user(user.id)
+
     async def login(
         self, email: str, password: str, user_agent: str | None, ip_address: str | None
     ) -> tuple[str, str, User]:

@@ -8,6 +8,8 @@ from schemas.auth_schemas import (
     RefreshRequest,
     ResendOtpRequest,
     ResendOtpResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     SignupRequest,
     TokenResponse,
     UserResponse,
@@ -49,6 +51,14 @@ async def resend_otp(
     otp_code = await auth_service.resend_otp(payload.email, payload.purpose)
     background_tasks.add_task(email_service.send_otp_email, payload.email, otp_code, payload.purpose)
     return ResendOtpResponse(message="A new verification code has been sent to your email")
+
+
+@router.post("/reset-password", response_model=ResetPasswordResponse)
+async def reset_password(
+    payload: ResetPasswordRequest, auth_service: AuthService = Depends(get_auth_service)
+) -> ResetPasswordResponse:
+    await auth_service.reset_password(payload.email, payload.otp_code, payload.new_password)
+    return ResetPasswordResponse(message="Your password has been updated")
 
 
 @router.post("/login", response_model=TokenResponse)

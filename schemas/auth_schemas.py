@@ -44,6 +44,23 @@ class ResendOtpResponse(BaseModel):
     message: str
 
 
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    otp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
+
+    @field_validator("new_password")
+    @classmethod
+    def new_password_must_fit_bcrypt_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > PASSWORD_MAX_LENGTH:
+            raise ValueError(f"Password must be at most {PASSWORD_MAX_LENGTH} bytes long")
+        return value
+
+
+class ResetPasswordResponse(BaseModel):
+    message: str
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
