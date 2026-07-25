@@ -4,6 +4,7 @@ import time
 import httpx
 
 from core.config import Settings
+from services.email_templates import render_otp_email_html
 
 logger = logging.getLogger("webnest.email")
 
@@ -36,7 +37,7 @@ class EmailService:
         """Returns (provider, from_address, is_configured) for diagnostics - never exposes the API key."""
         return "resend", self._settings.resend_from_address, self.is_configured()
 
-    async def _send(self, to_address: str, subject: str, body: str) -> tuple[bool, str]:
+    async def _send(self, to_address: str, subject: str, body: str, html_body: str | None = None) -> tuple[bool, str]:
         if not self._settings.email_enabled:
             message = "Skipping email: EMAIL_ENABLED is false (email temporarily disabled)"
             logger.info("%s (to=%s)", message, to_address)
@@ -55,6 +56,11 @@ class EmailService:
             "subject": subject,
             "text": body,
         }
+        # Plain-text "text" above is always included as the fallback body every
+        # client falls back to if it can't/won't render HTML - "html" is what
+        # actual mail clients display when they can.
+        if html_body is not None:
+            payload["html"] = html_body
         headers = {"Authorization": f"Bearer {self._settings.resend_api_key}"}
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -84,7 +90,8 @@ class EmailService:
     async def send_otp_email(self, to_address: str, otp_code: str, purpose: str) -> bool:
         subject = "Your WebNest Studio verification code"
         body = f"Your one-time code for {purpose.replace('_', ' ')} is: {otp_code}\nThis code expires in {self._settings.otp_expire_minutes} minutes."
-        sent, _detail = await self._send(to_address, subject, body)
+        html_body = render_otp_email_html(otp_code, purpose, self._settings.otp_expire_minutes)
+        sent, _detail = await self._send(to_address, subject, body, html_body=html_body)
         return sent
 
     async def send_lead_notification_email(

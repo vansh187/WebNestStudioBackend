@@ -1,8 +1,10 @@
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.admin_router import router as admin_router
@@ -21,6 +23,10 @@ from core.logging_config import LoggingConfigurator
 LoggingConfigurator().configure()
 
 logger = logging.getLogger("webnest.startup")
+
+# Resolved from this file's own location (not the process cwd) so the mount
+# works the same whether uvicorn is launched from the repo root or elsewhere.
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 
 @asynccontextmanager
@@ -74,6 +80,11 @@ class WebNestStudioApp:
             generation_router,
         ):
             self.instance.include_router(router)
+
+        # Serves static brand assets (e.g. /assets/logo.png) referenced by
+        # absolute URL from outside the app itself - transactional emails,
+        # where a relative path or bundled frontend asset isn't reachable.
+        self.instance.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 
         @self.instance.get("/health", tags=["health"])
         async def health_check() -> dict:
