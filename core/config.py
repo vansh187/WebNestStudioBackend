@@ -57,6 +57,23 @@ class Settings(BaseSettings):
     # really use. Kept well under the observed 12000 TPM cap on this account.
     groq_max_output_tokens: int = 8000
 
+    # Automated blog generation. Kept default-on for prod; set to False in local
+    # .env to avoid burning real Gemini/Groq quota and creating test posts every
+    # time the server restarts during development.
+    blog_generation_enabled: bool = True
+    blog_post_lifetime_days: int = 15
+    blog_generation_interval_days: int = 2
+    blog_generation_hour_ist: int = 6
+    # One-time launch post trigger, e.g. "2026-07-26T18:00:00+05:30". Empty
+    # string disables it. Left as a plain settings field (not hardcoded into
+    # the scheduler) so it can be set/cleared via env var without a redeploy,
+    # and so it naturally becomes a no-op once the date has passed and a post
+    # already exists for that day.
+    blog_launch_special_post_at: str = ""
+    # Where the "new blog post is live" publicity-reminder email goes every
+    # time a post (scheduled or manually triggered) is successfully published.
+    blog_publish_notification_email: str = "webneststudio19@gmail.com"
+
     @property
     def async_database_url(self) -> str:
         raw = self.supabase_url.strip()

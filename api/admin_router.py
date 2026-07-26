@@ -3,6 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 
 from core.dependencies import (
+    get_blog_generation_service,
     get_blog_service,
     get_client_service,
     get_email_service,
@@ -14,6 +15,7 @@ from core.dependencies import (
     require_admin,
 )
 from database.models import BlogPost, Faq, Lead, PortfolioItem, ProjectStatus, Service, Testimonial
+from schemas.blog_generation_schemas import BlogGenerationLogResponse, BlogGenerationTriggerResponse
 from schemas.client_schemas import ProjectStatusResponse, ProjectStatusUpsertRequest
 from schemas.diagnostics_schemas import EmailTestRequest, EmailTestResponse
 from schemas.content_schemas import (
@@ -34,11 +36,13 @@ from schemas.content_schemas import (
     TestimonialUpdateRequest,
 )
 from schemas.lead_schemas import LeadListResponse, LeadResponse, LeadStatusUpdateRequest
+from services.blog_generation_service import BlogGenerationError, BlogGenerationService
 from services.blog_service import BlogService
 from services.client_service import ClientService
 from services.email_service import EmailService
 from services.faq_service import FaqService
 from services.lead_service import LeadService
+from services.llm_provider import GenerationFailedError
 from services.portfolio_service import PortfolioService
 from services.service_catalog_service import ServiceCatalogService
 from services.testimonial_service import TestimonialService
@@ -251,6 +255,33 @@ async def admin_update_blog_post(
 @router.delete("/blog/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def admin_delete_blog_post(post_id: uuid.UUID, blog_service: BlogService = Depends(get_blog_service)) -> None:
     await blog_service.delete(post_id)
+
+
+@router.post("/blog/generate", response_model=BlogGenerationTriggerResponse)
+async def admin_trigger_blog_generation(
+    generation_service: BlogGenerationService = Depends(get_blog_generation_service),
+) -> BlogGenerationTriggerResponse:
+    """Manually runs the automated blog generation pipeline right now,
+    bypassing the 2-day cooldown (topic-uniqueness/SEO/slug validation still
+    applies). For recovery from a missed scheduled run and for testing
+    without waiting for the next cron fire. LLM/generation failures are
+    reported as a normal (success=False) response rather than an HTTP error,
+    since a provider being temporarily unavailable is an expected outcome,
+    not a server bug.
+    """
+    try:
+        post = await generation_service.generate_and_publish(trigger_source="manual-admin")
+    except (BlogGenerationError, GenerationFailedError) as exc:
+        return BlogGenerationTriggerResponse(success=False, detail=str(exc))
+    return BlogGenerationTriggerResponse(success=True, detail="Blog post generated and published", post_id=post.id, slug=post.slug)
+
+
+@router.get("/blog/generation-logs", response_model=list[BlogGenerationLogResponse])
+async def admin_list_blog_generation_logs(
+    limit: int = Query(default=20, ge=1, le=200),
+    generation_service: BlogGenerationService = Depends(get_blog_generation_service),
+) -> list:
+    return await generation_service.list_recent_logs(limit=limit)
 
 
 # ---- Client project status ----

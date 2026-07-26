@@ -162,6 +162,11 @@ class BlogPostCreateRequest(BaseModel):
     tags: list[str] | None = None
     is_published: bool = False
     published_at: datetime | None = None
+    expires_at: datetime | None = None
+    meta_title: str | None = None
+    meta_description: str | None = None
+    keywords: list[str] | None = None
+    topic_tag: str | None = None
 
 
 class BlogPostUpdateRequest(BaseModel):
@@ -173,6 +178,11 @@ class BlogPostUpdateRequest(BaseModel):
     tags: list[str] | None = None
     is_published: bool | None = None
     published_at: datetime | None = None
+    expires_at: datetime | None = None
+    meta_title: str | None = None
+    meta_description: str | None = None
+    keywords: list[str] | None = None
+    topic_tag: str | None = None
 
 
 class BlogPostResponse(BaseModel):
@@ -186,5 +196,11 @@ class BlogPostResponse(BaseModel):
     tags: list[str] | None
     is_published: bool
     published_at: datetime | None
+    expires_at: datetime | None
+    meta_title: str | None
+    meta_description: str | None
+    keywords: list[str] | None
+    topic_tag: str | None
+    word_count: int | None
 
     model_config = {"from_attributes": True}

@@ -33,3 +33,10 @@ class Database:
     async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
         async with self._session_factory() as session:
             yield session
+
+    def session_scope(self) -> AsyncSession:
+        """Same session factory as get_session(), exposed as a plain async
+        context manager for callers with no FastAPI request to hang DI off of
+        (e.g. scheduled background jobs): `async with database.session_scope() as session:`.
+        """
+        return self._session_factory()

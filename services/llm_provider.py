@@ -29,6 +29,12 @@ class LLMProvider:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
+    async def generate_text(self, system_prompt: str, user_message: str) -> tuple[str, str]:
+        """Alias for generate_html - the underlying call is plain text-in/text-out
+        (Gemini/Groq chat completion), the "_html" name just reflects its first
+        caller. Used by non-HTML text generation (e.g. blog post JSON)."""
+        return await self.generate_html(system_prompt, user_message)
+
     async def generate_html(self, system_prompt: str, user_message: str) -> tuple[str, str]:
         if self._settings.gemini_api_key:
             try:

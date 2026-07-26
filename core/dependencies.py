@@ -10,6 +10,8 @@ from core.security import JWTHandler, OtpGenerator, PasswordHasher
 from database.models import User
 from database.session import Database
 from services.auth_service import AuthService
+from services.blog_generation_service import BlogGenerationService
+from services.blog_scheduler import create_scheduler
 from services.blog_service import BlogService
 from services.client_service import ClientService
 from services.email_service import EmailService
@@ -34,6 +36,7 @@ class DependencyContainer:
         self.jwt_handler = JWTHandler(app_settings)
         self.otp_generator = OtpGenerator(app_settings)
         self.email_service = EmailService(app_settings)
+        self.scheduler = create_scheduler()
 
 
 container = DependencyContainer(settings)
@@ -83,7 +86,11 @@ def get_faq_service(session: AsyncSession = Depends(get_db_session)) -> FaqServi
 
 
 def get_blog_service(session: AsyncSession = Depends(get_db_session)) -> BlogService:
-    return BlogService(session=session)
+    return BlogService(session=session, settings=container.settings)
+
+
+def get_blog_generation_service(session: AsyncSession = Depends(get_db_session)) -> BlogGenerationService:
+    return BlogGenerationService(session=session, settings=container.settings)
 
 
 def get_client_service(session: AsyncSession = Depends(get_db_session)) -> ClientService:

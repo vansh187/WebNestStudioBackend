@@ -19,6 +19,7 @@ from api.sitemap_router import router as sitemap_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
+from services.blog_scheduler import register_blog_jobs
 
 LoggingConfigurator().configure()
 
@@ -38,7 +39,22 @@ async def lifespan(app: FastAPI):
             "Could not connect to the database at startup. Check SUPABASE_URL in .env.", exc_info=True
         )
         raise
+
+    try:
+        register_blog_jobs(container.scheduler, container.database, container.settings)
+        container.scheduler.start()
+    except Exception:
+        # The blog scheduler is a nice-to-have background feature - a bug in
+        # registering/starting it must never prevent the API itself from
+        # coming up and serving requests.
+        logger.critical("Could not start the blog generation scheduler", exc_info=True)
+
     yield
+
+    try:
+        container.scheduler.shutdown(wait=False)
+    except Exception:
+        logger.warning("Error while shutting down the blog generation scheduler", exc_info=True)
     try:
         await container.database.dispose()
     except SQLAlchemyError:

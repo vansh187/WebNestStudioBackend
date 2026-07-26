@@ -116,6 +116,31 @@ class EmailService:
         sent, _detail = await self._send(self._settings.team_notification_email, subject, body)
         return sent
 
+    async def send_alert_email(self, subject: str, body: str) -> bool:
+        """Sends an operational alert (e.g. background job failure) to
+        TEAM_NOTIFICATION_EMAIL. Best-effort like every other send here - a
+        failed alert email must never raise, it's already the fallback path."""
+        if not self._settings.team_notification_email:
+            logger.warning("Skipping alert email (subject=%r): TEAM_NOTIFICATION_EMAIL is not configured", subject)
+            return False
+        sent, _detail = await self._send(self._settings.team_notification_email, subject, body)
+        return sent
+
+    async def send_blog_published_notification(self, title: str, slug: str) -> bool:
+        """Best-effort "new blog post is live" ping so the team knows to push
+        publicity for it - never raises, mirrors every other send here."""
+        if not self._settings.blog_publish_notification_email:
+            logger.warning("Skipping blog-published notification: no recipient configured")
+            return False
+        post_url = f"{self._settings.frontend_base_url.rstrip('/')}/blog/{slug}"
+        subject = f"New blog post is live: {title}"
+        body = (
+            f'A new blog post just went live on Webnest Studio: "{title}"\n\n'
+            f"Check it out and share it: {post_url}"
+        )
+        sent, _detail = await self._send(self._settings.blog_publish_notification_email, subject, body)
+        return sent
+
     async def send_test_email(self, to_address: str) -> tuple[bool, str]:
         """Like send_otp_email, but surfaces the real success/failure detail -
         used by the admin test-email diagnostic endpoint."""

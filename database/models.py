@@ -184,6 +184,35 @@ class BlogPost(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+    # SEO metadata + auto-expiry, populated by the automated blog generation
+    # pipeline. Nullable so existing/manually-created posts stay valid without
+    # a backfill. expires_at drives both the public read filter and the daily
+    # archive sweep - every post (including the 2 original static ones) is
+    # subject to the same 15-day lifetime, there is no "permanent" post.
+    meta_title: Mapped[str | None] = mapped_column(Text)
+    meta_description: Mapped[str | None] = mapped_column(Text)
+    keywords: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    topic_tag: Mapped[str | None] = mapped_column(Text, index=True)
+    word_count: Mapped[int | None] = mapped_column(Integer)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class BlogGenerationLog(Base):
+    """Audit trail for every automated generation attempt (success or failure),
+    queryable via the admin API so operators can see what happened without
+    needing shell access to Render's logs."""
+
+    __tablename__ = "blog_generation_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    llm_used: Mapped[str | None] = mapped_column(Text)
+    topic_tag: Mapped[str | None] = mapped_column(Text)
+    blog_post_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("blog_posts.id", ondelete="SET NULL"))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    trigger_source: Mapped[str] = mapped_column(Text, nullable=False)
+
 
 class Generation(Base):
     __tablename__ = "generations"
