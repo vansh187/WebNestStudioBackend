@@ -1,7 +1,15 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class BlogGenerationTriggerRequest(BaseModel):
+    # Optional - when omitted, the pipeline picks its own topic and enforces
+    # historical topic-uniqueness as usual. When provided, the model is
+    # directed to write on this exact subject and the uniqueness check is
+    # skipped for this run (the caller asked for this topic deliberately).
+    topic_hint: str | None = Field(default=None, min_length=1, max_length=500)
 
 
 class BlogGenerationLogResponse(BaseModel):

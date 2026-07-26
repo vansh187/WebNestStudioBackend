@@ -57,12 +57,14 @@ class LLMProvider:
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "generationConfig": {
                 "maxOutputTokens": self._settings.gemini_max_output_tokens,
-                # gemini-flash-latest currently resolves to a "thinking" model that
-                # otherwise spends part of maxOutputTokens (and ~60s of latency) on
-                # hidden reasoning before writing any HTML, which was enough to
-                # trigger MAX_TOKENS truncation on CSS-heavy pages even at a large
-                # budget. We don't need chain-of-thought for HTML generation.
-                "thinkingConfig": {"thinkingBudget": 0},
+                # NOTE: thinkingConfig.thinkingBudget=0 previously lived here to
+                # skip hidden reasoning tokens/latency, but whatever model
+                # "gemini-flash-latest" currently resolves to now hard-rejects
+                # thinkingBudget=0 specifically with a bare HTTP 400 "Request
+                # contains an invalid argument" (confirmed by testing every other
+                # value - including -1/dynamic - works fine). Omitting the field
+                # entirely falls back to the model's default thinking behavior,
+                # which costs a bit more latency/tokens but actually succeeds.
             },
         }
         headers = {"x-goog-api-key": self._settings.gemini_api_key, "Content-Type": "application/json"}

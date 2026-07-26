@@ -87,9 +87,9 @@ class BlogGenerationService:
 
     # ---- Main entry point ----
 
-    async def generate_and_publish(self, trigger_source: str) -> BlogPost:
+    async def generate_and_publish(self, trigger_source: str, topic_hint: str | None = None) -> BlogPost:
         try:
-            post, provider, topic_tag = await self._run_pipeline()
+            post, provider, topic_tag = await self._run_pipeline(topic_hint=topic_hint)
         except GenerationFailedError as exc:
             logger.critical("Blog generation failed: both LLM providers are unavailable (%s)", exc)
             await self._log_failure(trigger_source, topic_tag=None, error=str(exc))
@@ -133,17 +133,22 @@ class BlogGenerationService:
 
     # ---- Pipeline internals ----
 
-    async def _run_pipeline(self) -> tuple[BlogPost, str, str]:
+    async def _run_pipeline(self, topic_hint: str | None = None) -> tuple[BlogPost, str, str]:
         existing_topics = await self._blog_posts.list_topic_tags()
         normalized_existing = {t.strip().lower() for t in existing_topics if t}
         excluded_for_prompt = existing_topics[:MAX_EXCLUDED_TOPICS_IN_PROMPT]
 
-        data, provider = await self._generate_json(excluded_for_prompt)
-        data, provider = await self._ensure_word_limit(data, provider, excluded_for_prompt)
+        data, provider = await self._generate_json(excluded_for_prompt, topic_hint=topic_hint)
+        data, provider = await self._ensure_word_limit(data, provider, excluded_for_prompt, topic_hint=topic_hint)
         topic_tag = _clean_str(data.get("topic_tag")) or "general"
 
+        # A directed topic (topic_hint) is trusted as-is even if its topic_tag
+        # happens to collide with a prior post - the caller asked for this
+        # exact subject deliberately, so the uniqueness retry loop (which
+        # exists to stop the model repeating itself when picking freely)
+        # doesn't apply here.
         attempts = 0
-        while topic_tag.strip().lower() in normalized_existing and attempts < MAX_TOPIC_RETRIES:
+        while topic_hint is None and topic_tag.strip().lower() in normalized_existing and attempts < MAX_TOPIC_RETRIES:
             attempts += 1
             logger.warning(
                 "Generated topic_tag %r collides with an existing topic, retrying (%s/%s)",
@@ -156,7 +161,7 @@ class BlogGenerationService:
             data, provider = await self._ensure_word_limit(data, provider, excluded_for_prompt)
             topic_tag = _clean_str(data.get("topic_tag")) or "general"
 
-        if topic_tag.strip().lower() in normalized_existing:
+        if topic_hint is None and topic_tag.strip().lower() in normalized_existing:
             uniquified = f"{topic_tag} ({datetime.now(timezone.utc).date().isoformat()})"
             logger.warning("Auto-uniquifying topic_tag %r -> %r after exhausting retries", topic_tag, uniquified)
             data["topic_tag"] = uniquified
@@ -165,8 +170,10 @@ class BlogGenerationService:
         post = await self._persist_with_unique_slug(post_fields)
         return post, provider, post.topic_tag or topic_tag
 
-    async def _generate_json(self, excluded_topics: list[str], strict_word_limit: bool = False) -> tuple[dict, str]:
-        system_prompt = _build_system_prompt(excluded_topics)
+    async def _generate_json(
+        self, excluded_topics: list[str], strict_word_limit: bool = False, topic_hint: str | None = None
+    ) -> tuple[dict, str]:
+        system_prompt = _build_system_prompt(excluded_topics, topic_hint=topic_hint)
         user_message = "Generate today's blog post as JSON."
         if strict_word_limit:
             user_message += (
@@ -186,13 +193,15 @@ class BlogGenerationService:
                 )
         raise BlogGenerationError(f"LLM did not return valid JSON after {MAX_JSON_RETRIES + 1} attempt(s): {last_error}")
 
-    async def _ensure_word_limit(self, data: dict, provider: str, excluded_topics: list[str]) -> tuple[dict, str]:
+    async def _ensure_word_limit(
+        self, data: dict, provider: str, excluded_topics: list[str], topic_hint: str | None = None
+    ) -> tuple[dict, str]:
         content = data.get("content") if isinstance(data.get("content"), str) else ""
         if _word_count(content) <= MAX_WORDS:
             return data, provider
         logger.warning("Generated content exceeded %s words; regenerating once", MAX_WORDS)
         try:
-            return await self._generate_json(excluded_topics, strict_word_limit=True)
+            return await self._generate_json(excluded_topics, strict_word_limit=True, topic_hint=topic_hint)
         except BlogGenerationError:
             logger.warning("Word-limit regeneration failed; will truncate at a sentence boundary instead")
             return data, provider
@@ -308,16 +317,22 @@ class BlogGenerationService:
             logger.error("Failed to send the blog-generation failure alert email", exc_info=True)
 
 
-def _build_system_prompt(excluded_topics: list[str]) -> str:
+def _build_system_prompt(excluded_topics: list[str], topic_hint: str | None = None) -> str:
     excluded_str = "; ".join(excluded_topics) if excluded_topics else "(none yet)"
+    if topic_hint:
+        topic_instruction = f"""Write specifically about the following topic (you may narrow or angle it,
+but stay on this subject - do not substitute a different topic):
+{topic_hint}"""
+    else:
+        topic_instruction = """Pick ONE fresh, specific topic: either (a) a current trend in web
+development, AI, or social media relevant to small businesses right now, or
+(b) a common real-world business problem and how a consultancy like Webnest
+Studio would solve it."""
     return f"""You are writing a blog post for Webnest Studio, a tech consultancy offering
 web development, AI/ML solutions, and social media growth for small and
 medium businesses.
 
-Pick ONE fresh, specific topic: either (a) a current trend in web
-development, AI, or social media relevant to small businesses right now, or
-(b) a common real-world business problem and how a consultancy like Webnest
-Studio would solve it.
+{topic_instruction}
 
 Rules:
 - The article body ("content") must be at most 300 words, markdown format,
