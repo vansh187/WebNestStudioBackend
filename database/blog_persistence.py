@@ -48,9 +48,16 @@ class BlogPersistence(BasePersistence):
         return list(result.scalars().all())
 
     async def get_latest(self) -> BlogPost | None:
-        """Most recently published post (any status), used to gate the
-        recurring-generation 2-day cooldown."""
-        query = select(BlogPost).where(BlogPost.published_at.is_not(None)).order_by(BlogPost.published_at.desc()).limit(1)
+        """Most recently *live* post, used to gate the recurring-generation
+        2-day cooldown. Filtered to is_published=True so an unpublished draft
+        with a manually-set published_at can't be mistaken for the last real
+        publish and delay the next scheduled run."""
+        query = (
+            select(BlogPost)
+            .where(BlogPost.is_published.is_(True), BlogPost.published_at.is_not(None))
+            .order_by(BlogPost.published_at.desc())
+            .limit(1)
+        )
         result = await self._execute(query)
         return result.scalar_one_or_none()
 
@@ -62,9 +69,12 @@ class BlogPersistence(BasePersistence):
         return [row[0] for row in result.all() if row[0]]
 
     async def has_published_on_date(self, day_start: datetime, day_end: datetime) -> bool:
-        """Whether any post's published_at falls within [day_start, day_end) -
-        used to make the one-off launch post idempotent across restarts."""
+        """Whether any *live* post's published_at falls within
+        [day_start, day_end) - used to make the one-off launch post
+        idempotent across restarts. Filtered to is_published=True for the
+        same reason as get_latest()."""
         query = select(BlogPost.id).where(
+            BlogPost.is_published.is_(True),
             BlogPost.published_at.is_not(None),
             BlogPost.published_at >= day_start,
             BlogPost.published_at < day_end,

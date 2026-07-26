@@ -85,6 +85,9 @@ class BlogGenerationService:
             day_start_ist.astimezone(timezone.utc), day_end_ist.astimezone(timezone.utc)
         )
 
+    async def has_launch_post_already_run(self) -> bool:
+        return await self._logs.has_successful_run("scheduled-launch")
+
     # ---- Main entry point ----
 
     async def generate_and_publish(self, trigger_source: str, topic_hint: str | None = None) -> BlogPost:

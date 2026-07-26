@@ -103,6 +103,15 @@ async def _launch_special_post_job(database: Database, settings: Settings) -> No
     try:
         async with database.session_scope() as session:
             service = BlogGenerationService(session, settings)
+            # Checked first and permanently (not scoped to "today"): this job
+            # is meant to fire exactly once, ever. Relying only on "already
+            # published today" would make it re-fire on every restart/redeploy
+            # that happens on a day nothing else has published yet - which, on
+            # the every-2-days cadence, is most days after the launch date, as
+            # long as BLOG_LAUNCH_SPECIAL_POST_AT is left set in the environment.
+            if await service.has_launch_post_already_run():
+                logger.info("Skipping one-off launch post: it has already run previously")
+                return
             now_ist = datetime.now(IST)
             if await service.already_published_on_ist_date(now_ist):
                 logger.info("Skipping one-off launch post: a post was already published today")
