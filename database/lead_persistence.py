@@ -55,6 +55,13 @@ class LeadPersistence(BasePersistence):
         await self._refresh(lead)
         return lead
 
+    async def update_fields(self, lead: Lead, **fields) -> Lead:
+        for name, value in fields.items():
+            setattr(lead, name, value)
+        await self._commit()
+        await self._refresh(lead)
+        return lead
+
     async def soft_delete(self, lead: Lead) -> Lead:
         lead.is_deleted = True
         await self._commit()

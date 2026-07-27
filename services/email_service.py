@@ -1,10 +1,11 @@
+import base64
 import logging
 import time
 
 import httpx
 
 from core.config import Settings
-from services.email_templates import render_otp_email_html
+from services.email_templates import render_otp_email_html, render_plan_email_html
 
 logger = logging.getLogger("webnest.email")
 
@@ -37,7 +38,14 @@ class EmailService:
         """Returns (provider, from_address, is_configured) for diagnostics - never exposes the API key."""
         return "resend", self._settings.resend_from_address, self.is_configured()
 
-    async def _send(self, to_address: str, subject: str, body: str, html_body: str | None = None) -> tuple[bool, str]:
+    async def _send(
+        self,
+        to_address: str,
+        subject: str,
+        body: str,
+        html_body: str | None = None,
+        attachments: list[dict] | None = None,
+    ) -> tuple[bool, str]:
         if not self._settings.email_enabled:
             message = "Skipping email: EMAIL_ENABLED is false (email temporarily disabled)"
             logger.info("%s (to=%s)", message, to_address)
@@ -61,6 +69,8 @@ class EmailService:
         # actual mail clients display when they can.
         if html_body is not None:
             payload["html"] = html_body
+        if attachments:
+            payload["attachments"] = attachments
         headers = {"Authorization": f"Bearer {self._settings.resend_api_key}"}
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -139,6 +149,17 @@ class EmailService:
             f"Check it out and share it: {post_url}"
         )
         sent, _detail = await self._send(self._settings.blog_publish_notification_email, subject, body)
+        return sent
+
+    async def send_plan_email(self, to_address: str, project_type: str, pdf_bytes: bytes) -> bool:
+        subject = f"Your WebNest Studio project plan - {project_type}"
+        body = "Attached is your week-by-week project plan from WebNest Studio. Reply to this email anytime with questions."
+        html_body = render_plan_email_html(project_type)
+        attachment = {
+            "filename": "webnest-studio-plan.pdf",
+            "content": base64.b64encode(pdf_bytes).decode("ascii"),
+        }
+        sent, _detail = await self._send(to_address, subject, body, html_body=html_body, attachments=[attachment])
         return sent
 
     async def send_test_email(self, to_address: str) -> tuple[bool, str]:

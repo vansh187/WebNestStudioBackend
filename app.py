@@ -9,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from api.admin_router import router as admin_router
 from api.auth_router import router as auth_router
+from api.chat_router import router as chat_router
 from api.client_router import router as client_router
 from api.content_router import router as content_router
 from api.generation_router import router as generation_router
@@ -94,6 +95,7 @@ class WebNestStudioApp:
             client_router,
             sitemap_router,
             generation_router,
+            chat_router,
         ):
             self.instance.include_router(router)
 

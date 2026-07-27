@@ -13,12 +13,15 @@ from services.auth_service import AuthService
 from services.blog_generation_service import BlogGenerationService
 from services.blog_scheduler import create_scheduler
 from services.blog_service import BlogService
+from services.chat_orchestrator_service import ChatOrchestratorService
+from services.chatbot_service import ChatbotService
 from services.client_service import ClientService
 from services.email_service import EmailService
 from services.faq_service import FaqService
 from services.generation_service import GenerationService
 from services.lead_service import LeadService
 from services.newsletter_service import NewsletterService
+from services.plan_pdf_service import PlanPdfService
 from services.portfolio_service import PortfolioService
 from services.service_catalog_service import ServiceCatalogService
 from services.testimonial_service import TestimonialService
@@ -36,6 +39,7 @@ class DependencyContainer:
         self.jwt_handler = JWTHandler(app_settings)
         self.otp_generator = OtpGenerator(app_settings)
         self.email_service = EmailService(app_settings)
+        self.plan_pdf_service = PlanPdfService(app_settings)
         self.scheduler = create_scheduler()
 
 
@@ -99,6 +103,18 @@ def get_client_service(session: AsyncSession = Depends(get_db_session)) -> Clien
 
 def get_generation_service(session: AsyncSession = Depends(get_db_session)) -> GenerationService:
     return GenerationService(session=session, settings=container.settings)
+
+
+def get_chatbot_service(session: AsyncSession = Depends(get_db_session)) -> ChatbotService:
+    return ChatbotService(session=session, settings=container.settings)
+
+
+def get_chat_orchestrator_service(session: AsyncSession = Depends(get_db_session)) -> ChatOrchestratorService:
+    return ChatOrchestratorService(session=session, settings=container.settings)
+
+
+def get_plan_pdf_service() -> PlanPdfService:
+    return container.plan_pdf_service
 
 
 def get_client_ip(request: Request) -> str | None:

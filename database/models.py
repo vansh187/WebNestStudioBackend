@@ -261,3 +261,103 @@ class ProjectStatus(Base):
     phase: Mapped[str | None] = mapped_column(Text)
     percent_complete: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ChatbotThread(Base):
+    """One project-enquiry conversation: accumulates structured requirements
+    (project type/goal/pages/budget/timeline) turn-by-turn until a plan can
+    be generated. collected_fields_json is the exact state replayed to the
+    LLM as context each turn; the individual columns mirror it for querying."""
+
+    __tablename__ = "chatbot_threads"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="in_progress")
+    collected_fields_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    project_type: Mapped[str | None] = mapped_column(Text)
+    project_goal: Mapped[str | None] = mapped_column(Text)
+    pages_features: Mapped[str | None] = mapped_column(Text)
+    budget_range: Mapped[str | None] = mapped_column(Text)
+    timeline_expectation: Mapped[str | None] = mapped_column(Text)
+    lead_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("leads.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    messages: Mapped[list["ChatbotMessage"]] = relationship(back_populates="thread", cascade="all, delete-orphan", order_by="ChatbotMessage.created_at")
+
+
+class ChatbotMessage(Base):
+    __tablename__ = "chatbot_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    thread_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("chatbot_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    thread: Mapped["ChatbotThread"] = relationship(back_populates="messages")
+
+
+class ChatbotLimit(Base):
+    __tablename__ = "chatbot_limits"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ChatbotPlan(Base):
+    """One row per generated plan document (append-only - regenerating a plan
+    on the same thread inserts a new row rather than overwriting, the latest
+    one is what's served). plan_weeks_json is the single source rendered into
+    both the PDF and the inline HTML summary so they can never disagree."""
+
+    __tablename__ = "chatbot_plans"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    thread_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("chatbot_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_type: Mapped[str] = mapped_column(Text, nullable=False)
+    total_weeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    plan_weeks_json: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_used: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ChatThread(Base):
+    """The single conversation the chat widget reads/writes - owns the
+    unified transcript (ChatMessage) and, once its first real message
+    resolves an intent, locks into either "page_builder" (delegating to the
+    existing Generation/GenerationService) or "enquiry" (delegating to
+    ChatbotThread/ChatbotService) for the rest of its life."""
+
+    __tablename__ = "chat_threads"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(Text, nullable=False, default="undecided")
+    generation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("generations.id", ondelete="SET NULL"))
+    enquiry_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("chatbot_threads.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    messages: Mapped[list["ChatMessage"]] = relationship(back_populates="thread", cascade="all, delete-orphan", order_by="ChatMessage.created_at")
+
+
+class ChatMessage(Base):
+    """The transcript the widget actually reads - every user/assistant turn
+    regardless of which mode handled it, so the frontend never has to merge
+    separate GenerationMessage/ChatbotMessage timelines itself."""
+
+    __tablename__ = "chat_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    chat_thread_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("chat_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    thread: Mapped["ChatThread"] = relationship(back_populates="messages")

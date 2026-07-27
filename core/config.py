@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     # time a post (scheduled or manually triggered) is successfully published.
     blog_publish_notification_email: str = "webneststudio19@gmail.com"
 
+    # Project Enquiry Chatbot: gathers project requirements from a logged-in
+    # user via conversational turns, then produces a week-by-week build plan
+    # (no pricing). Reuses the same Gemini/Groq provider account and API keys
+    # as the AI Page Builder above - no separate credentials needed, just its
+    # own rate limit and length caps so the two features don't share one bucket.
+    chatbot_enabled: bool = True
+    chatbot_rate_limit_per_hour: int = 10
+    chatbot_max_message_length: int = 1000
+    chatbot_max_transcript_messages: int = 20
+    chatbot_plan_max_weeks: int = 20
+
     @property
     def async_database_url(self) -> str:
         raw = self.supabase_url.strip()
