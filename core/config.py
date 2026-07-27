@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
 
     # Public site origin used to build absolute URLs in sitemap.xml / robots.txt.
-    frontend_base_url: str = "https://webneststudio.co.in"
+    frontend_base_url: str = "https://www.webneststudio.co.in"
 
     # AI Page Builder: Gemini (primary) + Groq (fallback) generation.
     gemini_api_key: str = ""
