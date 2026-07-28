@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 
 from PIL import Image as PILImage
+from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
@@ -37,16 +38,30 @@ def _logo_is_valid() -> bool:
         return False
 
 _TITLE_STYLE = ParagraphStyle(
-    "PlanTitle", fontName="Helvetica-Bold", fontSize=20, textColor=colors.HexColor(BRAND_INK), spaceAfter=4
+    "PlanTitle",
+    fontName="Helvetica-Bold",
+    fontSize=20,
+    leading=25,  # reportlab's ParagraphStyle defaults leading to a flat 12pt
+    # regardless of fontSize - left unset, a 20pt title's glyphs overflow a
+    # 12pt-tall line box and visually collide with the paragraph after it.
+    textColor=colors.HexColor(BRAND_INK),
+    spaceAfter=6,
+    alignment=TA_CENTER,
 )
 _SUBTITLE_STYLE = ParagraphStyle(
-    "PlanSubtitle", fontName="Helvetica", fontSize=11, textColor=colors.HexColor(BRAND_MUTED), spaceAfter=2
+    "PlanSubtitle",
+    fontName="Helvetica",
+    fontSize=11,
+    leading=15,
+    textColor=colors.HexColor(BRAND_MUTED),
+    spaceAfter=3,
+    alignment=TA_CENTER,
 )
 _WEEK_HEADING_STYLE = ParagraphStyle(
     "WeekHeading", fontName="Helvetica-Bold", fontSize=12, textColor=colors.white, leading=16
 )
 _WEEK_TITLE_STYLE = ParagraphStyle(
-    "WeekTitle", fontName="Helvetica-Bold", fontSize=12, textColor=colors.HexColor(BRAND_INK), spaceAfter=2
+    "WeekTitle", fontName="Helvetica-Bold", fontSize=12, leading=16, textColor=colors.HexColor(BRAND_INK), spaceAfter=3
 )
 _WEEK_BODY_STYLE = ParagraphStyle(
     "WeekBody", fontName="Helvetica", fontSize=10, textColor=colors.HexColor(BRAND_INK), leading=14
@@ -77,8 +92,10 @@ class PlanPdfService:
 
         story = []
         if _logo_is_valid():
-            story.append(Image(str(_LOGO_PATH), width=28 * mm, height=28 * mm))
-            story.append(Spacer(1, 8))
+            logo = Image(str(_LOGO_PATH), width=24 * mm, height=24 * mm)
+            logo.hAlign = "CENTER"
+            story.append(logo)
+            story.append(Spacer(1, 10))
 
         story.append(Paragraph("WebNest Studio", _TITLE_STYLE))
         story.append(Paragraph("Business &amp; Timeline Plan", _SUBTITLE_STYLE))
@@ -86,7 +103,7 @@ class PlanPdfService:
         generated_for = f"Prepared for {escape(contact_name)}" if contact_name else "Prepared for you"
         generated_at = datetime.now(timezone.utc).strftime("%B %d, %Y")
         story.append(Paragraph(f"{generated_for} &middot; {generated_at} &middot; {total_weeks} weeks", _SUBTITLE_STYLE))
-        story.append(Spacer(1, 20))
+        story.append(Spacer(1, 24))
 
         for week in weeks:
             header_table = Table(
