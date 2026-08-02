@@ -41,6 +41,17 @@ _FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULT
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
 _WORD_PATTERN = re.compile(r"\S+")
 _MARKDOWN_NOISE = re.compile(r"[#*_`>]+")
+# Strips trailing/inline hashtag clusters (e.g. "#WebDesign #SmallBusiness")
+# that the LLM sometimes appends despite the prompt forbidding them. Only
+# matches a "#" directly followed by a word - markdown "## Heading" is safe
+# since a heading's "#" is followed by a space, not a word character.
+_HASHTAG = re.compile(r"(?<!\w)#\w+")
+# Matches a markdown heading marker ("#", "##", or "###" + a space) that the
+# LLM glued onto the end of the previous sentence instead of putting on its
+# own line - e.g. "...processes. ## Key Features". Without a preceding blank
+# line, markdown renderers show the literal "##" text instead of a heading,
+# which reads to a viewer like a stray hashtag.
+_GLUED_HEADING = re.compile(r"(?<!^)(?<!\n)(#{1,3} )")
 
 
 class BlogGenerationError(Exception):
@@ -210,8 +221,8 @@ class BlogGenerationService:
             return data, provider
 
     def _validate_and_heal(self, data: dict) -> dict:
-        title = _clean_str(data.get("title"))
-        content = _clean_str(data.get("content"))
+        title = _strip_hashtags(_clean_str(data.get("title")))
+        content = _normalize_headings(_strip_hashtags(_clean_str(data.get("content"))))
         if not title:
             raise BlogGenerationError("LLM response was missing a non-empty 'title'")
         if not content:
@@ -223,7 +234,7 @@ class BlogGenerationService:
             content = _truncate_to_word_limit(content, MAX_WORDS)
         word_count = _word_count(content)
 
-        excerpt = _clean_str(data.get("excerpt")) or _derive_excerpt(content)
+        excerpt = _strip_hashtags(_clean_str(data.get("excerpt"))) or _derive_excerpt(content)
 
         meta_title = _clean_str(data.get("meta_title"))
         if not meta_title or len(meta_title) > 70:
@@ -339,8 +350,17 @@ medium businesses.
 
 Rules:
 - The article body ("content") must be at most 300 words, markdown format,
-  with a hook opening, 2-3 short "##" subheadings, and a closing call-to-
+  with a punchy hook opening (a bold claim, surprising stat, or relatable pain
+  point - not a generic "In today's world..." line), 2-3 short "##"
+  subheadings, at least one concrete example, number, or actionable tip so it
+  reads as genuinely useful rather than generic filler, and a closing call-to-
   action toward Webnest Studio's services.
+- Write in an engaging, confident, conversational tone - vary sentence length,
+  avoid clichés and corporate buzzwords, and make it something a small
+  business owner would actually enjoy reading.
+- Do NOT include any hashtags (e.g. "#SmallBusiness", "#WebDesign") anywhere
+  in the title, excerpt, or content - this is a blog article, not a social
+  media caption. Use the dedicated "keywords" field for SEO terms instead.
 - Include 4-6 realistic SEO keywords/phrases naturally within the content
   (not stuffed) - prefer specific, moderately-searched, long-tail phrases a
   small business owner would actually type into Google, over generic single
@@ -390,6 +410,20 @@ def _truncate(text: str, max_length: int) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 1].rstrip() + "…"
+
+
+def _strip_hashtags(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _HASHTAG.sub("", text)
+    # Collapse any double spaces / stray blank lines left behind by removal.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_headings(content: str) -> str:
+    return _GLUED_HEADING.sub(r"\n\n\1", content)
 
 
 def _derive_excerpt(content: str) -> str:
