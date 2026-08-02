@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     # AI Page Builder: Gemini (primary) + Groq (fallback) generation.
     gemini_api_key: str = ""
     groq_api_key: str = ""
-    gemini_model: str = "gemini-flash-latest"
+    gemini_model: str = "gemini-3.5-flash-lite"
     groq_model: str = "llama-3.3-70b-versatile"
     rate_limit_per_hour: int = 5
     max_prompt_length: int = 500
