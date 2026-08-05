@@ -18,7 +18,7 @@ logger = logging.getLogger("webnest.blog_generation")
 
 MAX_WORDS = 300
 MAX_TOPIC_RETRIES = 3
-MAX_JSON_RETRIES = 1
+MAX_JSON_RETRIES = 2
 MAX_SLUG_RETRIES = 5
 # How many historical topics get sent into the prompt's exclusion list. The
 # *validation* below still checks the freshly generated topic against the
@@ -391,7 +391,10 @@ def _parse_json(raw_text: str) -> dict:
     # treating an otherwise-valid response as a hard failure.
     text = _FENCE_PATTERN.sub("", text).strip()
     try:
-        data = json.loads(text)
+        # strict=False tolerates literal control characters (raw newlines/tabs)
+        # inside JSON string values - LLMs frequently emit these in multi-
+        # paragraph "content" fields instead of the escaped \n the spec requires.
+        data = json.loads(text, strict=False)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid JSON: {exc}") from exc
     if not isinstance(data, dict):
