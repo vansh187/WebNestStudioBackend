@@ -1,3 +1,4 @@
+import difflib
 import json
 import logging
 import re
@@ -24,6 +25,24 @@ MAX_SLUG_RETRIES = 5
 # *validation* below still checks the freshly generated topic against the
 # full historical set (unbounded) - this cap only bounds prompt token usage.
 MAX_EXCLUDED_TOPICS_IN_PROMPT = 40
+# How many recent post titles get shown to the model as "already published,
+# don't rephrase these". Same rationale as the topic cap - bounds token use
+# while the post-generation similarity check below still runs against every
+# historical title.
+MAX_RECENT_TITLES_IN_PROMPT = 20
+# A freshly generated title is treated as a duplicate of an existing one when
+# either the normalized character-level similarity ratio, or the word-set
+# overlap (Jaccard), is at or above these thresholds. Tuned so "... AI Search
+# Optimization" vs "... AI Search Optimization Now" is caught while two
+# genuinely different posts that share a stock "Why Your Small Business..."
+# opening are not.
+TITLE_SIMILARITY_RATIO = 0.8
+TITLE_TOKEN_OVERLAP = 0.75
+# Common filler words stripped before the word-set comparison so near-identical
+# titles aren't hidden by, or falsely flagged from, shared connective tissue.
+_TITLE_STOPWORDS = frozenset(
+    "a an and the to for of your you is are with how why what when in on it its".split()
+)
 
 FALLBACK_KEYWORD_POOL = [
     "small business website design",
@@ -152,32 +171,56 @@ class BlogGenerationService:
         normalized_existing = {t.strip().lower() for t in existing_topics if t}
         excluded_for_prompt = existing_topics[:MAX_EXCLUDED_TOPICS_IN_PROMPT]
 
-        data, provider = await self._generate_json(excluded_for_prompt, topic_hint=topic_hint)
-        data, provider = await self._ensure_word_limit(data, provider, excluded_for_prompt, topic_hint=topic_hint)
+        existing_titles = await self._blog_posts.list_titles()
+        recent_titles = existing_titles[:MAX_RECENT_TITLES_IN_PROMPT]
+
+        data, provider = await self._generate_json(excluded_for_prompt, recent_titles, topic_hint=topic_hint)
+        data, provider = await self._ensure_word_limit(
+            data, provider, excluded_for_prompt, recent_titles, topic_hint=topic_hint
+        )
         topic_tag = _clean_str(data.get("topic_tag")) or "general"
+        title = _clean_str(data.get("title"))
 
-        # A directed topic (topic_hint) is trusted as-is even if its topic_tag
-        # happens to collide with a prior post - the caller asked for this
-        # exact subject deliberately, so the uniqueness retry loop (which
-        # exists to stop the model repeating itself when picking freely)
-        # doesn't apply here.
+        # A directed topic (topic_hint) is trusted as-is even if it collides
+        # with a prior post - the caller asked for this exact subject
+        # deliberately, so the uniqueness retry loop (which exists to stop the
+        # model repeating itself when picking freely) doesn't apply here. The
+        # slug de-dup in _persist_with_unique_slug still runs regardless.
+        def _duplicate_of() -> str | None:
+            """Returns a human-readable reason string if the current draft
+            duplicates an existing post (by topic_tag or by title), else None."""
+            if topic_tag.strip().lower() in normalized_existing:
+                return f"topic_tag {topic_tag!r}"
+            match = _closest_title(title, existing_titles)
+            if match is not None:
+                return f"title {title!r} closely matches existing {match!r}"
+            return None
+
         attempts = 0
-        while topic_hint is None and topic_tag.strip().lower() in normalized_existing and attempts < MAX_TOPIC_RETRIES:
+        reason = _duplicate_of() if topic_hint is None else None
+        while reason is not None and attempts < MAX_TOPIC_RETRIES:
             attempts += 1
-            logger.warning(
-                "Generated topic_tag %r collides with an existing topic, retrying (%s/%s)",
-                topic_tag,
-                attempts,
-                MAX_TOPIC_RETRIES,
-            )
-            excluded_for_prompt = list(dict.fromkeys([*excluded_for_prompt, topic_tag]))
-            data, provider = await self._generate_json(excluded_for_prompt)
-            data, provider = await self._ensure_word_limit(data, provider, excluded_for_prompt)
+            logger.warning("Generated post duplicates a prior one (%s), retrying (%s/%s)", reason, attempts, MAX_TOPIC_RETRIES)
+            excluded_for_prompt = list(dict.fromkeys([*excluded_for_prompt, topic_tag, title]))
+            recent_titles = list(dict.fromkeys([title, *recent_titles]))[:MAX_RECENT_TITLES_IN_PROMPT]
+            data, provider = await self._generate_json(excluded_for_prompt, recent_titles)
+            data, provider = await self._ensure_word_limit(data, provider, excluded_for_prompt, recent_titles)
             topic_tag = _clean_str(data.get("topic_tag")) or "general"
+            title = _clean_str(data.get("title"))
+            reason = _duplicate_of()
 
-        if topic_hint is None and topic_tag.strip().lower() in normalized_existing:
+        if reason is not None:
+            # Retries exhausted and it still looks like a repeat. Auto-uniquify
+            # the topic_tag so the audit trail stays honest, and let it publish
+            # with a loud warning rather than failing the whole run over a
+            # near-duplicate - the slug is still forced unique downstream.
             uniquified = f"{topic_tag} ({datetime.now(timezone.utc).date().isoformat()})"
-            logger.warning("Auto-uniquifying topic_tag %r -> %r after exhausting retries", topic_tag, uniquified)
+            logger.warning(
+                "Publishing a possible near-duplicate after exhausting retries (%s); topic_tag %r -> %r",
+                reason,
+                topic_tag,
+                uniquified,
+            )
             data["topic_tag"] = uniquified
 
         post_fields = self._validate_and_heal(data)
@@ -185,9 +228,13 @@ class BlogGenerationService:
         return post, provider, post.topic_tag or topic_tag
 
     async def _generate_json(
-        self, excluded_topics: list[str], strict_word_limit: bool = False, topic_hint: str | None = None
+        self,
+        excluded_topics: list[str],
+        recent_titles: list[str] | None = None,
+        strict_word_limit: bool = False,
+        topic_hint: str | None = None,
     ) -> tuple[dict, str]:
-        system_prompt = _build_system_prompt(excluded_topics, topic_hint=topic_hint)
+        system_prompt = _build_system_prompt(excluded_topics, recent_titles or [], topic_hint=topic_hint)
         user_message = "Generate today's blog post as JSON."
         if strict_word_limit:
             user_message += (
@@ -208,14 +255,21 @@ class BlogGenerationService:
         raise BlogGenerationError(f"LLM did not return valid JSON after {MAX_JSON_RETRIES + 1} attempt(s): {last_error}")
 
     async def _ensure_word_limit(
-        self, data: dict, provider: str, excluded_topics: list[str], topic_hint: str | None = None
+        self,
+        data: dict,
+        provider: str,
+        excluded_topics: list[str],
+        recent_titles: list[str] | None = None,
+        topic_hint: str | None = None,
     ) -> tuple[dict, str]:
         content = data.get("content") if isinstance(data.get("content"), str) else ""
         if _word_count(content) <= MAX_WORDS:
             return data, provider
         logger.warning("Generated content exceeded %s words; regenerating once", MAX_WORDS)
         try:
-            return await self._generate_json(excluded_topics, strict_word_limit=True, topic_hint=topic_hint)
+            return await self._generate_json(
+                excluded_topics, recent_titles, strict_word_limit=True, topic_hint=topic_hint
+            )
         except BlogGenerationError:
             logger.warning("Word-limit regeneration failed; will truncate at a sentence boundary instead")
             return data, provider
@@ -331,8 +385,11 @@ class BlogGenerationService:
             logger.error("Failed to send the blog-generation failure alert email", exc_info=True)
 
 
-def _build_system_prompt(excluded_topics: list[str], topic_hint: str | None = None) -> str:
+def _build_system_prompt(
+    excluded_topics: list[str], recent_titles: list[str], topic_hint: str | None = None
+) -> str:
     excluded_str = "; ".join(excluded_topics) if excluded_topics else "(none yet)"
+    recent_titles_str = "; ".join(f'"{t}"' for t in recent_titles) if recent_titles else "(none yet)"
     if topic_hint:
         topic_instruction = f"""Write specifically about the following topic (you may narrow or angle it,
 but stay on this subject - do not substitute a different topic):
@@ -370,6 +427,8 @@ Rules:
 - slug: lowercase, hyphen-separated, url-safe, derived from the title.
 - topic_tag: a short 2-5 word label for this topic, distinct in wording from the title.
 - Do NOT reuse or closely rephrase any of these previously covered topics: {excluded_str}
+- Do NOT reuse or lightly reword any of these already-published titles (pick a
+  genuinely different angle, not the same headline with an extra word): {recent_titles_str}
 
 Return ONLY valid JSON, no markdown code fences, no extra commentary:
 {{
@@ -473,6 +532,36 @@ def _truncate_to_word_limit(content: str, max_words: int) -> str:
 
     truncated = " ".join(kept).strip()
     return truncated if truncated else " ".join(words[:max_words])
+
+
+def _normalize_title(title: str) -> str:
+    return _NON_ALNUM.sub(" ", (title or "").lower()).strip()
+
+
+def _title_word_set(title: str) -> set[str]:
+    return {w for w in _normalize_title(title).split() if w and w not in _TITLE_STOPWORDS}
+
+
+def _closest_title(candidate: str, existing: list[str]) -> str | None:
+    """Returns the first existing title the candidate duplicates - either a
+    high character-level similarity ratio or a high content-word overlap -
+    or None if the candidate reads as genuinely new."""
+    cand_norm = _normalize_title(candidate)
+    if not cand_norm:
+        return None
+    cand_words = _title_word_set(candidate)
+    for other in existing:
+        other_norm = _normalize_title(other)
+        if not other_norm:
+            continue
+        if difflib.SequenceMatcher(None, cand_norm, other_norm).ratio() >= TITLE_SIMILARITY_RATIO:
+            return other
+        other_words = _title_word_set(other)
+        if cand_words and other_words:
+            overlap = len(cand_words & other_words) / len(cand_words | other_words)
+            if overlap >= TITLE_TOKEN_OVERLAP:
+                return other
+    return None
 
 
 def _as_aware(value: datetime) -> datetime:

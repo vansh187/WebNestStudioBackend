@@ -1,6 +1,6 @@
 # AI Page Builder — API Reference (Frontend Integration)
 
-**Base URL:** `https://webneststudiobackend.onrender.com`
+**Base URL:** `https://webneststudiobackend-n00h.onrender.com`
 
 All endpoints below require the same JWT auth already used for the rest of the site (`POST /api/auth/login` → `access_token`). There is no separate auth system for this feature — anonymous use is not supported.
 

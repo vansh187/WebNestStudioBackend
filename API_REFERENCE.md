@@ -1,6 +1,6 @@
 # WebNest Studio API Reference (for Frontend Integration)
 
-**Base URL:** `https://webneststudiobackend.onrender.com`
+**Base URL:** `https://webneststudiobackend-n00h.onrender.com`
 
 All paths below are relative to this base URL. All request/response bodies are JSON (`Content-Type: application/json`), except where noted.
 
@@ -797,4 +797,4 @@ No auth. Use for uptime monitors / to "wake up" the Render instance before a dem
 1. Store `access_token` in memory (not localStorage if you can help it) and `refresh_token` in an httpOnly cookie or secure storage.
 2. On `401` from any authenticated call, try `POST /api/auth/refresh` once, then retry the original request. If refresh also fails, force re-login.
 3. Every public form on the site posts to `POST /api/leads` — just switch the `source` value per form (see the table in section 2).
-4. Interactive Swagger docs are also live at `https://webneststudiobackend.onrender.com/docs` if you want to try requests directly in the browser.
+4. Interactive Swagger docs are also live at `https://webneststudiobackend-n00h.onrender.com/docs` if you want to try requests directly in the browser.

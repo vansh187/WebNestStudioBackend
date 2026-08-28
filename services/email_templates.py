@@ -1,6 +1,6 @@
 from html import escape
 
-LOGO_URL = "https://webneststudiobackend.onrender.com/assets/logo.png"
+LOGO_URL = "https://webneststudiobackend-n00h.onrender.com/assets/logo.png"
 BRAND_PURPLE = "#7e14ff"
 BRAND_INK = "#1a1230"
 BRAND_MUTED = "#6b6480"
