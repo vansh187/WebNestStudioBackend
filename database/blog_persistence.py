@@ -68,6 +68,14 @@ class BlogPersistence(BasePersistence):
         result = await self._execute(query)
         return [row[0] for row in result.all() if row[0]]
 
+    async def list_titles(self) -> list[str]:
+        """Every historical post title ever used (any status), newest first, so
+        a freshly generated post can be rejected if its title merely rephrases
+        an existing one (the topic_tag check only catches exact-tag repeats)."""
+        query = select(BlogPost.title).where(BlogPost.title.is_not(None)).order_by(BlogPost.created_at.desc())
+        result = await self._execute(query)
+        return [row[0] for row in result.all() if row[0]]
+
     async def has_published_on_date(self, day_start: datetime, day_end: datetime) -> bool:
         """Whether any *live* post's published_at falls within
         [day_start, day_end) - used to make the one-off launch post

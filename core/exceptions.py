@@ -26,6 +26,10 @@ class ValidationError(DomainError):
     pass
 
 
+class PayloadTooLargeError(DomainError):
+    pass
+
+
 class DatabaseError(DomainError):
     """Raised when a database operation fails for reasons outside the caller's control
     (connection drop, constraint violation not otherwise mapped, timeout, etc.)."""
