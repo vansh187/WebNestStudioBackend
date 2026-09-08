@@ -352,18 +352,26 @@ class CodingService(BasePersistence):
             "versionIndex": version_index,
             "stdin": stdin or "",
         }
-        try:
-            async with httpx.AsyncClient(timeout=self._settings.compiler_request_timeout_seconds) as client:
-                response = await client.post(url, json=payload)
-        except httpx.TimeoutException:
-            # Let execute() turn this into a "timeout" result, not an engine outage.
-            raise
-        except httpx.HTTPError as exc:
-            raise GenerationUnavailableError("Compiler engine is temporarily unavailable.") from exc
+        # JDoodle's free plan throttles bursts with a 429 well before the daily
+        # credit cap; retry once after a short pause to absorb that.
+        response = None
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=self._settings.compiler_request_timeout_seconds) as client:
+                    response = await client.post(url, json=payload)
+            except httpx.TimeoutException:
+                # Let execute() turn this into a "timeout" result, not an engine outage.
+                raise
+            except httpx.HTTPError as exc:
+                raise GenerationUnavailableError("Compiler engine is temporarily unavailable.") from exc
+            if response.status_code != 429 or attempt == 1:
+                break
+            await asyncio.sleep(1.2)
+
         if response.status_code in (401, 403):
             raise GenerationUnavailableError("Compiler engine credentials are invalid.")
         if response.status_code == 429:
-            raise RateLimitedError("Daily execution quota reached. Try again tomorrow.")
+            raise RateLimitedError("The compiler engine is busy right now. Try again in a few seconds.")
         if response.status_code >= 500:
             raise GenerationUnavailableError("Compiler engine is temporarily unavailable.")
         if response.status_code >= 400:
@@ -380,7 +388,9 @@ class CodingService(BasePersistence):
         if error and raw_output is None:
             status_code = data.get("statusCode")
             if status_code == 429:
-                raise RateLimitedError("Daily execution quota reached. Try again tomorrow.")
+                # 429 in the body means the daily credit cap is spent, unlike a
+                # transport-level 429 which is JDoodle's short-term burst throttle.
+                raise RateLimitedError("Daily execution limit reached. Try again tomorrow.")
             if status_code in (401, 403):
                 raise GenerationUnavailableError("Compiler engine credentials are invalid.")
             raise GenerationUnavailableError("Compiler engine returned an error.")
