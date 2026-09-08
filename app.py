@@ -11,6 +11,7 @@ from api.admin_router import router as admin_router
 from api.auth_router import router as auth_router
 from api.chat_router import router as chat_router
 from api.client_router import router as client_router
+from api.coding_router import router as coding_router
 from api.content_router import router as content_router
 from api.generation_router import router as generation_router
 from api.home_router import router as home_router
@@ -96,6 +97,7 @@ class WebNestStudioApp:
             sitemap_router,
             generation_router,
             chat_router,
+            coding_router,
         ):
             self.instance.include_router(router)
 

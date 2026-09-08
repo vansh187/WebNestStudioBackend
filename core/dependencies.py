@@ -15,6 +15,7 @@ from services.blog_scheduler import create_scheduler
 from services.blog_service import BlogService
 from services.chat_orchestrator_service import ChatOrchestratorService
 from services.chatbot_service import ChatbotService
+from services.coding_service import CodingService
 from services.client_service import ClientService
 from services.email_service import EmailService
 from services.faq_service import FaqService
@@ -113,6 +114,10 @@ def get_chat_orchestrator_service(session: AsyncSession = Depends(get_db_session
     return ChatOrchestratorService(session=session, settings=container.settings)
 
 
+def get_coding_service(session: AsyncSession = Depends(get_db_session)) -> CodingService:
+    return CodingService(session=session, settings=container.settings)
+
+
 def get_plan_pdf_service() -> PlanPdfService:
     return container.plan_pdf_service
 
@@ -140,6 +145,18 @@ async def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired access token") from exc
+
+
+async def get_optional_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    auth_service: AuthService = Depends(get_auth_service),
+) -> User | None:
+    if credentials is None or not credentials.credentials:
+        return None
+    try:
+        return await auth_service.get_current_user(credentials.credentials)
+    except (UnauthorizedError, ValueError):
+        return None
 
 
 class RoleChecker:
