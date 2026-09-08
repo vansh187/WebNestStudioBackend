@@ -15,20 +15,29 @@ Implemented endpoints:
 
 ## Compiler Engine
 
-`POST /api/compiler/execute` proxies to a separate Piston-compatible sandbox.
-Set these environment variables in production:
+`POST /api/compiler/execute` proxies to JDoodle's hosted sandbox
+(https://www.jdoodle.com/compiler-api). Set these environment variables in production:
 
-- `PISTON_BASE_URL`: base URL for the always-on Piston service, for example `https://piston.example.com`
-- `COMPILER_REQUEST_TIMEOUT_SECONDS`: API-to-Piston HTTP timeout, default `12`
-- `COMPILER_RUN_TIMEOUT_MS`: run timeout sent to Piston, default `5000`
-- `COMPILER_COMPILE_TIMEOUT_MS`: compile timeout sent to Piston, default `5000`
-- `COMPILER_MEMORY_LIMIT_BYTES`: compile/run memory limit, default `268435456`
-- `COMPILER_OUTPUT_LIMIT_BYTES`: max captured bytes per stream returned by this API, default `65536`
+- `JDOODLE_CLIENT_ID` / `JDOODLE_CLIENT_SECRET`: credentials from the JDoodle Compiler API dashboard (free plan: 200 runs/day)
+- `JDOODLE_BASE_URL`: API base, default `https://api.jdoodle.com/v1`
+- `COMPILER_REQUEST_TIMEOUT_SECONDS`: API-to-JDoodle HTTP timeout, default `20`
+- `COMPILER_OUTPUT_LIMIT_BYTES`: max captured output bytes returned by this API, default `65536`
 - `COMPILER_SOURCE_LIMIT_BYTES`: max execution source bytes, default `131072`
 
-When `PISTON_BASE_URL` is empty, `/api/compiler/execute` returns `503`.
+When the JDoodle credentials are unset, `/api/compiler/execute` returns `503`.
 The API intentionally does not execute untrusted user code inside the FastAPI
 process.
+
+JDoodle limitations reflected in the response:
+- One entry-point file is executed (the file named `main.*`, else the first file);
+  multi-file projects are not compiled together.
+- JDoodle merges program output and error text into a single field, so `stdout`
+  carries everything, `stderr` is always empty, and `exit_code` / `signal` /
+  `compile` are `null`. `status` is `success` unless a timeout is detected or
+  JDoodle explicitly reports failure.
+- Command-line `args` are ignored (not supported by the JDoodle execute API).
+- Pass a plain-integer `version` (e.g. `"0"`) to pin a specific JDoodle
+  `versionIndex`; otherwise a sensible default per language is used.
 
 Rate limiting returns HTTP `429` with `{ "detail": "Too many runs, try again in a minute." }`.
 

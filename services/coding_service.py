@@ -15,7 +15,7 @@ from core.config import Settings
 from core.exceptions import GenerationUnavailableError, NotFoundError, PayloadTooLargeError, RateLimitedError, ValidationError
 from database.base_persistence import BasePersistence
 from database.models import CodingExecution, CodingProject, CodingShare, User
-from schemas.coding_schemas import CodingFile, ExecuteRequest, ExecuteResponse
+from schemas.coding_schemas import CodingFile, CompileResult, ExecuteRequest, ExecuteResponse
 
 logger = logging.getLogger("webnest.coding")
 
@@ -24,7 +24,21 @@ ANON_PER_DAY = 200
 AUTH_PER_MINUTE = 120
 SHARES_PER_HOUR = 60
 
-COMPILED_LANGUAGES = {"java", "c", "cpp", "go", "typescript"}
+# Maps our language ids to JDoodle's (language, default versionIndex) pair.
+# versionIndex selects the runtime build; JDoodle keeps older indexes valid when
+# it adds new ones, so these stay stable. A caller may still override the index
+# by passing a plain-integer `version` in the execute request.
+# Ref: https://docs.jdoodle.com/compiler-api/compiler-api
+JDOODLE_LANGUAGES = {
+    "javascript": ("nodejs", "4"),
+    "python": ("python3", "4"),
+    "java": ("java", "4"),
+    "c": ("c", "5"),
+    "cpp": ("cpp17", "1"),
+    "typescript": ("typescript", "1"),
+    "go": ("go", "4"),
+    "ruby": ("ruby", "4"),
+}
 
 LANGUAGES = [
     {
@@ -149,20 +163,38 @@ class CodingService(BasePersistence):
 
     async def execute(self, payload: ExecuteRequest, user: User | None, client_ip: str | None) -> ExecuteResponse:
         files = self._normalize_files(payload.language, payload.files, payload.source)
-        language = self._get_language(payload.language)
+        self._get_language(payload.language)
         self._validate_total_size(files, self._settings.compiler_source_limit_bytes)
         await self._check_execute_rate_limit(user, client_ip)
 
-        if not self._settings.piston_base_url.strip():
-            raise GenerationUnavailableError("Compiler engine is not configured. Set PISTON_BASE_URL to enable execution.")
+        if not (self._settings.jdoodle_client_id.strip() and self._settings.jdoodle_client_secret.strip()):
+            raise GenerationUnavailableError(
+                "Compiler engine is not configured. Set JDOODLE_CLIENT_ID and JDOODLE_CLIENT_SECRET to enable execution."
+            )
 
         started = time.perf_counter()
         status = "internal_error"
         time_ms = 0
         try:
-            response_data = await self._call_piston(language, payload.version, files, payload.stdin, payload.args)
-            wall_time_ms = int((time.perf_counter() - started) * 1000)
-            result = self._map_piston_response(payload.language, response_data, wall_time_ms)
+            try:
+                response_data = await self._call_jdoodle(payload.language, payload.version, files, payload.stdin)
+                wall_time_ms = int((time.perf_counter() - started) * 1000)
+                result = self._map_jdoodle_response(payload.language, response_data, wall_time_ms)
+            except httpx.TimeoutException:
+                # The engine did not answer within compiler_request_timeout_seconds:
+                # report it as a run timeout rather than an engine outage.
+                wall_time_ms = int((time.perf_counter() - started) * 1000)
+                result = ExecuteResponse(
+                    status="timeout",
+                    stdout="",
+                    stderr="Execution timed out.",
+                    exit_code=None,
+                    signal=None,
+                    compile=None,
+                    time_ms=0,
+                    wall_time_ms=wall_time_ms,
+                    truncated=False,
+                )
             status = result.status
             time_ms = result.time_ms
             return result
@@ -299,26 +331,39 @@ class CodingService(BasePersistence):
         count, last_activity_at = result.one()
         return count or 0, last_activity_at
 
-    async def _call_piston(
-        self, language: dict, version: str | None, files: list[CodingFile], stdin: str, args: list[str]
+    async def _call_jdoodle(
+        self, language_id: str, version: str | None, files: list[CodingFile], stdin: str
     ) -> dict:
-        url = self._settings.piston_base_url.rstrip("/") + "/api/v2/execute"
+        jdoodle_language, version_index = JDOODLE_LANGUAGES.get(language_id, (None, None))
+        if jdoodle_language is None:
+            raise ValidationError("This language cannot be executed by the compiler engine.")
+        # A caller may pin a specific runtime build by passing a plain-integer version.
+        if version and version.strip().isdigit():
+            version_index = version.strip()
+
+        # JDoodle's execute API runs a single script; send the entry-point file.
+        entry = next((f for f in files if f.name.startswith("main.")), files[0])
+        url = self._settings.jdoodle_base_url.rstrip("/") + "/execute"
         payload = {
-            "language": language["id"],
-            "version": version or language["version"],
-            "files": [file.model_dump() for file in files],
-            "stdin": stdin,
-            "args": args,
-            "compile_timeout": self._settings.compiler_compile_timeout_ms,
-            "run_timeout": self._settings.compiler_run_timeout_ms,
-            "compile_memory_limit": self._settings.compiler_memory_limit_bytes,
-            "run_memory_limit": self._settings.compiler_memory_limit_bytes,
+            "clientId": self._settings.jdoodle_client_id,
+            "clientSecret": self._settings.jdoodle_client_secret,
+            "script": entry.content,
+            "language": jdoodle_language,
+            "versionIndex": version_index,
+            "stdin": stdin or "",
         }
         try:
             async with httpx.AsyncClient(timeout=self._settings.compiler_request_timeout_seconds) as client:
                 response = await client.post(url, json=payload)
+        except httpx.TimeoutException:
+            # Let execute() turn this into a "timeout" result, not an engine outage.
+            raise
         except httpx.HTTPError as exc:
             raise GenerationUnavailableError("Compiler engine is temporarily unavailable.") from exc
+        if response.status_code in (401, 403):
+            raise GenerationUnavailableError("Compiler engine credentials are invalid.")
+        if response.status_code == 429:
+            raise RateLimitedError("Daily execution quota reached. Try again tomorrow.")
         if response.status_code >= 500:
             raise GenerationUnavailableError("Compiler engine is temporarily unavailable.")
         if response.status_code >= 400:
@@ -328,48 +373,67 @@ class CodingService(BasePersistence):
         except ValueError as exc:
             raise GenerationUnavailableError("Compiler engine returned an invalid response.") from exc
 
-    def _map_piston_response(self, language_id: str, data: dict, wall_time_ms: int) -> ExecuteResponse:
-        compile_data = data.get("compile") or {}
-        run_data = data.get("run") or {}
-        compile_code = compile_data.get("code")
-        run_code = run_data.get("code")
-        signal = run_data.get("signal")
-        stdout, stdout_truncated = self._cap_output(run_data.get("stdout") or "")
-        stderr, stderr_truncated = self._cap_output(run_data.get("stderr") or "")
-        compile_stdout, compile_stdout_truncated = self._cap_output(compile_data.get("stdout") or "")
-        compile_stderr, compile_stderr_truncated = self._cap_output(compile_data.get("stderr") or "")
+    def _map_jdoodle_response(self, language_id: str, data: dict, wall_time_ms: int) -> ExecuteResponse:
+        # JDoodle can return HTTP 200 with an error body (quota / bad credentials).
+        error = data.get("error")
+        raw_output = data.get("output")
+        if error and raw_output is None:
+            status_code = data.get("statusCode")
+            if status_code == 429:
+                raise RateLimitedError("Daily execution quota reached. Try again tomorrow.")
+            if status_code in (401, 403):
+                raise GenerationUnavailableError("Compiler engine credentials are invalid.")
+            raise GenerationUnavailableError("Compiler engine returned an error.")
 
-        run_message = str(run_data.get("message") or "").lower()
-        compile_message = str(compile_data.get("message") or "").lower()
-        timed_out = signal == "SIGKILL" or "timed out" in run_message or "timed out" in compile_message
+        raw_output = raw_output or ""
+        # JDoodle appends a boilerplate "JDoodle - Timeout ..." block whenever the
+        # sandbox hits its run limit - including after a failed compile, when it
+        # still tries to run a binary that waits on stdin. Detect it, then drop it
+        # from the text so only the real program/compiler output is returned.
+        hit_run_limit = "jdoodle - timeout" in raw_output.lower()
+        output, truncated = self._cap_output(self._strip_jdoodle_notice(raw_output))
 
-        if compile_code not in (None, 0):
+        cpu_time = data.get("cpuTime")
+        try:
+            time_ms = int(float(cpu_time) * 1000) if cpu_time not in (None, "") else 0
+        except (TypeError, ValueError):
+            time_ms = 0
+
+        if data.get("isCompiled") is False:
             status = "compile_error"
-        elif timed_out:
-            # Classify from the sandbox signal/message, not HTTP wall-clock time:
-            # a slow-but-successful Piston call is not a timeout.
+        elif hit_run_limit:
             status = "timeout"
-        elif run_code not in (None, 0) or signal:
+        elif data.get("isExecutionSuccess") is False:
             status = "runtime_error"
         else:
+            # JDoodle merges program output and any error text into one field.
+            # Without an explicit failure flag we treat it as success and let the
+            # text (which already carries the error, if any) through as stdout.
             status = "success"
+
+        if status == "compile_error":
+            return ExecuteResponse(
+                status=status,
+                stdout="",
+                stderr=output,
+                exit_code=None,
+                signal=None,
+                compile=CompileResult(stdout="", stderr=output, exit_code=None),
+                time_ms=time_ms,
+                wall_time_ms=wall_time_ms,
+                truncated=truncated,
+            )
 
         return ExecuteResponse(
             status=status,
-            stdout="" if status == "compile_error" else stdout,
-            stderr="" if status == "compile_error" else stderr,
-            exit_code=run_code,
-            signal=signal,
-            compile={
-                "stdout": compile_stdout,
-                "stderr": compile_stderr,
-                "exit_code": compile_code,
-            }
-            if language_id in COMPILED_LANGUAGES or compile_data
-            else None,
-            time_ms=int(run_data.get("time") or 0),
+            stdout=output,
+            stderr="",
+            exit_code=None,
+            signal=None,
+            compile=None,
+            time_ms=time_ms,
             wall_time_ms=wall_time_ms,
-            truncated=stdout_truncated or stderr_truncated or compile_stdout_truncated or compile_stderr_truncated,
+            truncated=truncated,
         )
 
     async def _check_execute_rate_limit(self, user: User | None, client_ip: str | None) -> None:
@@ -428,6 +492,14 @@ class CodingService(BasePersistence):
         total = sum(len(file.content.encode("utf-8")) for file in files)
         if total > limit_bytes:
             raise PayloadTooLargeError("Submitted code is too large.")
+
+    @staticmethod
+    def _strip_jdoodle_notice(text: str) -> str:
+        idx = text.lower().find("jdoodle - timeout")
+        if idx == -1:
+            return text
+        line_start = text.rfind("\n", 0, idx)
+        return text[:line_start].rstrip("\n") if line_start != -1 else ""
 
     def _cap_output(self, value: str) -> tuple[str, bool]:
         encoded = value.encode("utf-8")

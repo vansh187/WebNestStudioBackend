@@ -34,15 +34,16 @@ Validation errors:
 
 ## Production Safety Notes
 
-`POST /api/compiler/execute` must proxy to a separate sandboxed Piston-compatible service. The FastAPI backend intentionally does not execute untrusted user code inside the API process.
+`POST /api/compiler/execute` proxies to JDoodle's hosted sandbox. The FastAPI backend intentionally does not execute untrusted user code inside the API process.
 
-Required production env var:
+Required production env vars:
 
 ```text
-PISTON_BASE_URL=https://your-piston-service.example.com
+JDOODLE_CLIENT_ID=your-client-id
+JDOODLE_CLIENT_SECRET=your-client-secret
 ```
 
-When `PISTON_BASE_URL` is empty, execute returns:
+When either credential is empty, execute returns:
 
 ```http
 503 Service Unavailable
@@ -50,9 +51,12 @@ When `PISTON_BASE_URL` is empty, execute returns:
 
 ```json
 {
-  "detail": "Compiler engine is not configured. Set PISTON_BASE_URL to enable execution."
+  "detail": "Compiler engine is not configured. Set JDOODLE_CLIENT_ID and JDOODLE_CLIENT_SECRET to enable execution."
 }
 ```
+
+JDoodle daily-quota exhaustion returns HTTP `429`
+(`{ "detail": "Daily execution quota reached. Try again tomorrow." }`).
 
 Runtime safety behavior:
 
