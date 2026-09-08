@@ -85,13 +85,12 @@ class Settings(BaseSettings):
     chatbot_max_transcript_messages: int = 20
     chatbot_plan_max_weeks: int = 20
 
-    # Coding platform compiler proxy. Executed code must run in a separate
-    # sandbox service such as self-hosted Piston, never inside this API process.
-    piston_base_url: str = ""
-    compiler_request_timeout_seconds: float = 12.0
-    compiler_run_timeout_ms: int = 5000
-    compiler_compile_timeout_ms: int = 5000
-    compiler_memory_limit_bytes: int = 268435456
+    # Coding platform compiler proxy. Executed code runs on JDoodle's hosted
+    # sandbox (https://www.jdoodle.com/compiler-api), never inside this API process.
+    jdoodle_client_id: str = ""
+    jdoodle_client_secret: str = ""
+    jdoodle_base_url: str = "https://api.jdoodle.com/v1"
+    compiler_request_timeout_seconds: float = 20.0
     compiler_output_limit_bytes: int = 65536
     compiler_source_limit_bytes: int = 131072
     coding_project_limit_per_user: int = 100
