@@ -352,8 +352,8 @@ class CodingService(BasePersistence):
             "versionIndex": version_index,
             "stdin": stdin or "",
         }
-        # JDoodle's free plan throttles bursts with a 429 well before the daily
-        # credit cap; retry once after a short pause to absorb that.
+        # A 429 is either the daily credit cap (permanent until reset - do not
+        # retry) or a short-term burst throttle (retry once after a pause).
         response = None
         for attempt in range(2):
             try:
@@ -364,9 +364,17 @@ class CodingService(BasePersistence):
                 raise
             except httpx.HTTPError as exc:
                 raise GenerationUnavailableError("Compiler engine is temporarily unavailable.") from exc
-            if response.status_code != 429 or attempt == 1:
+            if response.status_code != 429:
                 break
-            await asyncio.sleep(1.2)
+            body = ""
+            try:
+                body = response.text.lower()
+            except Exception:
+                pass
+            if "daily" in body or "limit reached" in body:
+                raise RateLimitedError("Daily execution limit reached on the compiler engine. Please try again tomorrow.")
+            if attempt == 0:
+                await asyncio.sleep(1.2)
 
         if response.status_code in (401, 403):
             raise GenerationUnavailableError("Compiler engine credentials are invalid.")
