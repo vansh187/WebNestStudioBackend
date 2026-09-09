@@ -16,8 +16,10 @@ from api.content_router import router as content_router
 from api.generation_router import router as generation_router
 from api.home_router import router as home_router
 from api.leads_router import router as leads_router
+from api.messaging_router import router as messaging_router
 from api.newsletter_router import router as newsletter_router
 from api.sitemap_router import router as sitemap_router
+from api.users_router import router as users_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
@@ -57,6 +59,10 @@ async def lifespan(app: FastAPI):
         container.scheduler.shutdown(wait=False)
     except Exception:
         logger.warning("Error while shutting down the blog generation scheduler", exc_info=True)
+    try:
+        await container.storage_service.aclose()
+    except Exception:
+        logger.warning("Error while closing the storage service HTTP client", exc_info=True)
     try:
         await container.database.dispose()
     except SQLAlchemyError:
@@ -98,6 +104,8 @@ class WebNestStudioApp:
             generation_router,
             chat_router,
             coding_router,
+            messaging_router,
+            users_router,
         ):
             self.instance.include_router(router)
 

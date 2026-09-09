@@ -21,8 +21,10 @@ from services.email_service import EmailService
 from services.faq_service import FaqService
 from services.generation_service import GenerationService
 from services.lead_service import LeadService
+from services.messaging_service import MessagingService
 from services.newsletter_service import NewsletterService
 from services.plan_pdf_service import PlanPdfService
+from services.storage_service import StorageService
 from services.portfolio_service import PortfolioService
 from services.service_catalog_service import ServiceCatalogService
 from services.testimonial_service import TestimonialService
@@ -40,6 +42,7 @@ class DependencyContainer:
         self.jwt_handler = JWTHandler(app_settings)
         self.otp_generator = OtpGenerator(app_settings)
         self.email_service = EmailService(app_settings)
+        self.storage_service = StorageService(app_settings)
         self.plan_pdf_service = PlanPdfService(app_settings)
         self.scheduler = create_scheduler()
 
@@ -120,6 +123,14 @@ def get_coding_service(session: AsyncSession = Depends(get_db_session)) -> Codin
 
 def get_plan_pdf_service() -> PlanPdfService:
     return container.plan_pdf_service
+
+
+def get_messaging_service(session: AsyncSession = Depends(get_db_session)) -> MessagingService:
+    return MessagingService(
+        session=session,
+        settings=container.settings,
+        storage_service=container.storage_service,
+    )
 
 
 def get_client_ip(request: Request) -> str | None:

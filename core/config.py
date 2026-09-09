@@ -96,6 +96,19 @@ class Settings(BaseSettings):
     coding_project_limit_per_user: int = 100
     coding_project_source_limit_bytes: int = 262144
 
+    # In-app project chat (user-to-user messaging) attachment storage. Files
+    # live in a private Supabase Storage bucket; the backend uses the
+    # service-role key to mint short-lived signed upload/download URLs so the
+    # app never holds a storage credential. supabase_project_url is the
+    # Storage REST host (https://<ref>.supabase.co) and is DIFFERENT from
+    # supabase_url, which is the Postgres connection string. When these are
+    # left blank the messaging feature still runs but attachment endpoints
+    # return 503.
+    supabase_project_url: str = ""
+    supabase_service_role_key: str = ""
+    chat_storage_bucket: str = "chat-attachments"
+    chat_max_attachment_mb: int = 25
+
     @property
     def async_database_url(self) -> str:
         raw = self.supabase_url.strip()

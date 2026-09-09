@@ -7,9 +7,11 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from core.exceptions import (
+    BadRequestError,
     ConflictError,
     ContentRejectedError,
     DatabaseError,
+    ExternalServiceError,
     ForbiddenError,
     GenerationUnavailableError,
     InvalidPromptError,
@@ -17,6 +19,7 @@ from core.exceptions import (
     PayloadTooLargeError,
     RateLimitedError,
     UnauthorizedError,
+    UnsupportedMediaTypeError,
     ValidationError,
 )
 
@@ -24,6 +27,7 @@ logger = logging.getLogger("webnest.errors")
 
 _STATUS_BY_EXCEPTION = (
     (NotFoundError, 404),
+    (BadRequestError, 400),
     (ConflictError, 409),
     (UnauthorizedError, 401),
     (ForbiddenError, 403),
@@ -31,8 +35,10 @@ _STATUS_BY_EXCEPTION = (
     (ValidationError, 422),
     (ContentRejectedError, 422),
     (PayloadTooLargeError, 413),
+    (UnsupportedMediaTypeError, 415),
     (RateLimitedError, 429),
     (DatabaseError, 503),
+    (ExternalServiceError, 503),
     (GenerationUnavailableError, 503),
 )
 
