@@ -10,6 +10,11 @@ class NotFoundError(DomainError):
     pass
 
 
+class BadRequestError(DomainError):
+    """Raised when a request is well-formed but semantically invalid (unknown
+    referenced id, self-referential action, cross-resource mismatch) - maps to 400."""
+
+
 class ConflictError(DomainError):
     pass
 
@@ -28,6 +33,15 @@ class ValidationError(DomainError):
 
 class PayloadTooLargeError(DomainError):
     pass
+
+
+class UnsupportedMediaTypeError(DomainError):
+    """Raised when an uploaded/referenced file's MIME type is not on the allowlist - maps to 415."""
+
+
+class ExternalServiceError(DomainError):
+    """Raised when a required third-party service (e.g. Supabase Storage) is
+    unreachable or returns an unusable response - maps to 503."""
 
 
 class DatabaseError(DomainError):
