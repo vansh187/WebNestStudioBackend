@@ -11,11 +11,15 @@ from api.admin_router import router as admin_router
 from api.auth_router import router as auth_router
 from api.chat_router import router as chat_router
 from api.client_router import router as client_router
+from api.codelab_router import admin_router as codelab_admin_router
+from api.codelab_router import router as codelab_router
 from api.coding_router import router as coding_router
 from api.content_router import router as content_router
 from api.generation_router import router as generation_router
 from api.home_router import router as home_router
 from api.leads_router import router as leads_router
+from api.learning_router import admin_router as learning_admin_router
+from api.learning_router import router as learning_router
 from api.messaging_router import router as messaging_router
 from api.newsletter_router import router as newsletter_router
 from api.sitemap_router import router as sitemap_router
@@ -104,6 +108,10 @@ class WebNestStudioApp:
             generation_router,
             chat_router,
             coding_router,
+            codelab_router,
+            codelab_admin_router,
+            learning_router,
+            learning_admin_router,
             messaging_router,
             users_router,
         ):

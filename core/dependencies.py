@@ -15,8 +15,10 @@ from services.blog_scheduler import create_scheduler
 from services.blog_service import BlogService
 from services.chat_orchestrator_service import ChatOrchestratorService
 from services.chatbot_service import ChatbotService
+from services.codelab_service import CodelabService
 from services.coding_service import CodingService
 from services.client_service import ClientService
+from services.learning_service import LearningService
 from services.email_service import EmailService
 from services.faq_service import FaqService
 from services.generation_service import GenerationService
@@ -119,6 +121,14 @@ def get_chat_orchestrator_service(session: AsyncSession = Depends(get_db_session
 
 def get_coding_service(session: AsyncSession = Depends(get_db_session)) -> CodingService:
     return CodingService(session=session, settings=container.settings)
+
+
+def get_codelab_service(session: AsyncSession = Depends(get_db_session)) -> CodelabService:
+    return CodelabService(session=session)
+
+
+def get_learning_service(session: AsyncSession = Depends(get_db_session)) -> LearningService:
+    return LearningService(session=session)
 
 
 def get_plan_pdf_service() -> PlanPdfService:
