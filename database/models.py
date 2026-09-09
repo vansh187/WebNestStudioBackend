@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     ARRAY,
@@ -520,3 +520,335 @@ class CodingExecution(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     time_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+# =========================================================================== #
+# Webnest CodeLab - Phase 1 learning platform (browser-first execution; the
+# backend never runs visitor code). See CODELAB_LEARNING_API.md.
+# =========================================================================== #
+class CodelabTrack(Base):
+    __tablename__ = "codelab_tracks"
+
+    # Short stable identifier used as the ?track= filter value, e.g. "python".
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    runner: Mapped[str] = mapped_column(Text, nullable=False, server_default="iframe")  # pyodide | iframe
+    description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="published")  # draft | published
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CodelabProblem(Base):
+    __tablename__ = "codelab_problems"
+    __table_args__ = (
+        CheckConstraint("difficulty in ('easy','medium','hard')", name="ck_codelab_problem_difficulty"),
+        CheckConstraint("status in ('draft','published','archived')", name="ck_codelab_problem_status"),
+        Index("ix_codelab_problems_track_status", "track", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    track: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    language: Mapped[str] = mapped_column(Text, nullable=False)
+    difficulty: Mapped[str] = mapped_column(Text, nullable=False, server_default="easy")
+    statement: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    constraints: Mapped[list | None] = mapped_column(JSONB)          # list[str]
+    hints: Mapped[list | None] = mapped_column(JSONB)                # list[str]
+    starter_files: Mapped[list | None] = mapped_column(JSONB)        # list[{name,language,content}]
+    examples: Mapped[list | None] = mapped_column(JSONB)            # list[{input,expected_output,explanation}]
+    topics: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    points: Mapped[int] = mapped_column(Integer, nullable=False, server_default="20")
+    estimated_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="10")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    test_cases: Mapped[list["CodelabTestCase"]] = relationship(
+        back_populates="problem", cascade="all, delete-orphan", order_by="CodelabTestCase.display_order"
+    )
+
+
+class CodelabTestCase(Base):
+    __tablename__ = "codelab_test_cases"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("codelab_problems.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    input: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    expected_output: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    is_hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    weight: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    problem: Mapped["CodelabProblem"] = relationship(back_populates="test_cases")
+
+
+class CodelabSubmission(Base):
+    __tablename__ = "codelab_submissions"
+    __table_args__ = (Index("ix_codelab_submissions_user_created", "user_id", "submitted_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("codelab_problems.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    language: Mapped[str] = mapped_column(Text, nullable=False)
+    files: Mapped[list | None] = mapped_column(JSONB)               # list[{name,language,content}]
+    result: Mapped[dict | None] = mapped_column(JSONB)             # raw client-reported result blob (audit)
+    status: Mapped[str] = mapped_column(Text, nullable=False)       # passed|failed|runtime_error|timeout|manual_review
+    score: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    passed_tests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    total_tests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    runtime_ms: Mapped[int | None] = mapped_column(Integer)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    problem: Mapped["CodelabProblem"] = relationship()
+
+
+class CodelabProblemProgress(Base):
+    __tablename__ = "codelab_problem_progress"
+    __table_args__ = (UniqueConstraint("user_id", "problem_id", name="uq_codelab_problem_progress"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("codelab_problems.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="not_started")  # not_started|in_progress|solved
+    best_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    solved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CodelabUserStats(Base):
+    __tablename__ = "codelab_user_stats"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    xp: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    current_streak: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    best_streak: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    solved_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_activity_date: Mapped[date | None] = mapped_column(Date)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CodelabAchievement(Base):
+    __tablename__ = "codelab_achievements"
+    __table_args__ = (UniqueConstraint("user_id", "achievement_key", name="uq_codelab_achievement"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    achievement_key: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    earned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Course(Base):
+    __tablename__ = "courses"
+    __table_args__ = (CheckConstraint("status in ('draft','published','archived')", name="ck_course_status"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    level: Mapped[str] = mapped_column(Text, nullable=False, server_default="beginner")
+    description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft", index=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    modules: Mapped[list["CourseModule"]] = relationship(
+        back_populates="course", cascade="all, delete-orphan", order_by="CourseModule.display_order"
+    )
+
+
+class CourseModule(Base):
+    __tablename__ = "course_modules"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="published")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    course: Mapped["Course"] = relationship(back_populates="modules")
+    lessons: Mapped[list["Lesson"]] = relationship(
+        back_populates="module", cascade="all, delete-orphan", order_by="Lesson.display_order"
+    )
+
+
+class Lesson(Base):
+    __tablename__ = "lessons"
+    __table_args__ = (CheckConstraint("status in ('draft','published','archived')", name="ck_lesson_status"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    module_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("course_modules.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Denormalised so lesson lookups can return course_slug without walking up.
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[dict | None] = mapped_column(JSONB)             # {format:"html", body:"..."}
+    resources: Mapped[list | None] = mapped_column(JSONB)          # list[{type,language,content,...}]
+    estimated_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="8")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft", index=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    module: Mapped["CourseModule"] = relationship(back_populates="lessons")
+    course: Mapped["Course"] = relationship(foreign_keys=[course_id])
+    practice_links: Mapped[list["LessonProblemMap"]] = relationship(
+        back_populates="lesson", cascade="all, delete-orphan"
+    )
+
+
+class LessonProblemMap(Base):
+    __tablename__ = "lesson_problem_map"
+    __table_args__ = (UniqueConstraint("lesson_id", "problem_id", name="uq_lesson_problem_map"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    lesson_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("codelab_problems.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    lesson: Mapped["Lesson"] = relationship(back_populates="practice_links")
+    problem: Mapped["CodelabProblem"] = relationship()
+
+
+class Quiz(Base):
+    __tablename__ = "quizzes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    lesson_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lessons.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False, server_default="Quiz")
+    pass_percent: Mapped[int] = mapped_column(Integer, nullable=False, server_default="70")
+    xp_reward: Mapped[int] = mapped_column(Integer, nullable=False, server_default="10")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    questions: Mapped[list["QuizQuestion"]] = relationship(
+        back_populates="quiz", cascade="all, delete-orphan", order_by="QuizQuestion.display_order"
+    )
+
+
+class QuizQuestion(Base):
+    __tablename__ = "quiz_questions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    quiz_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("quizzes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="single")  # single | boolean
+    options: Mapped[list | None] = mapped_column(JSONB)            # list[{id,text}] for single-choice
+    correct_answer: Mapped[dict | None] = mapped_column(JSONB)     # {"value": <option id | bool>}
+    explanation: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    quiz: Mapped["Quiz"] = relationship(back_populates="questions")
+
+
+class QuizAttempt(Base):
+    __tablename__ = "quiz_attempts"
+    __table_args__ = (Index("ix_quiz_attempts_user_quiz", "user_id", "quiz_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    quiz_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("quizzes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    score: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    answers: Mapped[list | None] = mapped_column(JSONB)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class UserCourseProgress(Base):
+    __tablename__ = "user_course_progress"
+    __table_args__ = (UniqueConstraint("user_id", "course_id", name="uq_user_course_progress"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    completion_percent: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UserLessonProgress(Base):
+    __tablename__ = "user_lesson_progress"
+    __table_args__ = (UniqueConstraint("user_id", "lesson_id", name="uq_user_lesson_progress"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    lesson_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="not_started")  # not_started|in_progress|completed
+    completed_percent: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    time_spent_seconds: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UserLessonBookmark(Base):
+    __tablename__ = "user_lesson_bookmarks"
+    __table_args__ = (UniqueConstraint("user_id", "lesson_id", name="uq_user_lesson_bookmark"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    lesson_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    bookmarked: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UserLessonNote(Base):
+    __tablename__ = "user_lesson_notes"
+    __table_args__ = (UniqueConstraint("user_id", "lesson_id", name="uq_user_lesson_note"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    lesson_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    note: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
