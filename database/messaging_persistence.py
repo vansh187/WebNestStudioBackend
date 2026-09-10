@@ -2,7 +2,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -63,6 +63,22 @@ class MessagingPersistence(BasePersistence):
         )
         return result.scalar_one_or_none()
 
+    async def get_conversation_by_project(
+        self, project_id: uuid.UUID
+    ) -> Conversation | None:
+        """The team room for a project (spec section 11), if one exists. Used by
+        create_project_conversation to stay idempotent per project."""
+        result = await self._execute(
+            select(Conversation)
+            .where(Conversation.project_id == project_id)
+            .order_by(Conversation.created_at.asc())
+            .limit(1)
+            .options(
+                selectinload(Conversation.participants).selectinload(ConversationParticipant.user)
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def find_direct_conversation(
         self, user_a: uuid.UUID, user_b: uuid.UUID
     ) -> Conversation | None:
@@ -94,8 +110,14 @@ class MessagingPersistence(BasePersistence):
         title: str | None,
         created_by: uuid.UUID,
         members: Sequence[tuple[uuid.UUID, str]],
+        project_id: uuid.UUID | None = None,
     ) -> Conversation:
-        conversation = Conversation(type=conversation_type, title=title, created_by=created_by)
+        conversation = Conversation(
+            type=conversation_type,
+            title=title,
+            created_by=created_by,
+            project_id=project_id,
+        )
         self._session.add(conversation)
         await self._session.flush()
         seen: set[uuid.UUID] = set()
@@ -250,11 +272,16 @@ class MessagingPersistence(BasePersistence):
         beyond the page; otherwise it means older messages exist before it. The
         caller is expected to have already validated that the cursor id belongs
         to this conversation; if it somehow does not resolve we fall back to the
-        latest page rather than erroring here."""
+        latest page rather than erroring here.
+
+        Pagination is keyset on the full ``(created_at, id)`` tuple that the
+        result is ordered by - not on ``created_at`` alone - so messages that
+        share an exact timestamp with the cursor (or with each other) are never
+        skipped or double-counted across pages."""
         limit = min(max(limit, 1), 100)
         forward = after_id is not None
         pivot_id = before_id or after_id
-        pivot_created_at: datetime | None = None
+        pivot_key: tuple[datetime, uuid.UUID] | None = None
         if pivot_id is not None:
             pivot = await self._execute(
                 select(Message.created_at).where(
@@ -262,18 +289,21 @@ class MessagingPersistence(BasePersistence):
                 )
             )
             pivot_created_at = pivot.scalar_one_or_none()
+            if pivot_created_at is not None:
+                pivot_key = (pivot_created_at, pivot_id)
 
+        row_key = tuple_(Message.created_at, Message.id)
         base = select(Message).where(Message.conversation_id == conversation_id).options(
             *self._message_options()
         )
 
-        if forward and pivot_created_at is not None:
-            statement = base.where(Message.created_at > pivot_created_at).order_by(
+        if forward and pivot_key is not None:
+            statement = base.where(row_key > pivot_key).order_by(
                 Message.created_at.asc(), Message.id.asc()
             ).limit(limit)
             rows = list((await self._execute(statement)).scalars().all())
-        elif before_id is not None and pivot_created_at is not None:
-            statement = base.where(Message.created_at < pivot_created_at).order_by(
+        elif before_id is not None and pivot_key is not None:
+            statement = base.where(row_key < pivot_key).order_by(
                 Message.created_at.desc(), Message.id.desc()
             ).limit(limit)
             rows = list(reversed((await self._execute(statement)).scalars().all()))
@@ -286,12 +316,12 @@ class MessagingPersistence(BasePersistence):
             if forward:
                 probe = select(Message.id).where(
                     Message.conversation_id == conversation_id,
-                    Message.created_at > rows[-1].created_at,
+                    row_key > (rows[-1].created_at, rows[-1].id),
                 )
             else:
                 probe = select(Message.id).where(
                     Message.conversation_id == conversation_id,
-                    Message.created_at < rows[0].created_at,
+                    row_key < (rows[0].created_at, rows[0].id),
                 )
             has_more = (await self._execute(probe.limit(1))).scalar_one_or_none() is not None
         return rows, has_more

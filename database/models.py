@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -408,6 +409,17 @@ class Conversation(Base):
     __tablename__ = "conversations"
     __table_args__ = (
         CheckConstraint("type in ('group','direct')", name="ck_conversation_type"),
+        # One conversation per project (spec section 11). Partial so ordinary
+        # groups and DMs, which leave project_id NULL, are unconstrained. Kept
+        # in sync with migrations/005_messaging_project_link.sql so a fresh
+        # create_all database has the same idempotency backstop as a migrated
+        # one.
+        Index(
+            "uq_conversations_project",
+            "project_id",
+            unique=True,
+            postgresql_where=text("project_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
@@ -416,6 +428,14 @@ class Conversation(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_message_preview: Mapped[str | None] = mapped_column(Text)
+    # Set when this group is a project team room (spec section 11); NULL for
+    # every ordinary group and DM. Deliberately NOT an ORM ForeignKey: the
+    # `projects` table (project-progress-backend-spec.md section 2) is not part
+    # of this service's metadata, and Base.metadata.create_all would fail to
+    # resolve it at startup. The DB-level FK to projects(id) ON DELETE SET NULL
+    # and the one-per-project partial unique index are added by
+    # migrations/005_messaging_project_link.sql once that table exists.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

@@ -91,6 +91,9 @@ class ConversationOut(BaseModel):
     id: uuid.UUID
     type: str
     title: str | None = None
+    # Set only when this group is a project team room (spec section 11); null
+    # for every ordinary group and DM. The app uses it to badge a project room.
+    project_id: uuid.UUID | None = None
     created_by: uuid.UUID
     participants: list[ParticipantOut]
     last_message: LastMessageOut | None = None

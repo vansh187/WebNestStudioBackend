@@ -88,6 +88,7 @@ Everywhere else (participants, message senders) it is the real address.
   "id": "51de…",
   "type": "group",
   "title": "V Stitch — Website Revamp",
+  "project_id": null,
   "created_by": "b3f1…",
   "participants": [ /* Participant… */ ],
   "last_message": {
@@ -103,6 +104,7 @@ Everywhere else (participants, message senders) it is the real address.
 }
 ```
 - `type: "direct"` → `title` is `null`; show the other participant's name.
+- `project_id` is non-null only when the group is a project team room; use it to badge the room. `null` for every ordinary group and DM.
 - `last_message` is `null` before the first message.
 - `unread_count` = messages from other people newer than your `last_read_at`.
 
