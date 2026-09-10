@@ -416,6 +416,14 @@ class Conversation(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_message_preview: Mapped[str | None] = mapped_column(Text)
+    # Set when this group is a project team room (spec section 11); NULL for
+    # every ordinary group and DM. Deliberately NOT an ORM ForeignKey: the
+    # `projects` table (project-progress-backend-spec.md section 2) is not part
+    # of this service's metadata, and Base.metadata.create_all would fail to
+    # resolve it at startup. The DB-level FK to projects(id) ON DELETE SET NULL
+    # and the one-per-project partial unique index are added by
+    # migrations/005_messaging_project_link.sql once that table exists.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

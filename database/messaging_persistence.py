@@ -63,6 +63,22 @@ class MessagingPersistence(BasePersistence):
         )
         return result.scalar_one_or_none()
 
+    async def get_conversation_by_project(
+        self, project_id: uuid.UUID
+    ) -> Conversation | None:
+        """The team room for a project (spec section 11), if one exists. Used by
+        create_project_conversation to stay idempotent per project."""
+        result = await self._execute(
+            select(Conversation)
+            .where(Conversation.project_id == project_id)
+            .order_by(Conversation.created_at.asc())
+            .limit(1)
+            .options(
+                selectinload(Conversation.participants).selectinload(ConversationParticipant.user)
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def find_direct_conversation(
         self, user_a: uuid.UUID, user_b: uuid.UUID
     ) -> Conversation | None:
@@ -94,8 +110,14 @@ class MessagingPersistence(BasePersistence):
         title: str | None,
         created_by: uuid.UUID,
         members: Sequence[tuple[uuid.UUID, str]],
+        project_id: uuid.UUID | None = None,
     ) -> Conversation:
-        conversation = Conversation(type=conversation_type, title=title, created_by=created_by)
+        conversation = Conversation(
+            type=conversation_type,
+            title=title,
+            created_by=created_by,
+            project_id=project_id,
+        )
         self._session.add(conversation)
         await self._session.flush()
         seen: set[uuid.UUID] = set()

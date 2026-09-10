@@ -236,6 +236,35 @@ class MessagingService:
         new_owner_id = self._pick_successor_owner(conversation, target)
         await self._messaging.remove_participant(conversation_id, target_user_id, new_owner_id)
 
+    async def create_project_conversation(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        title: str,
+        project_id: uuid.UUID,
+    ) -> Conversation:
+        """Find-or-create the team group chat for a project (spec section 11).
+
+        Idempotent per project: a second call for the same project_id returns
+        the existing conversation rather than a duplicate (the partial unique
+        index uq_conversations_project is the DB-level backstop). Intended to be
+        called by ProjectService with the same AsyncSession so the project row
+        and its conversation are created in one unit of work. Returns the ORM
+        Conversation, not a serialised view, because the caller owns the
+        response shape.
+        """
+        existing = await self._messaging.get_conversation_by_project(project_id)
+        if existing is not None:
+            return existing
+        clean_title = (title or "").strip()[:120] or "Project chat"
+        return await self._messaging.create_conversation(
+            conversation_type="group",
+            title=clean_title,
+            created_by=owner_user_id,
+            members=[(owner_user_id, "owner")],
+            project_id=project_id,
+        )
+
     # ================================================================== #
     # Messages
     # ================================================================== #
@@ -502,6 +531,7 @@ class MessagingService:
             id=conversation.id,
             type=conversation.type,
             title=conversation.title,
+            project_id=conversation.project_id,
             created_by=conversation.created_by,
             participants=participants,
             last_message=last_message,
