@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -408,6 +409,17 @@ class Conversation(Base):
     __tablename__ = "conversations"
     __table_args__ = (
         CheckConstraint("type in ('group','direct')", name="ck_conversation_type"),
+        # One conversation per project (spec section 11). Partial so ordinary
+        # groups and DMs, which leave project_id NULL, are unconstrained. Kept
+        # in sync with migrations/005_messaging_project_link.sql so a fresh
+        # create_all database has the same idempotency backstop as a migrated
+        # one.
+        Index(
+            "uq_conversations_project",
+            "project_id",
+            unique=True,
+            postgresql_where=text("project_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
