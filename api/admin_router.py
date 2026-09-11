@@ -10,11 +10,12 @@ from core.dependencies import (
     get_faq_service,
     get_lead_service,
     get_portfolio_service,
+    get_project_service,
     get_service_catalog_service,
     get_testimonial_service,
     require_admin,
 )
-from database.models import BlogPost, Faq, Lead, PortfolioItem, ProjectStatus, Service, Testimonial
+from database.models import BlogPost, Faq, Lead, PortfolioItem, ProjectStatus, Service, Testimonial, User
 from schemas.blog_generation_schemas import (
     BlogGenerationLogResponse,
     BlogGenerationTriggerRequest,
@@ -22,6 +23,13 @@ from schemas.blog_generation_schemas import (
 )
 from schemas.client_schemas import ProjectStatusResponse, ProjectStatusUpsertRequest
 from schemas.diagnostics_schemas import EmailTestRequest, EmailTestResponse
+from schemas.project_schemas import (
+    AdminProjectCreateRequest,
+    AdminProjectListResponse,
+    AdminProjectRow,
+    AdminProjectUpdateRequest,
+    AdminStageUpdateRequest,
+)
 from schemas.content_schemas import (
     BlogPostCreateRequest,
     BlogPostResponse,
@@ -48,6 +56,7 @@ from services.faq_service import FaqService
 from services.lead_service import LeadService
 from services.llm_provider import GenerationFailedError
 from services.portfolio_service import PortfolioService
+from services.project_service import ProjectService
 from services.service_catalog_service import ServiceCatalogService
 from services.testimonial_service import TestimonialService
 
@@ -302,3 +311,79 @@ async def admin_update_project_status(
     return await client_service.set_project_status(
         client_user_id, payload.project_name, payload.phase, payload.percent_complete
     )
+
+
+# ---- Projects (SDLC pipeline) ----
+
+
+@router.get("/projects", response_model=AdminProjectListResponse)
+async def admin_list_projects(
+    client_email: str | None = None,
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    project_service: ProjectService = Depends(get_project_service),
+) -> AdminProjectListResponse:
+    projects, total = await project_service.list_admin(
+        client_email=client_email, status=status_filter, limit=limit, offset=offset
+    )
+    return AdminProjectListResponse(projects=projects, total=total)
+
+
+@router.post("/projects", response_model=AdminProjectRow, status_code=status.HTTP_201_CREATED)
+async def admin_create_project(
+    payload: AdminProjectCreateRequest,
+    current_user: User = Depends(require_admin),
+    project_service: ProjectService = Depends(get_project_service),
+) -> AdminProjectRow:
+    return await project_service.create_project(
+        admin_user_id=current_user.id,
+        client_email=payload.client_email,
+        name=payload.name,
+        summary=payload.summary,
+        current_stage=payload.current_stage,
+        create_conversation=payload.create_conversation,
+    )
+
+
+@router.get("/projects/{project_id}", response_model=AdminProjectRow)
+async def admin_get_project(
+    project_id: uuid.UUID,
+    project_service: ProjectService = Depends(get_project_service),
+) -> AdminProjectRow:
+    return await project_service.get_admin(project_id)
+
+
+@router.patch("/projects/{project_id}", response_model=AdminProjectRow)
+async def admin_update_project(
+    project_id: uuid.UUID,
+    payload: AdminProjectUpdateRequest,
+    project_service: ProjectService = Depends(get_project_service),
+) -> AdminProjectRow:
+    return await project_service.update_project(
+        project_id, **payload.model_dump(exclude_unset=True)
+    )
+
+
+@router.patch("/projects/{project_id}/stages/{stage_key}", response_model=AdminProjectRow)
+async def admin_update_project_stage(
+    project_id: uuid.UUID,
+    stage_key: str,
+    payload: AdminStageUpdateRequest,
+    project_service: ProjectService = Depends(get_project_service),
+) -> AdminProjectRow:
+    return await project_service.update_stage(
+        project_id, stage_key, state=payload.state, note=payload.note
+    )
+
+
+@router.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def admin_delete_project(
+    project_id: uuid.UUID,
+    hard: bool = False,
+    project_service: ProjectService = Depends(get_project_service),
+) -> None:
+    if hard:
+        await project_service.hard_delete(project_id)
+    else:
+        await project_service.archive(project_id)
