@@ -40,7 +40,12 @@ class ProjectDetailResponse(ProjectSummaryResponse):
     stages: list[ProjectStageResponse]
 
 
-class AdminProjectRow(ProjectSummaryResponse):
+class AdminProjectRow(ProjectDetailResponse):
+    """Every admin project response — list rows included — carries the full
+    stage detail, matching what the app's admin screens render (stage editor
+    on the detail screen, but also so a freshly created/updated project's
+    response is immediately usable without a second round trip)."""
+
     client_email: str
     client_name: str | None
 

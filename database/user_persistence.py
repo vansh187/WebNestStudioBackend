@@ -2,7 +2,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.base_persistence import BasePersistence
@@ -28,6 +28,15 @@ class UserPersistence(BasePersistence):
 
     async def get_by_email(self, email: str) -> User | None:
         result = await self._execute(select(User).where(User.email == email))
+        return result.scalar_one_or_none()
+
+    async def get_by_email_ci(self, email: str) -> User | None:
+        """Case-insensitive email lookup — for flows where the caller (e.g. an
+        admin typing someone else's address) can't be relied on to know the
+        exact casing the account was created with."""
+        result = await self._execute(
+            select(User).where(func.lower(User.email) == email.strip().lower())
+        )
         return result.scalar_one_or_none()
 
     async def mark_verified(self, user: User) -> User:

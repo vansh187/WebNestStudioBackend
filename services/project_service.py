@@ -116,7 +116,7 @@ class ProjectService:
         current_stage: str,
         create_conversation: bool,
     ) -> AdminProjectRow:
-        client = await self._users.get_by_email(client_email.strip())
+        client = await self._users.get_by_email_ci(client_email)
         if client is None:
             raise NotFoundError("No user with that email")
         if current_stage not in SDLC_STAGE_KEYS:
