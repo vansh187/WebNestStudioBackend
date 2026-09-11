@@ -872,3 +872,69 @@ class UserLessonNote(Base):
     )
     note: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class Project(Base):
+    """A named, client-owned engagement WebNest is building, driven through the
+    six fixed SDLC stages (core/constants.py: SDLC_STAGES). Admin-created
+    against a client's email (project-progress-backend-spec.md). Replaces the
+    flat ProjectStatus concept for any client with a real Project; ProjectStatus
+    itself is untouched and kept as a deprecated read-only shim."""
+
+    __tablename__ = "projects"
+    __table_args__ = (
+        CheckConstraint(
+            "current_stage in ('requirements','design','development','testing','deployment','maintenance')",
+            name="ck_project_current_stage",
+        ),
+        CheckConstraint(
+            "progress_percent is null or (progress_percent between 0 and 100)",
+            name="ck_project_progress_range",
+        ),
+        CheckConstraint("status in ('active','on_hold','completed','archived')", name="ck_project_status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    client_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text)
+    current_stage: Mapped[str] = mapped_column(Text, nullable=False, server_default="requirements")
+    progress_percent: Mapped[int | None] = mapped_column(Integer)  # NULL => compute from stages
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )  # the admin who created it
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    stages: Mapped[list["ProjectStage"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan", order_by="ProjectStage.order_index"
+    )
+
+
+class ProjectStage(Base):
+    """One of the six fixed pipeline rows for a Project (always all six, seeded
+    at project creation)."""
+
+    __tablename__ = "project_stages"
+    __table_args__ = (
+        UniqueConstraint("project_id", "key", name="uq_project_stage"),
+        CheckConstraint("state in ('pending','in_progress','done')", name="ck_project_stage_state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    note: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    project: Mapped["Project"] = relationship(back_populates="stages")

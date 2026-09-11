@@ -26,6 +26,7 @@ from services.lead_service import LeadService
 from services.messaging_service import MessagingService
 from services.newsletter_service import NewsletterService
 from services.plan_pdf_service import PlanPdfService
+from services.project_service import ProjectService
 from services.storage_service import StorageService
 from services.portfolio_service import PortfolioService
 from services.service_catalog_service import ServiceCatalogService
@@ -141,6 +142,10 @@ def get_messaging_service(session: AsyncSession = Depends(get_db_session)) -> Me
         settings=container.settings,
         storage_service=container.storage_service,
     )
+
+
+def get_project_service(session: AsyncSession = Depends(get_db_session)) -> ProjectService:
+    return ProjectService(session=session)
 
 
 def get_client_ip(request: Request) -> str | None:

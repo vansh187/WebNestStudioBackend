@@ -188,7 +188,6 @@ class MessagingService:
         participant = self._require_participant(conversation, user.id)
         if conversation.type != "group":
             raise ConflictError("Cannot add members to a direct chat")
-        self._require_admin(participant)
 
         active_ids = {
             member.user_id
