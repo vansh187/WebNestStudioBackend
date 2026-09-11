@@ -194,13 +194,13 @@ Find-or-create the 1:1 with that user. Both stored as `member`.
 
 **Request** `{ "user_ids": ["a1b2…", "f6a7…"] }` (1–50)
 
-`owner` / `admin` only. Re-adding someone who left revives their membership. Already-active ids are silently skipped.
+Any active participant. Re-adding someone who left revives their membership. Already-active ids are silently skipped.
 
 **200** → `Conversation` (updated participant list)
 
 **Errors**
 - `400 {"detail":"One or more users could not be found"}`
-- `403` — not owner/admin
+- `403` — not a participant of this conversation
 - `409 {"detail":"Cannot add members to a direct chat"}`
 
 ---
