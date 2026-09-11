@@ -2,11 +2,12 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
+from sqlalchemy import delete, or_, select
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.base_persistence import BasePersistence
-from database.models import User
+from database.models import CodingExecution, CodingShare, Lead, NewsletterSubscriber, OtpVerification, User
 
 
 class UserPersistence(BasePersistence):
@@ -62,6 +63,26 @@ class UserPersistence(BasePersistence):
         await self._commit()
         await self._refresh(user)
         return user
+
+    async def delete_account(self, user: User) -> None:
+        """Delete the account and directly email-linked records.
+
+        Most user-owned feature data is removed by ON DELETE CASCADE from the
+        users row. These extra deletes cover tables that intentionally use
+        SET NULL or store the email address independently.
+        """
+        await self._execute(
+            delete(OtpVerification).where(
+                or_(OtpVerification.user_id == user.id, OtpVerification.email == user.email)
+            )
+        )
+        await self._execute(
+            delete(Lead).where(or_(Lead.user_id == user.id, Lead.email == user.email))
+        )
+        await self._execute(delete(NewsletterSubscriber).where(NewsletterSubscriber.email == user.email))
+        await self._execute(delete(CodingShare).where(CodingShare.owner_user_id == user.id))
+        await self._execute(delete(CodingExecution).where(CodingExecution.user_id == user.id))
+        await self._delete(user)
 
     async def search(self, query: str, exclude_user_id: uuid.UUID, limit: int = 20) -> list[User]:
         """Case-insensitive ILIKE match on full_name OR email, active accounts

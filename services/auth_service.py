@@ -206,6 +206,10 @@ class AuthService:
     async def logout_all_devices(self, user_id) -> None:
         await self._refresh_tokens.revoke_all_for_user(user_id)
 
+    async def delete_account(self, user: User) -> None:
+        await self._refresh_tokens.revoke_all_for_user(user.id)
+        await self._users.delete_account(user)
+
     async def get_current_user(self, access_token: str) -> User:
         try:
             payload = self._jwt_handler.decode_token(access_token)

@@ -251,6 +251,26 @@ Requires `Authorization: Bearer <access_token>`.
 { "detail": "Missing bearer token" }
 ```
 
+### `DELETE /api/auth/me`
+Requires `Authorization: Bearer <access_token>`. Use this for Android and website account-removal flows.
+
+The backend deletes the current user account, revokes all refresh tokens, removes directly email-linked records, and lets database cascades remove user-owned app data.
+
+**Request**
+No body. Requests with any body are rejected with `422`.
+
+```http
+DELETE /api/auth/me
+Authorization: Bearer <access_token>
+```
+
+**Response `204`** - empty body.
+
+**Error `401`** - missing/expired token:
+```json
+{ "detail": "Missing bearer token" }
+```
+
 ---
 
 ## 2. Lead Capture — `/api/leads`
