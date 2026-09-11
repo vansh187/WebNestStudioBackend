@@ -98,13 +98,22 @@ class ProjectService:
         conversation_ids = await self._conversation_ids_for(p.id for p, _ in rows)
         return [self._to_admin_row(p, u, conversation_ids.get(p.id)) for p, u in rows], total
 
-    async def get_admin(self, project_id: uuid.UUID) -> AdminProjectRow:
+    async def get_admin(
+        self, project_id: uuid.UUID, *, admin_user_id: uuid.UUID | None = None
+    ) -> AdminProjectRow:
         project = await self._projects.get_by_id(project_id)
         if project is None:
             raise NotFoundError("Project not found")
         user = await self._users.get_by_id(project.client_user_id)
-        conversation_ids = await self._conversation_ids_for([project.id])
-        return self._to_admin_row(project, user, conversation_ids.get(project.id))
+        # Viewing a project's detail is also how an admin reaches its team
+        # chat — self-heal membership here so "Open project team chat" never
+        # 403s for whichever admin is looking, not just the one who created it.
+        if admin_user_id is not None:
+            conversation_id = await self._ensure_admin_in_conversation(project.id, admin_user_id)
+        else:
+            conversation_ids = await self._conversation_ids_for([project.id])
+            conversation_id = conversation_ids.get(project.id)
+        return self._to_admin_row(project, user, conversation_id)
 
     async def create_project(
         self,
@@ -144,12 +153,15 @@ class ProjectService:
                     owner_user_id=client.id, title=project.name, project_id=project.id
                 )
                 conversation_id = conversation.id
+                await self._add_admin_to_conversation(conversation, admin_user_id)
             except Exception:
                 logger.exception("Failed to create team chat for new project %s", project.id)
 
         return self._to_admin_row(project, client, conversation_id)
 
-    async def update_project(self, project_id: uuid.UUID, **fields) -> AdminProjectRow:
+    async def update_project(
+        self, project_id: uuid.UUID, *, admin_user_id: uuid.UUID | None = None, **fields
+    ) -> AdminProjectRow:
         project = await self._projects.get_by_id(project_id)
         if project is None:
             raise NotFoundError("Project not found")
@@ -168,17 +180,22 @@ class ProjectService:
         else:
             project = await self._projects.get_by_id(project_id)
 
-        conversation_ids = await self._conversation_ids_for([project.id])
-        conversation_id = conversation_ids.get(project.id)
-        if create_conversation and conversation_id is None:
-            user = await self._users.get_by_id(project.client_user_id)
+        conversation_id = None
+        if create_conversation:
             try:
                 conversation = await self._messaging_service.create_project_conversation(
                     owner_user_id=project.client_user_id, title=project.name, project_id=project.id
                 )
                 conversation_id = conversation.id
+                if admin_user_id is not None:
+                    await self._add_admin_to_conversation(conversation, admin_user_id)
             except Exception:
                 logger.exception("Failed to create team chat for project %s", project.id)
+        elif admin_user_id is not None:
+            conversation_id = await self._ensure_admin_in_conversation(project.id, admin_user_id)
+        else:
+            conversation_ids = await self._conversation_ids_for([project.id])
+            conversation_id = conversation_ids.get(project.id)
 
         user = await self._users.get_by_id(project.client_user_id)
         return self._to_admin_row(project, user, conversation_id)
@@ -259,6 +276,22 @@ class ProjectService:
             if conversation is not None:
                 result[project_id] = conversation.id
         return result
+
+    async def _add_admin_to_conversation(self, conversation, admin_user_id: uuid.UUID) -> None:
+        # Idempotent — add_participants no-ops for an already-active member.
+        # The client stays `owner`; the admin joins as a normal `member` (the
+        # existing any-participant-can-add rule already lets them add more
+        # WebNest staff or be added back if they ever leave).
+        await self._messaging.add_participants(conversation, [admin_user_id])
+
+    async def _ensure_admin_in_conversation(
+        self, project_id: uuid.UUID, admin_user_id: uuid.UUID
+    ) -> uuid.UUID | None:
+        conversation = await self._messaging.get_conversation_by_project(project_id)
+        if conversation is None:
+            return None
+        await self._add_admin_to_conversation(conversation, admin_user_id)
+        return conversation.id
 
     def _to_stage(self, stage) -> ProjectStageResponse:
         return ProjectStageResponse.model_validate(stage)

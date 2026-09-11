@@ -349,19 +349,21 @@ async def admin_create_project(
 @router.get("/projects/{project_id}", response_model=AdminProjectRow)
 async def admin_get_project(
     project_id: uuid.UUID,
+    current_user: User = Depends(require_admin),
     project_service: ProjectService = Depends(get_project_service),
 ) -> AdminProjectRow:
-    return await project_service.get_admin(project_id)
+    return await project_service.get_admin(project_id, admin_user_id=current_user.id)
 
 
 @router.patch("/projects/{project_id}", response_model=AdminProjectRow)
 async def admin_update_project(
     project_id: uuid.UUID,
     payload: AdminProjectUpdateRequest,
+    current_user: User = Depends(require_admin),
     project_service: ProjectService = Depends(get_project_service),
 ) -> AdminProjectRow:
     return await project_service.update_project(
-        project_id, **payload.model_dump(exclude_unset=True)
+        project_id, admin_user_id=current_user.id, **payload.model_dump(exclude_unset=True)
     )
 
 
