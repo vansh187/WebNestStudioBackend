@@ -15,7 +15,7 @@ from core.exceptions import (
     ValidationError,
 )
 from database.messaging_persistence import MessagingPersistence
-from database.models import Conversation, ConversationParticipant, Message, User
+from database.models import Conversation, ConversationParticipant, Message, MessageReport, User
 from database.user_persistence import UserPersistence
 from schemas.messaging_schemas import (
     AttachmentInput,
@@ -29,6 +29,8 @@ from schemas.messaging_schemas import (
     ReactionGroup,
     ReactionMutationResponse,
     ReplyPreview,
+    ReportListResponse,
+    ReportOut,
     SignUploadResponse,
     UserSearchResponse,
     UserSummary,
@@ -422,6 +424,58 @@ class MessagingService:
                 )
                 for candidate in found
             ]
+        )
+
+    # ================================================================== #
+    # Moderation
+    # ================================================================== #
+    async def report_message(
+        self, user: User, message_id: uuid.UUID, reason: str
+    ) -> ReportOut:
+        """Any participant of the message's conversation can flag it for admin
+        review. One report per (message, reporter) - the DB's unique
+        constraint turns a repeat call into a clean ConflictError rather than
+        piling up duplicate rows."""
+        message = await self._require_message_participant(user, message_id)
+        if message.is_deleted:
+            raise BadRequestError("This message has been deleted and can no longer be reported")
+        if message.sender_id == user.id:
+            raise BadRequestError("You cannot report your own message")
+
+        report = await self._messaging.create_report(
+            message_id=message.id,
+            reporter_id=user.id,
+            reported_user_id=message.sender_id,
+            reason=reason,
+        )
+        report.message = message
+        report.reporter = user
+        report.reported_user = message.sender
+        return self._report_view(report)
+
+    async def list_reports(self, status: str = "open") -> ReportListResponse:
+        reports = await self._messaging.list_reports(status)
+        return ReportListResponse(reports=[self._report_view(report) for report in reports])
+
+    async def resolve_report(self, report_id: uuid.UUID) -> ReportOut:
+        report = await self._messaging.get_report(report_id)
+        if report is None:
+            raise NotFoundError("Report not found")
+        report = await self._messaging.resolve_report(report)
+        return self._report_view(report)
+
+    def _report_view(self, report: MessageReport) -> ReportOut:
+        message = report.message
+        return ReportOut(
+            id=report.id,
+            message_id=report.message_id,
+            reporter=self._user_summary(report.reporter),
+            reported_user=self._user_summary(report.reported_user),
+            reason=report.reason,
+            status=report.status,
+            message_preview=None if message is None or message.is_deleted else _truncate(message.body, PREVIEW_LENGTH),
+            message_deleted=bool(message is None or message.is_deleted),
+            created_at=report.created_at,
         )
 
     # ================================================================== #

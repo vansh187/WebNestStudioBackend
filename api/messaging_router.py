@@ -16,6 +16,8 @@ from schemas.messaging_schemas import (
     ReactionMutationResponse,
     ReactionRequest,
     RenameConversationRequest,
+    ReportMessageRequest,
+    ReportOut,
     SendMessageRequest,
     SignUploadRequest,
     SignUploadResponse,
@@ -181,6 +183,20 @@ async def delete_message(
     messaging: MessagingService = Depends(get_messaging_service),
 ) -> MessageOut:
     return await messaging.delete_message(current_user, message_id)
+
+
+@router.post(
+    "/messages/{message_id}/report",
+    response_model=ReportOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def report_message(
+    message_id: uuid.UUID,
+    payload: ReportMessageRequest,
+    current_user: User = Depends(get_current_user),
+    messaging: MessagingService = Depends(get_messaging_service),
+) -> ReportOut:
+    return await messaging.report_message(current_user, message_id, payload.reason)
 
 
 @router.post("/attachments/sign-upload", response_model=SignUploadResponse)

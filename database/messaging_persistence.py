@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 from core.datetime_utils import as_aware
 from core.exceptions import ConflictError
 from database.base_persistence import BasePersistence
-from database.models import Conversation, ConversationParticipant, Message, MessageReaction
+from database.models import Conversation, ConversationParticipant, Message, MessageReaction, MessageReport
 
 
 class MessagingPersistence(BasePersistence):
@@ -458,3 +458,62 @@ class MessagingPersistence(BasePersistence):
         for message_id, emoji, count, reacted_by_me, _first_at in result.all():
             grouped.setdefault(message_id, []).append((emoji, count, bool(reacted_by_me)))
         return grouped
+
+    # ------------------------------------------------------------------ #
+    # Moderation
+    # ------------------------------------------------------------------ #
+    async def create_report(
+        self,
+        message_id: uuid.UUID,
+        reporter_id: uuid.UUID,
+        reported_user_id: uuid.UUID,
+        reason: str,
+    ) -> MessageReport:
+        report = MessageReport(
+            message_id=message_id,
+            reporter_id=reporter_id,
+            reported_user_id=reported_user_id,
+            reason=reason,
+        )
+        self._session.add(report)
+        await self._commit(conflict_message="This message has already been reported")
+        await self._refresh(report)
+        return report
+
+    async def list_reports(self, status: str = "open") -> list[MessageReport]:
+        result = await self._execute(
+            select(MessageReport)
+            .where(MessageReport.status == status)
+            .options(
+                selectinload(MessageReport.reporter),
+                selectinload(MessageReport.reported_user),
+                selectinload(MessageReport.message),
+            )
+            .order_by(MessageReport.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def get_report(self, report_id: uuid.UUID) -> MessageReport | None:
+        result = await self._execute(
+            select(MessageReport)
+            .where(MessageReport.id == report_id)
+            .options(
+                selectinload(MessageReport.reporter),
+                selectinload(MessageReport.reported_user),
+                selectinload(MessageReport.message),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def resolve_report(self, report: MessageReport) -> MessageReport:
+        # No self._refresh() here: the session is expire_on_commit=False, so
+        # the eagerly-loaded reporter/reported_user/message relationships this
+        # instance already carries (from get_report's selectinload) stay
+        # populated after commit. An explicit refresh() would mark those
+        # relationships expired, and the caller reads them right after this
+        # returns (_report_view) - on an AsyncSession that lazy (re)load isn't
+        # awaited and raises MissingGreenlet instead of silently working like
+        # it would under a sync Session.
+        report.status = "resolved"
+        await self._commit()
+        return report

@@ -195,3 +195,39 @@ class SignUploadResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 class UserSearchResponse(BaseModel):
     results: list[UserSummary]
+
+
+# --------------------------------------------------------------------------- #
+# Moderation: reporting a message, admin review, and blocking a user
+# --------------------------------------------------------------------------- #
+class ReportMessageRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_reason(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("reason must not be blank")
+        return cleaned
+
+
+class ReportOut(BaseModel):
+    id: uuid.UUID
+    message_id: uuid.UUID
+    reporter: UserSummary
+    reported_user: UserSummary
+    reason: str
+    status: str
+    message_preview: str | None = None
+    message_deleted: bool
+    created_at: datetime
+
+
+class ReportListResponse(BaseModel):
+    reports: list[ReportOut]
+
+
+class BlockUserResponse(BaseModel):
+    id: uuid.UUID
+    is_active: bool

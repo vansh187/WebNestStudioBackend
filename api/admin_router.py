@@ -3,18 +3,21 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 
 from core.dependencies import (
+    get_auth_service,
     get_blog_generation_service,
     get_blog_service,
     get_client_service,
     get_email_service,
     get_faq_service,
     get_lead_service,
+    get_messaging_service,
     get_portfolio_service,
     get_project_service,
     get_service_catalog_service,
     get_testimonial_service,
     require_admin,
 )
+from core.exceptions import BadRequestError
 from database.models import BlogPost, Faq, Lead, PortfolioItem, ProjectStatus, Service, Testimonial, User
 from schemas.blog_generation_schemas import (
     BlogGenerationLogResponse,
@@ -48,6 +51,8 @@ from schemas.content_schemas import (
     TestimonialUpdateRequest,
 )
 from schemas.lead_schemas import LeadListResponse, LeadResponse, LeadStatusUpdateRequest
+from schemas.messaging_schemas import BlockUserResponse, ReportListResponse, ReportOut
+from services.auth_service import AuthService
 from services.blog_generation_service import BlogGenerationError, BlogGenerationService
 from services.blog_service import BlogService
 from services.client_service import ClientService
@@ -55,6 +60,7 @@ from services.email_service import EmailService
 from services.faq_service import FaqService
 from services.lead_service import LeadService
 from services.llm_provider import GenerationFailedError
+from services.messaging_service import MessagingService
 from services.portfolio_service import PortfolioService
 from services.project_service import ProjectService
 from services.service_catalog_service import ServiceCatalogService
@@ -389,3 +395,50 @@ async def admin_delete_project(
         await project_service.hard_delete(project_id)
     else:
         await project_service.archive(project_id)
+
+
+# ---- Moderation: reported messages & user blocking ----
+#
+# Play Store / general UGC policy requires (a) a way for users to report
+# abusive content and (b) a way for the operator to act on it. Reporting
+# itself lives on the messaging router (any participant can report a
+# message they can see); everything here - reviewing those reports and
+# blocking/unblocking the offending account - is admin-only via the
+# router-level require_admin dependency.
+
+
+@router.get("/reports", response_model=ReportListResponse)
+async def list_reports(
+    status_filter: str = Query(default="open", alias="status", pattern="^(open|resolved)$"),
+    messaging: MessagingService = Depends(get_messaging_service),
+) -> ReportListResponse:
+    return await messaging.list_reports(status_filter)
+
+
+@router.post("/reports/{report_id}/resolve", response_model=ReportOut)
+async def resolve_report(
+    report_id: uuid.UUID,
+    messaging: MessagingService = Depends(get_messaging_service),
+) -> ReportOut:
+    return await messaging.resolve_report(report_id)
+
+
+@router.post("/users/{user_id}/block", response_model=BlockUserResponse)
+async def block_user(
+    user_id: uuid.UUID,
+    current_user: User = Depends(require_admin),
+    auth_service: AuthService = Depends(get_auth_service),
+) -> BlockUserResponse:
+    if user_id == current_user.id:
+        raise BadRequestError("You cannot block your own account")
+    user = await auth_service.set_user_active(user_id, False)
+    return BlockUserResponse(id=user.id, is_active=user.is_active)
+
+
+@router.post("/users/{user_id}/unblock", response_model=BlockUserResponse)
+async def unblock_user(
+    user_id: uuid.UUID,
+    auth_service: AuthService = Depends(get_auth_service),
+) -> BlockUserResponse:
+    user = await auth_service.set_user_active(user_id, True)
+    return BlockUserResponse(id=user.id, is_active=user.is_active)

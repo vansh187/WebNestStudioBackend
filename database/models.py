@@ -530,6 +530,39 @@ class MessageReaction(Base):
     user: Mapped["User"] = relationship(foreign_keys=[user_id])
 
 
+class MessageReport(Base):
+    """A user flagging one message (and, transitively, its sender) for admin
+    review. Kept even after the underlying message/reporter is deleted would
+    lose context, so both are CASCADE - a report only matters while both
+    sides of it still exist. `status` starts 'open' and moves to 'resolved'
+    when an admin has acted on it (e.g. blocked the sender)."""
+
+    __tablename__ = "message_reports"
+    __table_args__ = (
+        CheckConstraint("status in ('open','resolved')", name="ck_report_status"),
+        UniqueConstraint("message_id", "reporter_id", name="uq_report_message_reporter"),
+        Index("ix_message_reports_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reporter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    reported_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    message: Mapped["Message"] = relationship(foreign_keys=[message_id])
+    reporter: Mapped["User"] = relationship(foreign_keys=[reporter_id])
+    reported_user: Mapped["User"] = relationship(foreign_keys=[reported_user_id])
+
+
 class CodingExecution(Base):
     __tablename__ = "coding_executions"
 

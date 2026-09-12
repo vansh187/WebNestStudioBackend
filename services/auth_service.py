@@ -210,6 +210,19 @@ class AuthService:
         await self._refresh_tokens.revoke_all_for_user(user.id)
         await self._users.delete_account(user)
 
+    async def set_user_active(self, user_id: uuid.UUID, is_active: bool) -> User:
+        """Admin block/unblock. Blocking also revokes every refresh token so
+        the effect is immediate: get_current_user rejects the account's
+        access token on its very next request, and a stolen/cached refresh
+        token can't mint a new one either - the account doesn't just fail to
+        log in again, it's cut off mid-session."""
+        user = await self._users.get_by_id(user_id)
+        if user is None:
+            raise NotFoundError("User not found")
+        if not is_active:
+            await self._refresh_tokens.revoke_all_for_user(user.id)
+        return await self._users.set_active(user, is_active)
+
     async def get_current_user(self, access_token: str) -> User:
         try:
             payload = self._jwt_handler.decode_token(access_token)
