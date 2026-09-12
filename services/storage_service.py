@@ -24,21 +24,44 @@ DOWNLOAD_URL_CACHE_MAX_ENTRIES = 5000
 _MAX_CONNECTIONS = 20
 _MAX_KEEPALIVE = 10
 
-# MIME allowlist - section 4 of the chat backend spec.
+# MIME allowlist - section 4 of the chat backend spec, extended to cover
+# video, audio, and a broader set of document formats. Video is expected to
+# arrive already compressed by the client (react-native-compressor) - this
+# server-side cap is the same one used for every other attachment kind, not
+# a separate/looser one for video.
 ALLOWED_MIME_TYPES = frozenset(
     {
+        # Images
         "image/jpeg",
         "image/png",
         "image/webp",
         "image/gif",
         "image/heic",
+        # Documents
         "application/pdf",
         "text/plain",
+        "text/csv",
+        "application/json",
         "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "application/zip",
+        # Video
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+        "video/3gpp",
+        # Audio
+        "audio/mpeg",
+        "audio/mp4",
+        "audio/aac",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/ogg",
+        "audio/webm",
     }
 )
 
@@ -113,6 +136,10 @@ class StorageService:
             return "image"
         if normalized == "application/pdf":
             return "pdf"
+        if normalized.startswith("video/"):
+            return "video"
+        if normalized.startswith("audio/"):
+            return "audio"
         return "file"
 
     def validate_descriptor(self, mime_type: str, size_bytes: int) -> None:
