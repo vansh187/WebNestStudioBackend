@@ -18,6 +18,23 @@ The public endpoints you already use (`GET /api/blog`, `GET
 fields on every post**, added for SEO (meta tags, keyword targeting). Nothing
 that previously worked should break — this is additive.
 
+## Editorial direction
+
+When the generator is not given a manual `topic_hint`, it now prioritizes
+commercial-intent topic clusters tied to Webnest's core services:
+
+- **Website Development** -> website development cost in India, React frontend
+  with Python/Java backend development, conversion, ecommerce cost, and the
+  Website Development service page.
+- **AI & Automation** -> AI chatbot cost, lead automation, WhatsApp automation,
+  AI search/GEO, and the AI Development service page.
+- **CRM & Enterprise Software** -> custom CRM cost, Custom CRM vs Zoho vs
+  Salesforce, SaaS vs custom software, and the CRM Development service page.
+
+Manual admin generation can still force an exact subject through `topic_hint`;
+otherwise the automated schedule should favor these clusters while avoiding
+recently covered topics and near-duplicate titles.
+
 ## Endpoints (public, no auth)
 
 ### `GET /api/blog?tag=<optional>`

@@ -53,6 +53,39 @@ FALLBACK_KEYWORD_POOL = [
     "social media marketing for startups",
 ]
 
+PREFERRED_TOPIC_CLUSTERS = [
+    {
+        "cluster": "Website Development",
+        "service_page": "Website Development",
+        "topics": [
+            "Website Development Cost in India",
+            "React frontend with Python and Java backend development",
+            "Website conversion improvements for lead generation",
+            "Ecommerce website development cost in India",
+        ],
+    },
+    {
+        "cluster": "AI & Automation",
+        "service_page": "AI Development",
+        "topics": [
+            "How Much Does an AI Chatbot Cost in India?",
+            "Lead automation for small and medium businesses",
+            "WhatsApp automation for sales and support",
+            "SEO vs GEO: How to Rank on Google, ChatGPT and AI Search",
+        ],
+    },
+    {
+        "cluster": "CRM & Enterprise Software",
+        "service_page": "CRM Development",
+        "topics": [
+            "How Much Does Custom CRM Development Cost in India?",
+            "Custom CRM vs Zoho vs Salesforce",
+            "SaaS vs custom software for Indian businesses",
+            "CRM development for sales, support, and operations teams",
+        ],
+    },
+]
+
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -395,10 +428,15 @@ def _build_system_prompt(
 but stay on this subject - do not substitute a different topic):
 {topic_hint}"""
     else:
-        topic_instruction = """Pick ONE fresh, specific topic: either (a) a current trend in web
-development, AI, or social media relevant to small businesses right now, or
-(b) a common real-world business problem and how a consultancy like Webnest
-Studio would solve it."""
+        topic_instruction = f"""Pick ONE fresh, specific topic from the preferred topic clusters below unless
+the exact subject has already been covered. Prioritize commercial-intent posts
+that attract Indian founders, marketing heads, operations teams, and B2B buyers
+who are close to requesting a quote.
+
+{_format_preferred_topic_clusters()}
+
+If every preferred topic is already covered, choose a closely related long-tail
+angle that still supports one of these service pages."""
     return f"""You are writing a blog post for Webnest Studio, a tech consultancy offering
 web development, AI/ML solutions, and social media growth for small and
 medium businesses.
@@ -422,6 +460,10 @@ Rules:
   (not stuffed) - prefer specific, moderately-searched, long-tail phrases a
   small business owner would actually type into Google, over generic single
   words, so the post can realistically rank and drive traffic.
+- When writing cost/comparison posts, include India-specific buying context
+  and practical ranges or decision factors without making unverifiable promises.
+- Keep the article aligned with the selected cluster's service page so it can
+  work as part of a topic cluster, not as an unrelated standalone post.
 - meta_title: at most 60 characters, includes a primary keyword near the start.
 - meta_description: 150-160 characters, includes a keyword and a soft call to action.
 - slug: lowercase, hyphen-separated, url-safe, derived from the title.
@@ -441,6 +483,14 @@ Return ONLY valid JSON, no markdown code fences, no extra commentary:
   "keywords": ["...", "..."],
   "topic_tag": "..."
 }}"""
+
+
+def _format_preferred_topic_clusters() -> str:
+    lines: list[str] = []
+    for cluster in PREFERRED_TOPIC_CLUSTERS:
+        topics = "; ".join(cluster["topics"])
+        lines.append(f'- {cluster["cluster"]} -> {cluster["service_page"]} service page: {topics}')
+    return "\n".join(lines)
 
 
 def _parse_json(raw_text: str) -> dict:
