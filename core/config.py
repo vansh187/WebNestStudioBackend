@@ -12,7 +12,9 @@ class Settings(BaseSettings):
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 15
-    refresh_token_expire_days: int = 30
+    # Absolute session lifetime: refresh tokens rotate but keep the expiry set
+    # at login, so a user is fully logged out this long after signing in.
+    refresh_token_expire_minutes: int = 60
     otp_expire_minutes: int = 10
 
     # Temporary switch while the sending domain is pending at the registrar:
