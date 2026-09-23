@@ -176,7 +176,8 @@ class AuthService:
         stored = await self._refresh_tokens.get_by_hash(token_hash)
         if stored is None or stored.revoked:
             raise UnauthorizedError("Refresh token has been revoked")
-        if stored.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        session_expires_at = stored.expires_at.replace(tzinfo=timezone.utc)
+        if session_expires_at < datetime.now(timezone.utc):
             raise UnauthorizedError("Refresh token has expired")
 
         user = await self._users.get_by_id(stored.user_id)
@@ -186,7 +187,10 @@ class AuthService:
         await self._refresh_tokens.revoke(stored)
         try:
             new_access_token = self._jwt_handler.create_access_token(str(user.id), user.role)
-            new_refresh_token, expires_at = self._jwt_handler.create_refresh_token(str(user.id))
+            # Carry the login-time expiry forward so rotation can't extend the session.
+            new_refresh_token, expires_at = self._jwt_handler.create_refresh_token(
+                str(user.id), expires_at=session_expires_at
+            )
         except ValueError as exc:
             raise UnauthorizedError(str(exc)) from exc
         await self._refresh_tokens.create(

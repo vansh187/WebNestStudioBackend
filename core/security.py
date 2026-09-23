@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import string
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -72,12 +73,15 @@ class JWTHandler:
             logger.error("Failed to create access token", exc_info=True)
             raise ValueError("Could not create access token") from exc
 
-    def create_refresh_token(self, subject: str) -> tuple[str, datetime]:
+    def create_refresh_token(self, subject: str, expires_at: datetime | None = None) -> tuple[str, datetime]:
+        """expires_at pins the token to an existing session's expiry (used on
+        rotation); when omitted a new session window starts now."""
         if not subject:
             raise ValueError("Cannot create a refresh token without a subject")
         try:
-            expire = datetime.now(timezone.utc) + timedelta(days=self._settings.refresh_token_expire_days)
-            payload = {"sub": subject, "exp": expire, "type": "refresh"}
+            expire = expires_at or datetime.now(timezone.utc) + timedelta(minutes=self._settings.refresh_token_expire_minutes)
+            # jti keeps rotated tokens distinct even when they share sub + exp.
+            payload = {"sub": subject, "exp": expire, "type": "refresh", "jti": uuid.uuid4().hex}
             token = jwt.encode(payload, self._settings.jwt_secret_key, algorithm=self._settings.jwt_algorithm)
             return token, expire
         except JWTError as exc:
