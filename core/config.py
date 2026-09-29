@@ -98,6 +98,17 @@ class Settings(BaseSettings):
     coding_project_limit_per_user: int = 100
     coding_project_source_limit_bytes: int = 262144
 
+    # Java 17 playground: a private Cloud Run service that only accepts calls
+    # carrying a Google ID token minted for exactly java_playground_url.
+    # java_playground_invoker_key is the full service-account JSON key pasted
+    # as one value - a secret: never log it or return it to a client.
+    # java_playground_daily_cap is the site-wide run budget per UTC day that
+    # keeps the Cloud Run bill at zero.
+    java_playground_url: str = ""
+    java_playground_invoker_key: str = ""
+    java_playground_timeout_seconds: float = 65.0
+    java_playground_daily_cap: int = 1500
+
     # In-app project chat (user-to-user messaging) attachment storage. Files
     # live in a private Supabase Storage bucket; the backend uses the
     # service-role key to mint short-lived signed upload/download URLs so the

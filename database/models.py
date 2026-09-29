@@ -575,6 +575,16 @@ class CodingExecution(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class JavaPlaygroundDailyUsage(Base):
+    """Site-wide Java playground run counter, one row per UTC day. Kept in the
+    database (not memory) so a Render idle restart cannot reset the daily cap."""
+
+    __tablename__ = "java_playground_daily_usage"
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    runs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+
 # =========================================================================== #
 # Webnest CodeLab - Phase 1 learning platform (browser-first execution; the
 # backend never runs visitor code). See CODELAB_LEARNING_API.md.

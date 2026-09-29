@@ -1,9 +1,10 @@
+import json
 import logging
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.exc import SQLAlchemyError
 
 from core.exceptions import (
@@ -57,7 +58,7 @@ def register_error_handlers(app: FastAPI) -> None:
         app.add_exception_handler(exception_type, _make_domain_handler(status_code))
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> Response:
         # exc.errors() may embed a raw exception object under ctx.error (from a
         # raised ValueError inside a validator) which json.dumps cannot serialize.
         safe_errors = []
@@ -69,10 +70,17 @@ def register_error_handlers(app: FastAPI) -> None:
                 error["ctx"] = ctx
             safe_errors.append(error)
         safe_errors = jsonable_encoder(safe_errors)
-        return JSONResponse(
-            status_code=422,
-            content={"detail": "Request validation failed", "errors": safe_errors},
-        )
+        content = {"detail": "Request validation failed", "errors": safe_errors}
+        try:
+            return JSONResponse(status_code=422, content=content)
+        except UnicodeEncodeError:
+            # The echoed input holds a lone UTF-16 surrogate (e.g. "\ud800"),
+            # which UTF-8 cannot encode; ASCII-escaped JSON can.
+            return Response(
+                status_code=422,
+                content=json.dumps(content, ensure_ascii=True),
+                media_type="application/json",
+            )
 
     @app.exception_handler(SQLAlchemyError)
     async def _database_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
