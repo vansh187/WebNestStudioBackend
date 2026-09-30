@@ -76,6 +76,19 @@ class BlogPersistence(BasePersistence):
         result = await self._execute(query)
         return [row[0] for row in result.all() if row[0]]
 
+    async def list_recent_contents(self, limit: int) -> list[str]:
+        """Markdown bodies of the most recent posts (any status), newest first,
+        so their "##" subheadings can be fed back to the generator as ones
+        not to reuse."""
+        query = (
+            select(BlogPost.content)
+            .where(BlogPost.content.is_not(None))
+            .order_by(BlogPost.created_at.desc())
+            .limit(limit)
+        )
+        result = await self._execute(query)
+        return [row[0] for row in result.all() if row[0]]
+
     async def has_published_on_date(self, day_start: datetime, day_end: datetime) -> bool:
         """Whether any *live* post's published_at falls within
         [day_start, day_end) - used to make the one-off launch post
