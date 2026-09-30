@@ -29,15 +29,38 @@ MAX_EXCLUDED_TOPICS_IN_PROMPT = 40
 # don't rephrase these". Same rationale as the topic cap - bounds token use
 # while the post-generation similarity check below still runs against every
 # historical title.
-MAX_RECENT_TITLES_IN_PROMPT = 20
+MAX_RECENT_TITLES_IN_PROMPT = 60
+# How many recent posts' "##" subheadings are shown to the model as ones not to
+# reuse, so every article doesn't end up with the same "Why It Matters" /
+# "The Bottom Line" skeleton.
+MAX_RECENT_POSTS_FOR_SUBHEADINGS = 15
+MAX_SUBHEADINGS_IN_PROMPT = 45
+# How many recent posts a new article body is compared against, and how many
+# of their opening lines are shown to the model as hooks not to repeat.
+MAX_RECENT_POSTS_FOR_CONTENT_CHECK = 60
+MAX_RECENT_OPENINGS_IN_PROMPT = 15
+# A new article counts as a copy of an existing one when this share of its
+# 3-word phrases (Jaccard over word trigrams) also appear in that post, or its
+# opening sentence is this close to that post's opening. Two different posts
+# in the same niche typically share well under 10% of trigrams; a reworded
+# rerun of the same article shares far more.
+CONTENT_SHINGLE_OVERLAP = 0.2
+OPENING_SIMILARITY_RATIO = 0.75
+# How many extra LLM calls are spent rewriting only the headline when the
+# article is fine but its title still duplicates an existing one.
+MAX_TITLE_REWRITES = 3
 # A freshly generated title is treated as a duplicate of an existing one when
-# either the normalized character-level similarity ratio, or the word-set
-# overlap (Jaccard), is at or above these thresholds. Tuned so "... AI Search
-# Optimization" vs "... AI Search Optimization Now" is caught while two
-# genuinely different posts that share a stock "Why Your Small Business..."
-# opening are not.
-TITLE_SIMILARITY_RATIO = 0.8
-TITLE_TOKEN_OVERLAP = 0.75
+# the normalized character-level similarity ratio, the word-set overlap
+# (Jaccard), or the overlap relative to the shorter title is at or above these
+# thresholds, or when both titles share the same headline stem (the part
+# before a ":", "?", or " - "). Topics may repeat; headlines must not - so
+# "Website Development Cost in India: 2026 Guide" and "Website Development
+# Cost in India: What Drives Pricing" count as the same heading.
+TITLE_SIMILARITY_RATIO = 0.7
+TITLE_TOKEN_OVERLAP = 0.5
+TITLE_TOKEN_CONTAINMENT = 0.8
+_TITLE_STEM_SPLIT = re.compile(r"\s*(?::|\?|\s[-–—|]\s)\s*")
+_SUBHEADING = re.compile(r"^#{2,3}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 # Common filler words stripped before the word-set comparison so near-identical
 # titles aren't hidden by, or falsely flagged from, shared connective tissue.
 _TITLE_STOPWORDS = frozenset(
@@ -206,50 +229,86 @@ class BlogGenerationService:
 
         existing_titles = await self._blog_posts.list_titles()
         recent_titles = existing_titles[:MAX_RECENT_TITLES_IN_PROMPT]
+        existing_contents = await self._blog_posts.list_recent_contents(MAX_RECENT_POSTS_FOR_CONTENT_CHECK)
+        used_subheadings = _recent_subheadings(existing_contents[:MAX_RECENT_POSTS_FOR_SUBHEADINGS])
+        recent_openings = _recent_openings(existing_contents[:MAX_RECENT_OPENINGS_IN_PROMPT])
 
-        data, provider = await self._generate_json(excluded_for_prompt, recent_titles, topic_hint=topic_hint)
-        data, provider = await self._ensure_word_limit(
-            data, provider, excluded_for_prompt, recent_titles, topic_hint=topic_hint
-        )
+        async def _draft() -> tuple[dict, str]:
+            draft, draft_provider = await self._generate_json(
+                excluded_for_prompt, recent_titles, used_subheadings, recent_openings, topic_hint=topic_hint
+            )
+            return await self._ensure_word_limit(
+                draft,
+                draft_provider,
+                excluded_for_prompt,
+                recent_titles,
+                used_subheadings,
+                recent_openings,
+                topic_hint=topic_hint,
+            )
+
+        data, provider = await _draft()
         topic_tag = _clean_str(data.get("topic_tag")) or "general"
         title = _clean_str(data.get("title"))
 
-        # A directed topic (topic_hint) is trusted as-is even if it collides
-        # with a prior post - the caller asked for this exact subject
-        # deliberately, so the uniqueness retry loop (which exists to stop the
-        # model repeating itself when picking freely) doesn't apply here. The
-        # slug de-dup in _persist_with_unique_slug still runs regardless.
+        # A directed topic (topic_hint) may repeat a prior post's subject - the
+        # caller asked for it deliberately - so only the topic_tag check is
+        # skipped for it. The headline and the article itself must always be
+        # new: two posts may share a topic, never a heading or a body.
+        def _content_duplicate_of() -> str | None:
+            content = _clean_str(data.get("content"))
+            match = _closest_content(content, existing_contents)
+            if match is not None:
+                return f"content closely matches an existing post ({match})"
+            return None
+
         def _duplicate_of() -> str | None:
             """Returns a human-readable reason string if the current draft
-            duplicates an existing post (by topic_tag or by title), else None."""
-            if topic_tag.strip().lower() in normalized_existing:
+            duplicates an existing post (by topic_tag, title, or content),
+            else None."""
+            if topic_hint is None and topic_tag.strip().lower() in normalized_existing:
                 return f"topic_tag {topic_tag!r}"
             match = _closest_title(title, existing_titles)
             if match is not None:
                 return f"title {title!r} closely matches existing {match!r}"
-            return None
+            return _content_duplicate_of()
 
         attempts = 0
-        reason = _duplicate_of() if topic_hint is None else None
+        reason = _duplicate_of()
         while reason is not None and attempts < MAX_TOPIC_RETRIES:
             attempts += 1
             logger.warning("Generated post duplicates a prior one (%s), retrying (%s/%s)", reason, attempts, MAX_TOPIC_RETRIES)
-            excluded_for_prompt = list(dict.fromkeys([*excluded_for_prompt, topic_tag, title]))
+            if topic_hint is None:
+                excluded_for_prompt = list(dict.fromkeys([*excluded_for_prompt, topic_tag]))
             recent_titles = list(dict.fromkeys([title, *recent_titles]))[:MAX_RECENT_TITLES_IN_PROMPT]
-            data, provider = await self._generate_json(excluded_for_prompt, recent_titles)
-            data, provider = await self._ensure_word_limit(data, provider, excluded_for_prompt, recent_titles)
+            opening = _opening_line(_clean_str(data.get("content")))
+            if opening:
+                recent_openings = list(dict.fromkeys([opening, *recent_openings]))[:MAX_RECENT_OPENINGS_IN_PROMPT]
+            data, provider = await _draft()
             topic_tag = _clean_str(data.get("topic_tag")) or "general"
             title = _clean_str(data.get("title"))
             reason = _duplicate_of()
 
+        content_reason = _content_duplicate_of()
+        if content_reason is not None:
+            # Unlike a headline, a repeated body can't be patched in place -
+            # skip this run rather than publish a copy of an earlier article.
+            raise BlogGenerationError(f"Could not produce an original article after retries: {content_reason}")
+
+        if reason is not None and _closest_title(title, existing_titles) is not None:
+            # The article is usable but its headline still repeats an existing
+            # one - rewrite just the headline rather than publish a duplicate.
+            title = await self._rewrite_unique_title(data, existing_titles)
+            data["title"] = title
+            data["meta_title"] = ""  # re-derived from the new title in _validate_and_heal
+            reason = _duplicate_of()
+
         if reason is not None:
-            # Retries exhausted and it still looks like a repeat. Auto-uniquify
-            # the topic_tag so the audit trail stays honest, and let it publish
-            # with a loud warning rather than failing the whole run over a
-            # near-duplicate - the slug is still forced unique downstream.
+            # Only the topic_tag still repeats (the title is unique by now).
+            # Auto-uniquify the tag so the audit trail stays honest.
             uniquified = f"{topic_tag} ({datetime.now(timezone.utc).date().isoformat()})"
             logger.warning(
-                "Publishing a possible near-duplicate after exhausting retries (%s); topic_tag %r -> %r",
+                "Publishing a repeated topic under a new headline (%s); topic_tag %r -> %r",
                 reason,
                 topic_tag,
                 uniquified,
@@ -264,10 +323,14 @@ class BlogGenerationService:
         self,
         excluded_topics: list[str],
         recent_titles: list[str] | None = None,
+        used_subheadings: list[str] | None = None,
+        recent_openings: list[str] | None = None,
         strict_word_limit: bool = False,
         topic_hint: str | None = None,
     ) -> tuple[dict, str]:
-        system_prompt = _build_system_prompt(excluded_topics, recent_titles or [], topic_hint=topic_hint)
+        system_prompt = _build_system_prompt(
+            excluded_topics, recent_titles or [], used_subheadings or [], recent_openings or [], topic_hint=topic_hint
+        )
         user_message = "Generate today's blog post as JSON."
         if strict_word_limit:
             user_message += (
@@ -293,6 +356,8 @@ class BlogGenerationService:
         provider: str,
         excluded_topics: list[str],
         recent_titles: list[str] | None = None,
+        used_subheadings: list[str] | None = None,
+        recent_openings: list[str] | None = None,
         topic_hint: str | None = None,
     ) -> tuple[dict, str]:
         content = data.get("content") if isinstance(data.get("content"), str) else ""
@@ -301,11 +366,52 @@ class BlogGenerationService:
         logger.warning("Generated content exceeded %s words; regenerating once", MAX_WORDS)
         try:
             return await self._generate_json(
-                excluded_topics, recent_titles, strict_word_limit=True, topic_hint=topic_hint
+                excluded_topics,
+                recent_titles,
+                used_subheadings,
+                recent_openings,
+                strict_word_limit=True,
+                topic_hint=topic_hint,
             )
         except BlogGenerationError:
             logger.warning("Word-limit regeneration failed; will truncate at a sentence boundary instead")
             return data, provider
+
+    async def _rewrite_unique_title(self, data: dict, existing_titles: list[str]) -> str:
+        """Asks the model for a fresh headline for an already-written article,
+        rejecting any candidate that still matches an existing title. Raises
+        BlogGenerationError rather than let a duplicate heading go live."""
+        forbidden = list(existing_titles[:MAX_RECENT_TITLES_IN_PROMPT])
+        excerpt = _clean_str(data.get("excerpt")) or _derive_excerpt(_clean_str(data.get("content")))
+        for attempt in range(MAX_TITLE_REWRITES):
+            system_prompt = f"""You write blog headlines for Webnest Studio, a tech consultancy.
+Write ONE new headline (at most 70 characters) for the article summarised below.
+It must be clearly different in wording AND structure from every headline in the
+forbidden list - do not reuse their opening phrase, do not just add or swap a word
+or a year. Try a different angle: a question, a number, a specific scenario, a
+mistake to avoid, or a bold claim. No hashtags, no quotes.
+
+Article summary: {excerpt}
+
+Forbidden headlines: {"; ".join(f'"{t}"' for t in forbidden) or "(none)"}
+
+Return ONLY valid JSON: {{"title": "..."}}"""
+            raw_text, _ = await self._llm.generate_text(system_prompt, "Write the new headline as JSON.")
+            try:
+                candidate = _strip_hashtags(_clean_str(_parse_json(raw_text).get("title")))
+            except ValueError:
+                continue
+            if not candidate:
+                continue
+            match = _closest_title(candidate, existing_titles)
+            if match is None:
+                logger.info("Rewrote duplicate headline to %r", candidate)
+                return candidate
+            logger.warning(
+                "Rewritten headline %r still matches %r (%s/%s)", candidate, match, attempt + 1, MAX_TITLE_REWRITES
+            )
+            forbidden = [candidate, *forbidden]
+        raise BlogGenerationError("Could not produce a headline distinct from existing posts")
 
     def _validate_and_heal(self, data: dict) -> dict:
         title = _strip_hashtags(_clean_str(data.get("title")))
@@ -419,10 +525,16 @@ class BlogGenerationService:
 
 
 def _build_system_prompt(
-    excluded_topics: list[str], recent_titles: list[str], topic_hint: str | None = None
+    excluded_topics: list[str],
+    recent_titles: list[str],
+    used_subheadings: list[str] | None = None,
+    recent_openings: list[str] | None = None,
+    topic_hint: str | None = None,
 ) -> str:
+    openings_str = "; ".join(f'"{o}"' for o in recent_openings) if recent_openings else "(none yet)"
     excluded_str = "; ".join(excluded_topics) if excluded_topics else "(none yet)"
     recent_titles_str = "; ".join(f'"{t}"' for t in recent_titles) if recent_titles else "(none yet)"
+    subheadings_str = "; ".join(f'"{h}"' for h in used_subheadings) if used_subheadings else "(none yet)"
     if topic_hint:
         topic_instruction = f"""Write specifically about the following topic (you may narrow or angle it,
 but stay on this subject - do not substitute a different topic):
@@ -469,8 +581,25 @@ Rules:
 - slug: lowercase, hyphen-separated, url-safe, derived from the title.
 - topic_tag: a short 2-5 word label for this topic, distinct in wording from the title.
 - Do NOT reuse or closely rephrase any of these previously covered topics: {excluded_str}
-- Do NOT reuse or lightly reword any of these already-published titles (pick a
-  genuinely different angle, not the same headline with an extra word): {recent_titles_str}
+- The topic clusters above are SUBJECTS, not headlines - never copy a cluster
+  topic verbatim as the title.
+- The title must be unique: even when the subject overlaps an earlier post, the
+  headline must differ in wording AND structure. Do NOT reuse or lightly reword
+  any of these already-published titles, do not start with the same lead phrase
+  (e.g. the words before a ":" or "?"), and do not just add a year, "Guide", or
+  one swapped word: {recent_titles_str}
+- Vary the headline format - rotate between a question, a number/list, a
+  specific scenario or persona, a mistake to avoid, a comparison, or a bold
+  claim - and avoid the format the recent titles above use most.
+- The "##" subheadings must be specific to this article's content (e.g.
+  "What a ₹40,000 Website Actually Includes"), never generic labels like
+  "Why It Matters", "The Bottom Line", "Conclusion", "Key Benefits", or
+  "Getting Started". Do NOT reuse any of these recently used subheadings:
+  {subheadings_str}
+- The whole article must be original, not a remix of an earlier post: use a
+  fresh angle, a new concrete example or scenario, different numbers, and a
+  different structure. Do NOT open the way any of these recent posts opened
+  (no same hook, stat, or first sentence pattern): {openings_str}
 
 Return ONLY valid JSON, no markdown code fences, no extra commentary:
 {{
@@ -592,26 +721,105 @@ def _title_word_set(title: str) -> set[str]:
     return {w for w in _normalize_title(title).split() if w and w not in _TITLE_STOPWORDS}
 
 
+def _title_stem(title: str) -> str:
+    """The headline's lead phrase - the part before a ":", "?", or " - " - so
+    "X: A Guide" and "X: What to Know" are recognised as the same heading.
+    Empty when the title has no such separator or the stem is too short to be
+    meaningful."""
+    parts = _TITLE_STEM_SPLIT.split(title or "", maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    stem_words = _title_word_set(parts[0])
+    return " ".join(sorted(stem_words)) if len(stem_words) >= 3 else ""
+
+
 def _closest_title(candidate: str, existing: list[str]) -> str | None:
-    """Returns the first existing title the candidate duplicates - either a
-    high character-level similarity ratio or a high content-word overlap -
+    """Returns the first existing title the candidate duplicates - a high
+    character-level similarity ratio, a high content-word overlap, one title's
+    words mostly contained in the other's, or an identical headline stem -
     or None if the candidate reads as genuinely new."""
     cand_norm = _normalize_title(candidate)
     if not cand_norm:
         return None
     cand_words = _title_word_set(candidate)
+    cand_stem = _title_stem(candidate)
     for other in existing:
         other_norm = _normalize_title(other)
         if not other_norm:
             continue
+        if cand_norm == other_norm:
+            return other
         if difflib.SequenceMatcher(None, cand_norm, other_norm).ratio() >= TITLE_SIMILARITY_RATIO:
+            return other
+        if cand_stem and cand_stem == _title_stem(other):
             return other
         other_words = _title_word_set(other)
         if cand_words and other_words:
-            overlap = len(cand_words & other_words) / len(cand_words | other_words)
-            if overlap >= TITLE_TOKEN_OVERLAP:
+            shared = len(cand_words & other_words)
+            if shared / len(cand_words | other_words) >= TITLE_TOKEN_OVERLAP:
+                return other
+            if min(len(cand_words), len(other_words)) >= 3 and shared / min(
+                len(cand_words), len(other_words)
+            ) >= TITLE_TOKEN_CONTAINMENT:
                 return other
     return None
+
+
+def _extract_subheadings(content: str) -> list[str]:
+    return [m.group(1).strip() for m in _SUBHEADING.finditer(content or "") if m.group(1).strip()]
+
+
+def _plain_words(content: str) -> list[str]:
+    return _normalize_title(_MARKDOWN_NOISE.sub(" ", content or "")).split()
+
+
+def _shingles(content: str) -> set[tuple[str, ...]]:
+    words = _plain_words(content)
+    return {tuple(words[i : i + 3]) for i in range(len(words) - 2)}
+
+
+def _opening_line(content: str) -> str:
+    """The article's first real sentence (its hook), skipping headings."""
+    for line in (content or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            first = _SENTENCE_BOUNDARY.split(_MARKDOWN_NOISE.sub("", line).strip(), maxsplit=1)[0]
+            return _truncate(first, 160)
+    return ""
+
+
+def _recent_openings(contents: list[str]) -> list[str]:
+    return list(dict.fromkeys(o for o in (_opening_line(c) for c in contents) if o))
+
+
+def _closest_content(candidate: str, existing: list[str]) -> str | None:
+    """Returns a short description of the first existing post the candidate
+    article copies - heavy 3-word-phrase overlap or a near-identical opening
+    hook - or None if the article reads as original."""
+    cand_shingles = _shingles(candidate)
+    cand_opening = _normalize_title(_opening_line(candidate))
+    for other in existing:
+        other_opening_raw = _opening_line(other)
+        other_opening = _normalize_title(other_opening_raw)
+        if cand_opening and other_opening and (
+            difflib.SequenceMatcher(None, cand_opening, other_opening).ratio() >= OPENING_SIMILARITY_RATIO
+        ):
+            return f"same opening as {other_opening_raw!r}"
+        other_shingles = _shingles(other)
+        if cand_shingles and other_shingles:
+            overlap = len(cand_shingles & other_shingles) / len(cand_shingles | other_shingles)
+            if overlap >= CONTENT_SHINGLE_OVERLAP:
+                return f"{overlap:.0%} phrase overlap with the post opening {other_opening_raw!r}"
+    return None
+
+
+def _recent_subheadings(contents: list[str]) -> list[str]:
+    """Distinct subheadings from recent posts (case-insensitive), newest first."""
+    seen: dict[str, str] = {}
+    for content in contents:
+        for heading in _extract_subheadings(content):
+            seen.setdefault(heading.lower(), heading)
+    return list(seen.values())[:MAX_SUBHEADINGS_IN_PROMPT]
 
 
 def _as_aware(value: datetime) -> datetime:

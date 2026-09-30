@@ -27,6 +27,7 @@ class CourseLessonRef(BaseModel):
     order: int
     status: str  # per-user: not_started | in_progress | completed
     estimated_minutes: int
+    bookmarked: bool = False
 
 
 class CourseModuleView(BaseModel):
@@ -37,12 +38,39 @@ class CourseModuleView(BaseModel):
     lessons: list[CourseLessonRef]
 
 
+class LessonLink(BaseModel):
+    id: uuid.UUID
+    title: str
+    estimated_minutes: int
+
+
+class LearningCourseProgress(BaseModel):
+    """Per-user progress for one course. Each course covers a single
+    language, so this is also the learner's progress in that language."""
+
+    course_id: uuid.UUID
+    course_slug: str
+    title: str
+    level: str
+    completion_percent: int
+    lessons_completed: int
+    lessons_in_progress: int
+    lessons_total: int
+    bookmarks_count: int
+    quizzes_passed: int
+    problems_solved: int  # CodeLab problems linked to this course's lessons
+    time_spent_minutes: int
+    last_activity_at: datetime | None = None
+    continue_lesson: LessonLink | None = None  # latest in-progress, else first unfinished
+
+
 class CourseDetailResponse(BaseModel):
     id: uuid.UUID
     slug: str
     title: str
     level: str
     modules: list[CourseModuleView]
+    progress: LearningCourseProgress | None = None  # authenticated users only
 
 
 # --------------------------------------------------------------------------- #
@@ -75,9 +103,15 @@ class LessonDetailResponse(BaseModel):
     resources: list[dict] = Field(default_factory=list)
     practice: list[LessonPracticeRef] = Field(default_factory=list)
     progress: LessonProgressView
+    previous_lesson: LessonLink | None = None
+    next_lesson: LessonLink | None = None
 
 
 class LessonProgressUpdateRequest(BaseModel):
+    """Completion is sticky: later in_progress updates (e.g. revisiting the
+    lesson) keep it completed and only add time. Send not_started to
+    explicitly un-mark a lesson."""
+
     status: Literal["not_started", "in_progress", "completed"]
     completed_percent: int = Field(ge=0, le=100)
     time_spent_seconds: int = Field(default=0, ge=0, le=86_400)
@@ -88,6 +122,10 @@ class LessonProgressUpdateResponse(BaseModel):
     status: str
     completed_percent: int
     updated_at: datetime
+    newly_completed: bool = False  # true only on the transition into completed
+    course_slug: str = ""
+    course_completion_percent: int = 0
+    next_lesson: LessonLink | None = None
 
 
 class LessonBookmarkRequest(BaseModel):
@@ -97,6 +135,21 @@ class LessonBookmarkRequest(BaseModel):
 class LessonBookmarkResponse(BaseModel):
     lesson_id: uuid.UUID
     bookmarked: bool
+
+
+class BookmarkItem(BaseModel):
+    lesson_id: uuid.UUID
+    lesson_title: str
+    estimated_minutes: int
+    course_slug: str
+    course_title: str
+    module_title: str
+    status: str  # per-user lesson status
+    bookmarked_at: datetime
+
+
+class BookmarkListResponse(BaseModel):
+    items: list[BookmarkItem]
 
 
 class LessonNoteRequest(BaseModel):
@@ -168,12 +221,6 @@ class LearningSummary(BaseModel):
     current_streak: int
 
 
-class LearningCourseProgress(BaseModel):
-    course_slug: str
-    title: str
-    completion_percent: int
-
-
 class LearningContinue(BaseModel):
     type: str
     title: str
@@ -187,9 +234,12 @@ class LearningActivityItem(BaseModel):
     title: str
     status: str | None = None
     created_at: datetime
+    lesson_id: uuid.UUID | None = None
+    course_slug: str | None = None
 
 
 class LearningDashboardResponse(BaseModel):
+    course_slug: str | None = None  # set when the dashboard is scoped to one course
     summary: LearningSummary
     course_progress: list[LearningCourseProgress]
     continue_learning: LearningContinue | None = None

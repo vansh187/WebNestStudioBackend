@@ -1,12 +1,13 @@
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 
 from core.dependencies import get_current_user, get_learning_service, get_optional_current_user, require_admin
 from database.models import User
 from schemas.learning_schemas import (
     AdminCourseResponse,
     AdminCourseUpsertRequest,
+    BookmarkListResponse,
     CourseDetailResponse,
     CourseListResponse,
     LearningDashboardResponse,
@@ -75,6 +76,15 @@ async def set_lesson_bookmark(
     return await learning.set_bookmark(current_user, lesson_id, payload.bookmarked)
 
 
+@router.get("/bookmarks", response_model=BookmarkListResponse)
+async def list_bookmarks(
+    course_slug: str | None = Query(default=None, max_length=200),
+    current_user: User = Depends(get_current_user),
+    learning: LearningService = Depends(get_learning_service),
+) -> BookmarkListResponse:
+    return await learning.list_bookmarks(current_user, course_slug)
+
+
 @router.put("/lessons/{lesson_id}/note", response_model=LessonNoteResponse)
 async def set_lesson_note(
     lesson_id: uuid.UUID,
@@ -110,10 +120,11 @@ async def submit_quiz(
 
 @router.get("/dashboard", response_model=LearningDashboardResponse)
 async def get_dashboard(
+    course_slug: str | None = Query(default=None, max_length=200),
     current_user: User = Depends(get_current_user),
     learning: LearningService = Depends(get_learning_service),
 ) -> LearningDashboardResponse:
-    return await learning.get_dashboard(current_user)
+    return await learning.get_dashboard(current_user, course_slug)
 
 
 # --------------------------------------------------------------------------- #
