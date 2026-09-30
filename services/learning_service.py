@@ -1,4 +1,5 @@
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,12 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.exceptions import BadRequestError, NotFoundError
 from database.codelab_persistence import CodelabPersistence
 from database.learning_persistence import LearningPersistence
-from database.models import User
+from database.models import Course, Lesson, User
 from schemas.learning_schemas import (
     AdminCourseLessonView,
     AdminCourseModuleView,
     AdminCourseResponse,
     AdminCourseUpsertRequest,
+    BookmarkItem,
+    BookmarkListResponse,
     CourseDetailResponse,
     CourseLessonRef,
     CourseListItem,
@@ -25,6 +28,7 @@ from schemas.learning_schemas import (
     LessonBookmarkResponse,
     LessonContent,
     LessonDetailResponse,
+    LessonLink,
     LessonNoteResponse,
     LessonPracticeRef,
     LessonProgressUpdateRequest,
@@ -47,6 +51,56 @@ def _normalise_answer(value: object) -> object:
             return low == "true"
         return value.strip()
     return value
+
+
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _lesson_link(lesson: Lesson | None) -> LessonLink | None:
+    if lesson is None:
+        return None
+    return LessonLink(id=lesson.id, title=lesson.title, estimated_minutes=lesson.estimated_minutes)
+
+
+@dataclass
+class _CourseStats:
+    lessons_total: int = 0
+    lessons_completed: int = 0
+    lessons_in_progress: int = 0
+    bookmarks: int = 0
+    time_spent_seconds: int = 0
+    quizzes_passed: int = 0
+    problems_solved: int = 0
+    last_activity_at: datetime | None = None
+    continue_lesson: Lesson | None = None
+
+    @property
+    def completion_percent(self) -> int:
+        if not self.lessons_total:
+            return 0
+        return int(round(self.lessons_completed / self.lessons_total * 100))
+
+    @property
+    def started(self) -> bool:
+        return self.last_activity_at is not None or self.bookmarks > 0
+
+    def to_view(self, course: Course) -> LearningCourseProgress:
+        return LearningCourseProgress(
+            course_id=course.id,
+            course_slug=course.slug,
+            title=course.title,
+            level=course.level,
+            completion_percent=self.completion_percent,
+            lessons_completed=self.lessons_completed,
+            lessons_in_progress=self.lessons_in_progress,
+            lessons_total=self.lessons_total,
+            bookmarks_count=self.bookmarks,
+            quizzes_passed=self.quizzes_passed,
+            problems_solved=self.problems_solved,
+            time_spent_minutes=self.time_spent_seconds // 60,
+            last_activity_at=self.last_activity_at,
+            continue_lesson=_lesson_link(self.continue_lesson),
+        )
 
 
 class LearningService:
@@ -95,11 +149,15 @@ class LearningService:
             for lesson in (module.lessons or [])
             if lesson.status == "published"
         ]
-        progress_map = (
-            await self._learning.lesson_progress_map(user.id, [l.id for l in published_lessons])
-            if user
-            else {}
-        )
+        published_ids = [l.id for l in published_lessons]
+        progress_map: dict = {}
+        bookmarked: set[uuid.UUID] = set()
+        course_progress = None
+        if user is not None:
+            progress_map = await self._learning.lesson_progress_map(user.id, published_ids)
+            bookmarked = await self._learning.bookmarked_lesson_ids(user.id, published_ids)
+            stats = await self._course_stats(user.id, [course.id])
+            course_progress = stats[course.id].to_view(course)
 
         modules: list[CourseModuleView] = []
         for module in sorted(course.modules, key=lambda m: m.display_order):
@@ -114,6 +172,7 @@ class LearningService:
                     order=l.display_order,
                     status=(progress_map[l.id].status if l.id in progress_map else "not_started"),
                     estimated_minutes=l.estimated_minutes,
+                    bookmarked=l.id in bookmarked,
                 )
                 for l in lessons
             ]
@@ -129,8 +188,70 @@ class LearningService:
             )
 
         return CourseDetailResponse(
-            id=course.id, slug=course.slug, title=course.title, level=course.level, modules=modules
+            id=course.id,
+            slug=course.slug,
+            title=course.title,
+            level=course.level,
+            modules=modules,
+            progress=course_progress,
         )
+
+    async def _course_stats(
+        self, user_id: uuid.UUID, course_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, _CourseStats]:
+        """Live per-course (= per-language) progress for one user, computed
+        from lesson rows rather than the cached user_course_progress percent
+        so it stays right when lessons are added or unpublished."""
+        lessons = await self._learning.ordered_published_lessons(course_ids)
+        lesson_ids = [l.id for l in lessons]
+        progress = await self._learning.lesson_progress_map(user_id, lesson_ids)
+        bookmarked = await self._learning.bookmarked_lesson_ids(user_id, lesson_ids)
+        quizzes = await self._learning.quizzes_passed_by_course(user_id, course_ids)
+        problems = await self._learning.problems_solved_by_course(user_id, course_ids)
+
+        stats = {
+            cid: _CourseStats(quizzes_passed=quizzes.get(cid, 0), problems_solved=problems.get(cid, 0))
+            for cid in course_ids
+        }
+        latest_in_progress: dict[uuid.UUID, tuple[datetime, Lesson]] = {}
+        first_unfinished: dict[uuid.UUID, Lesson] = {}
+        for lesson in lessons:
+            s = stats[lesson.course_id]
+            s.lessons_total += 1
+            if lesson.id in bookmarked:
+                s.bookmarks += 1
+            row = progress.get(lesson.id)
+            if row is not None:
+                s.time_spent_seconds += row.time_spent_seconds or 0
+                if s.last_activity_at is None or row.updated_at > s.last_activity_at:
+                    s.last_activity_at = row.updated_at
+            status = row.status if row is not None else "not_started"
+            if status == "completed":
+                s.lessons_completed += 1
+                continue
+            if status == "in_progress":
+                s.lessons_in_progress += 1
+                seen = latest_in_progress.get(lesson.course_id)
+                if seen is None or row.updated_at > seen[0]:
+                    latest_in_progress[lesson.course_id] = (row.updated_at, lesson)
+            first_unfinished.setdefault(lesson.course_id, lesson)
+
+        for cid, s in stats.items():
+            if cid in latest_in_progress:
+                s.continue_lesson = latest_in_progress[cid][1]
+            else:
+                s.continue_lesson = first_unfinished.get(cid)
+        return stats
+
+    async def _neighbours(
+        self, course_id: uuid.UUID, lesson_id: uuid.UUID
+    ) -> tuple[Lesson | None, Lesson | None]:
+        ordered = await self._learning.ordered_published_lessons([course_id])
+        ids = [l.id for l in ordered]
+        if lesson_id not in ids:
+            return None, None
+        i = ids.index(lesson_id)
+        return (ordered[i - 1] if i > 0 else None), (ordered[i + 1] if i + 1 < len(ordered) else None)
 
     # ------------------------------------------------------------------ #
     # Lessons
@@ -158,6 +279,7 @@ class LearningService:
             for link in lesson.practice_links
             if link.problem is not None and link.problem.status == "published"
         ]
+        previous_lesson, next_lesson = await self._neighbours(lesson.course_id, lesson.id)
 
         return LessonDetailResponse(
             id=lesson.id,
@@ -173,6 +295,8 @@ class LearningService:
                 bookmarked=(bool(bookmark_row.bookmarked) if bookmark_row else False),
                 note=(note_row.note if note_row else None),
             ),
+            previous_lesson=_lesson_link(previous_lesson),
+            next_lesson=_lesson_link(next_lesson),
         )
 
     async def update_lesson_progress(
@@ -182,22 +306,45 @@ class LearningService:
         if lesson is None:
             raise NotFoundError("Lesson not found")
 
+        existing = await self._learning.get_lesson_progress(user.id, lesson.id)
+        was_completed = existing is not None and existing.status == "completed"
+
+        if payload.status == "not_started":
+            # Explicit "mark as not done" - the only way out of completed.
+            status, percent = "not_started", 0
+        elif payload.status == "completed" or was_completed:
+            # Completion is sticky: reopening a finished lesson (which the
+            # client reports as in_progress) must not undo it.
+            status, percent = "completed", 100
+        else:
+            # Reading progress only moves forward, and never reaches 100
+            # without an explicit completion.
+            previous = existing.completed_percent if existing is not None else 0
+            status, percent = "in_progress", min(99, max(previous, payload.completed_percent))
+        newly_completed = status == "completed" and not was_completed
+
         row = await self._learning.upsert_lesson_progress(
             user.id,
             lesson.id,
-            payload.status,
-            payload.completed_percent,
+            status,
+            percent,
             payload.time_spent_seconds,
+            touch_updated_at=not (was_completed and status == "completed"),
         )
-        await self._learning.recompute_course_progress(user.id, lesson.course_id)
-        if payload.status == "completed":
+        course_percent = await self._learning.recompute_course_progress(user.id, lesson.course_id)
+        if newly_completed:
             await self._codelab.touch_streak(user.id, datetime.now(timezone.utc).date())
+        _, next_lesson = await self._neighbours(lesson.course_id, lesson.id)
 
         return LessonProgressUpdateResponse(
             lesson_id=lesson.id,
             status=row.status,
             completed_percent=row.completed_percent,
             updated_at=row.updated_at,
+            newly_completed=newly_completed,
+            course_slug=lesson.course.slug if lesson.course else "",
+            course_completion_percent=course_percent,
+            next_lesson=_lesson_link(next_lesson),
         )
 
     async def set_bookmark(
@@ -208,6 +355,31 @@ class LearningService:
             raise NotFoundError("Lesson not found")
         row = await self._learning.upsert_bookmark(user.id, lesson.id, bookmarked)
         return LessonBookmarkResponse(lesson_id=lesson.id, bookmarked=bool(row.bookmarked))
+
+    async def list_bookmarks(self, user: User, course_slug: str | None = None) -> BookmarkListResponse:
+        course_id = None
+        if course_slug:
+            course = await self._learning.get_course(course_slug)
+            if course is None:
+                raise NotFoundError("Course not found")
+            course_id = course.id
+        rows = await self._learning.list_bookmarks(user.id, course_id)
+        progress = await self._learning.lesson_progress_map(user.id, [r[0] for r in rows])
+        return BookmarkListResponse(
+            items=[
+                BookmarkItem(
+                    lesson_id=lesson_id,
+                    lesson_title=lesson_title,
+                    estimated_minutes=minutes,
+                    course_slug=c_slug,
+                    course_title=c_title,
+                    module_title=module_title,
+                    status=(progress[lesson_id].status if lesson_id in progress else "not_started"),
+                    bookmarked_at=bookmarked_at,
+                )
+                for lesson_id, lesson_title, minutes, c_slug, c_title, module_title, bookmarked_at in rows
+            ]
+        )
 
     async def set_note(self, user: User, lesson_id: uuid.UUID, note: str) -> LessonNoteResponse:
         lesson = await self._learning.get_lesson(lesson_id)
@@ -299,44 +471,76 @@ class LearningService:
     # ------------------------------------------------------------------ #
     # Learning dashboard
     # ------------------------------------------------------------------ #
-    async def get_dashboard(self, user: User) -> LearningDashboardResponse:
-        courses_enrolled = await self._learning.count_courses_with_progress(user.id)
-        lessons_completed = await self._learning.count_completed_lessons(user.id)
-        quizzes_passed = await self._learning.count_passed_quizzes(user.id)
+    async def get_dashboard(
+        self, user: User, course_slug: str | None = None
+    ) -> LearningDashboardResponse:
+        """Overall dashboard, or - with course_slug - the same dashboard
+        scoped to one course (i.e. one language). XP and streak are always
+        account-wide since CodeLab and every course share them."""
+        scope: Course | None = None
+        if course_slug:
+            scope = await self._learning.get_course(course_slug)
+            if scope is None:
+                raise NotFoundError("Course not found")
+
+        courses = [scope] if scope is not None else await self._learning.list_published_courses()
+        course_stats = await self._course_stats(user.id, [c.id for c in courses])
+        started = [c for c in courses if course_stats[c.id].started]
+        started.sort(key=lambda c: course_stats[c.id].last_activity_at or _EPOCH, reverse=True)
+
+        if scope is not None:
+            s = course_stats[scope.id]
+            courses_enrolled = 1 if s.started else 0
+            lessons_completed = s.lessons_completed
+            quizzes_passed = s.quizzes_passed
+            problems_solved = s.problems_solved
+        else:
+            courses_enrolled = len(started)
+            lessons_completed = sum(s.lessons_completed for s in course_stats.values())
+            quizzes_passed = await self._learning.count_passed_quizzes(user.id)
+            _, problems_solved = await self._codelab.progress_counts(user.id)
         stats = await self._codelab.get_stats(user.id)
-        _, problems_solved = await self._codelab.progress_counts(user.id)
-        course_progress = await self._learning.list_course_progress(user.id)
-        continue_lesson = await self._learning.pick_continue_lesson(user.id)
-        lesson_completions = await self._learning.recent_lesson_completions(user.id, 5)
-        quiz_attempts = await self._learning.recent_quiz_attempts(user.id, 5)
 
+        # Resume in the most recently active course; a scoped dashboard with
+        # no activity yet still points at that course's first lesson.
         continue_learning = None
-        if continue_lesson is not None:
-            continue_learning = LearningContinue(
-                type="lesson",
-                title=continue_lesson.title,
-                lesson_id=continue_lesson.id,
-                course_slug=continue_lesson.course.slug if continue_lesson.course else None,
-            )
+        for course in started or ([scope] if scope is not None else []):
+            lesson = course_stats[course.id].continue_lesson
+            if lesson is not None:
+                continue_learning = LearningContinue(
+                    type="lesson", title=lesson.title, lesson_id=lesson.id, course_slug=course.slug
+                )
+                break
 
+        scope_id = scope.id if scope is not None else None
+        lesson_completions = await self._learning.recent_lesson_completions(user.id, 10, scope_id)
+        quiz_attempts = await self._learning.recent_quiz_attempts(user.id, 10, scope_id)
         activity: list[LearningActivityItem] = [
             LearningActivityItem(
-                type="lesson", title=lesson.title, status="completed", created_at=completed_at
+                type="lesson",
+                title=title,
+                status="completed",
+                created_at=completed_at,
+                lesson_id=lesson_id,
+                course_slug=c_slug,
             )
-            for lesson, completed_at in lesson_completions
+            for lesson_id, title, c_slug, completed_at in lesson_completions
         ]
         activity += [
             LearningActivityItem(
                 type="quiz",
-                title="Quiz attempt",
-                status=("passed" if a.passed else "failed"),
-                created_at=a.submitted_at,
+                title=quiz_title,
+                status=("passed" if attempt.passed else "failed"),
+                created_at=attempt.submitted_at,
+                lesson_id=lesson_id,
+                course_slug=c_slug,
             )
-            for a in quiz_attempts
+            for attempt, quiz_title, lesson_id, c_slug in quiz_attempts
         ]
         activity.sort(key=lambda i: i.created_at, reverse=True)
 
         return LearningDashboardResponse(
+            course_slug=scope.slug if scope is not None else None,
             summary=LearningSummary(
                 courses_enrolled=courses_enrolled,
                 lessons_completed=lessons_completed,
@@ -346,10 +550,7 @@ class LearningService:
                 current_streak=(stats.current_streak if stats else 0),
             ),
             course_progress=[
-                LearningCourseProgress(
-                    course_slug=course.slug, title=course.title, completion_percent=pct
-                )
-                for course, pct in course_progress
+                course_stats[c.id].to_view(c) for c in (started or ([scope] if scope is not None else []))
             ],
             continue_learning=continue_learning,
             recent_activity=activity[:10],

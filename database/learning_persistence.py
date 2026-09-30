@@ -4,10 +4,11 @@ from datetime import date, datetime, timezone
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 
 from database.base_persistence import BasePersistence
 from database.models import (
+    CodelabProblemProgress,
     Course,
     CourseModule,
     Lesson,
@@ -75,6 +76,21 @@ class LearningPersistence(BasePersistence):
         )
         return {row[0]: int(row[1]) for row in result.all()}
 
+    async def ordered_published_lessons(self, course_ids: list[uuid.UUID]) -> list[Lesson]:
+        """Published lessons in reading order (module order, then lesson
+        order). Only the columns needed for navigation/progress are loaded -
+        touching any other attribute would trigger a lazy load."""
+        if not course_ids:
+            return []
+        result = await self._execute(
+            select(Lesson)
+            .join(CourseModule, CourseModule.id == Lesson.module_id)
+            .options(load_only(Lesson.id, Lesson.course_id, Lesson.title, Lesson.estimated_minutes))
+            .where(Lesson.course_id.in_(course_ids), Lesson.status == "published")
+            .order_by(Lesson.course_id, CourseModule.display_order, Lesson.display_order)
+        )
+        return list(result.scalars().all())
+
     # ------------------------------------------------------------------ #
     # Lessons
     # ------------------------------------------------------------------ #
@@ -136,6 +152,17 @@ class LearningPersistence(BasePersistence):
         ).scalar_one_or_none()
         return progress, bookmark, note
 
+    async def get_lesson_progress(
+        self, user_id: uuid.UUID, lesson_id: uuid.UUID
+    ) -> UserLessonProgress | None:
+        result = await self._execute(
+            select(UserLessonProgress).where(
+                UserLessonProgress.user_id == user_id,
+                UserLessonProgress.lesson_id == lesson_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def upsert_lesson_progress(
         self,
         user_id: uuid.UUID,
@@ -143,8 +170,19 @@ class LearningPersistence(BasePersistence):
         status: str,
         completed_percent: int,
         add_time_seconds: int,
+        touch_updated_at: bool = True,
     ) -> UserLessonProgress:
+        """touch_updated_at=False leaves updated_at alone on an existing row:
+        for completed lessons updated_at doubles as the completion time, so
+        revisits must not move it."""
         now = datetime.now(timezone.utc)
+        set_ = {
+            "status": status,
+            "completed_percent": max(0, min(completed_percent, 100)),
+            "time_spent_seconds": UserLessonProgress.time_spent_seconds + max(0, add_time_seconds),
+        }
+        if touch_updated_at:
+            set_["updated_at"] = now
         stmt = (
             pg_insert(UserLessonProgress)
             .values(
@@ -157,24 +195,68 @@ class LearningPersistence(BasePersistence):
             )
             .on_conflict_do_update(
                 index_elements=[UserLessonProgress.user_id, UserLessonProgress.lesson_id],
-                set_={
-                    "status": status,
-                    "completed_percent": max(0, min(completed_percent, 100)),
-                    "time_spent_seconds": UserLessonProgress.time_spent_seconds + max(0, add_time_seconds),
-                    "updated_at": now,
-                },
+                set_=set_,
             )
             .returning(UserLessonProgress.id)
         )
         await self._execute(stmt)
         await self._commit()
         result = await self._execute(
-            select(UserLessonProgress).where(
+            select(UserLessonProgress)
+            .where(
                 UserLessonProgress.user_id == user_id,
                 UserLessonProgress.lesson_id == lesson_id,
             )
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one()
+
+    async def bookmarked_lesson_ids(
+        self, user_id: uuid.UUID, lesson_ids: list[uuid.UUID]
+    ) -> set[uuid.UUID]:
+        if not lesson_ids:
+            return set()
+        result = await self._execute(
+            select(UserLessonBookmark.lesson_id).where(
+                UserLessonBookmark.user_id == user_id,
+                UserLessonBookmark.lesson_id.in_(lesson_ids),
+                UserLessonBookmark.bookmarked.is_(True),
+            )
+        )
+        return set(result.scalars().all())
+
+    async def list_bookmarks(
+        self, user_id: uuid.UUID, course_id: uuid.UUID | None = None, limit: int = 200
+    ) -> list[tuple]:
+        """(lesson_id, lesson_title, estimated_minutes, course_slug,
+        course_title, module_title, bookmarked_at), newest first. Lessons or
+        courses that were unpublished after bookmarking are left out."""
+        stmt = (
+            select(
+                Lesson.id,
+                Lesson.title,
+                Lesson.estimated_minutes,
+                Course.slug,
+                Course.title,
+                CourseModule.title,
+                UserLessonBookmark.updated_at,
+            )
+            .join(Lesson, Lesson.id == UserLessonBookmark.lesson_id)
+            .join(CourseModule, CourseModule.id == Lesson.module_id)
+            .join(Course, Course.id == Lesson.course_id)
+            .where(
+                UserLessonBookmark.user_id == user_id,
+                UserLessonBookmark.bookmarked.is_(True),
+                Lesson.status == "published",
+                Course.status == "published",
+            )
+            .order_by(UserLessonBookmark.updated_at.desc())
+            .limit(max(1, min(limit, 500)))
+        )
+        if course_id is not None:
+            stmt = stmt.where(Lesson.course_id == course_id)
+        result = await self._execute(stmt)
+        return [tuple(row) for row in result.all()]
 
     async def upsert_bookmark(
         self, user_id: uuid.UUID, lesson_id: uuid.UUID, bookmarked: bool
@@ -320,22 +402,44 @@ class LearningPersistence(BasePersistence):
     # ------------------------------------------------------------------ #
     # Learning dashboard aggregates
     # ------------------------------------------------------------------ #
-    async def count_courses_with_progress(self, user_id: uuid.UUID) -> int:
+    async def quizzes_passed_by_course(
+        self, user_id: uuid.UUID, course_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        if not course_ids:
+            return {}
         result = await self._execute(
-            select(func.count(UserCourseProgress.id)).where(
-                UserCourseProgress.user_id == user_id
+            select(Lesson.course_id, func.count(func.distinct(QuizAttempt.quiz_id)))
+            .join(Quiz, Quiz.id == QuizAttempt.quiz_id)
+            .join(Lesson, Lesson.id == Quiz.lesson_id)
+            .where(
+                QuizAttempt.user_id == user_id,
+                QuizAttempt.passed.is_(True),
+                Lesson.course_id.in_(course_ids),
             )
+            .group_by(Lesson.course_id)
         )
-        return int(result.scalar_one() or 0)
+        return {row[0]: int(row[1]) for row in result.all()}
 
-    async def count_completed_lessons(self, user_id: uuid.UUID) -> int:
+    async def problems_solved_by_course(
+        self, user_id: uuid.UUID, course_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        """Solved CodeLab problems that are linked as practice to a published
+        lesson of each course."""
+        if not course_ids:
+            return {}
         result = await self._execute(
-            select(func.count(UserLessonProgress.id)).where(
-                UserLessonProgress.user_id == user_id,
-                UserLessonProgress.status == "completed",
+            select(Lesson.course_id, func.count(func.distinct(CodelabProblemProgress.problem_id)))
+            .join(LessonProblemMap, LessonProblemMap.problem_id == CodelabProblemProgress.problem_id)
+            .join(Lesson, Lesson.id == LessonProblemMap.lesson_id)
+            .where(
+                CodelabProblemProgress.user_id == user_id,
+                CodelabProblemProgress.status == "solved",
+                Lesson.status == "published",
+                Lesson.course_id.in_(course_ids),
             )
+            .group_by(Lesson.course_id)
         )
-        return int(result.scalar_one() or 0)
+        return {row[0]: int(row[1]) for row in result.all()}
 
     async def list_course_progress(
         self, user_id: uuid.UUID
@@ -348,27 +452,14 @@ class LearningPersistence(BasePersistence):
         )
         return [(row[0], int(row[1] or 0)) for row in result.all()]
 
-    async def pick_continue_lesson(self, user_id: uuid.UUID) -> Lesson | None:
-        result = await self._execute(
-            select(Lesson)
-            .join(UserLessonProgress, UserLessonProgress.lesson_id == Lesson.id)
-            .options(selectinload(Lesson.course))
-            .where(
-                UserLessonProgress.user_id == user_id,
-                UserLessonProgress.status == "in_progress",
-                Lesson.status == "published",
-            )
-            .order_by(UserLessonProgress.updated_at.desc())
-            .limit(1)
-        )
-        return result.scalars().first()
-
     async def recent_lesson_completions(
-        self, user_id: uuid.UUID, limit: int
-    ) -> list[tuple[Lesson, datetime]]:
-        result = await self._execute(
-            select(Lesson, UserLessonProgress.updated_at)
+        self, user_id: uuid.UUID, limit: int, course_id: uuid.UUID | None = None
+    ) -> list[tuple[uuid.UUID, str, str, datetime]]:
+        """(lesson_id, lesson_title, course_slug, completed_at), newest first."""
+        stmt = (
+            select(Lesson.id, Lesson.title, Course.slug, UserLessonProgress.updated_at)
             .join(UserLessonProgress, UserLessonProgress.lesson_id == Lesson.id)
+            .join(Course, Course.id == Lesson.course_id)
             .where(
                 UserLessonProgress.user_id == user_id,
                 UserLessonProgress.status == "completed",
@@ -376,18 +467,30 @@ class LearningPersistence(BasePersistence):
             .order_by(UserLessonProgress.updated_at.desc())
             .limit(max(1, min(limit, 50)))
         )
-        return [(row[0], row[1]) for row in result.all()]
+        if course_id is not None:
+            stmt = stmt.where(Lesson.course_id == course_id)
+        result = await self._execute(stmt)
+        return [tuple(row) for row in result.all()]
 
     async def recent_quiz_attempts(
-        self, user_id: uuid.UUID, limit: int
-    ) -> list[QuizAttempt]:
-        result = await self._execute(
-            select(QuizAttempt)
+        self, user_id: uuid.UUID, limit: int, course_id: uuid.UUID | None = None
+    ) -> list[tuple[QuizAttempt, str, uuid.UUID | None, str | None]]:
+        """(attempt, quiz_title, lesson_id, course_slug), newest first. Quizzes
+        not attached to a lesson have no lesson/course and are dropped when
+        filtering by course."""
+        stmt = (
+            select(QuizAttempt, Quiz.title, Lesson.id, Course.slug)
+            .join(Quiz, Quiz.id == QuizAttempt.quiz_id)
+            .outerjoin(Lesson, Lesson.id == Quiz.lesson_id)
+            .outerjoin(Course, Course.id == Lesson.course_id)
             .where(QuizAttempt.user_id == user_id)
             .order_by(QuizAttempt.submitted_at.desc())
             .limit(max(1, min(limit, 50)))
         )
-        return list(result.scalars().all())
+        if course_id is not None:
+            stmt = stmt.where(Lesson.course_id == course_id)
+        result = await self._execute(stmt)
+        return [tuple(row) for row in result.all()]
 
     # ------------------------------------------------------------------ #
     # Admin - course tree (upsert only; never hard-deletes learner-linked rows)
