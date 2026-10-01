@@ -38,7 +38,7 @@ async def list_blog_posts(tag: str | None = None, blog_service: BlogService = De
 
 @router.get("/blog/{slug}", response_model=BlogPostResponse)
 async def get_blog_post(slug: str, blog_service: BlogService = Depends(get_blog_service)) -> BlogPost:
-    return await blog_service.get_by_slug(slug)
+    return await blog_service.get_published_by_slug(slug)
 
 
 @router.get("/faqs", response_model=list[FaqResponse])
