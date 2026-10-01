@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from core.constants import BLOG_MIN_RECOMMENDED_WORDS
 
 SLUG_PATTERN = r"^[a-z0-9]+(-[a-z0-9]+)*$"
 
@@ -202,5 +204,22 @@ class BlogPostResponse(BaseModel):
     keywords: list[str] | None
     topic_tag: str | None
     word_count: int | None
+    updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class AdminBlogPostResponse(BlogPostResponse):
+    """Admin view of a post: same shape plus non-blocking editorial warnings
+    (e.g. the post is too short to rank) for the admin panel to display."""
+
+    warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _add_warnings(self) -> "AdminBlogPostResponse":
+        if (self.word_count or 0) < BLOG_MIN_RECOMMENDED_WORDS:
+            self.warnings = [
+                f"This post is {self.word_count or 0} words. Posts under "
+                f"{BLOG_MIN_RECOMMENDED_WORDS} words are unlikely to rank - consider expanding it."
+            ]
+        return self

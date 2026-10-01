@@ -273,3 +273,31 @@ class AdminProblemResponse(BaseModel):
     hidden_test_count: int
     created_at: datetime
     updated_at: datetime
+
+
+# --------------------------------------------------------------------------- #
+# Admin: automated problem generation
+# --------------------------------------------------------------------------- #
+class CodelabGenerationTriggerRequest(BaseModel):
+    # Omitted = one problem of each difficulty.
+    difficulties: list[Literal["easy", "medium", "hard"]] | None = Field(default=None, min_length=1, max_length=3)
+
+
+class CodelabGenerationTriggerResponse(BaseModel):
+    started: bool
+    detail: str
+
+
+class CodelabGenerationLogResponse(BaseModel):
+    id: uuid.UUID
+    attempted_at: datetime
+    success: bool
+    difficulty: str
+    topic: str | None
+    llm_used: str | None
+    problem_id: uuid.UUID | None
+    problem_slug: str | None
+    error_message: str | None
+    trigger_source: str
+
+    model_config = {"from_attributes": True}

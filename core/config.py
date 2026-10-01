@@ -37,7 +37,9 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     groq_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash-lite"
-    groq_model: str = "llama-3.3-70b-versatile"
+    # llama-3.3-70b-versatile was retired by Groq (requests returned 404), which
+    # silently left every feature without its fallback provider.
+    groq_model: str = "openai/gpt-oss-120b"
     rate_limit_per_hour: int = 5
     max_prompt_length: int = 500
     max_refinement_length: int = 300
@@ -63,9 +65,13 @@ class Settings(BaseSettings):
     # .env to avoid burning real Gemini/Groq quota and creating test posts every
     # time the server restarts during development.
     blog_generation_enabled: bool = True
-    blog_post_lifetime_days: int = 15
-    blog_generation_interval_days: int = 2
+    blog_generation_interval_days: int = 7
     blog_generation_hour_ist: int = 6
+    # Vercel deploy hook for the pre-rendered frontend. Called after a post is
+    # published, updated or unpublished so the static blog pages are rebuilt.
+    # Empty string disables it (local dev).
+    vercel_deploy_hook_url: str = ""
+    vercel_deploy_hook_timeout_seconds: float = 10.0
     # One-time launch post trigger, e.g. "2026-07-26T18:00:00+05:30". Empty
     # string disables it. Left as a plain settings field (not hardcoded into
     # the scheduler) so it can be set/cleared via env var without a redeploy,
@@ -75,6 +81,16 @@ class Settings(BaseSettings):
     # Where the "new blog post is live" publicity-reminder email goes every
     # time a post (scheduled or manually triggered) is successfully published.
     blog_publish_notification_email: str = "webneststudio19@gmail.com"
+
+    # Automated CodeLab problem generation: each run publishes one easy, one
+    # medium and one hard Python problem, every codelab_generation_interval_days
+    # (1 = daily, 2 = every other day). Set codelab_generation_enabled to False
+    # in local .env so development restarts don't publish problems.
+    codelab_generation_enabled: bool = True
+    codelab_generation_interval_days: int = 1
+    codelab_generation_hour_ist: int = 7
+    # Per-test time limit for the generated reference solutions.
+    codelab_solution_timeout_seconds: float = 4.0
 
     # Project Enquiry Chatbot: gathers project requirements from a logged-in
     # user via conversational turns, then produces a week-by-week build plan

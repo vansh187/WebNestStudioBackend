@@ -13,3 +13,8 @@ SDLC_STAGES: list[tuple[str, str]] = [
 ]
 SDLC_STAGE_KEYS = [key for key, _ in SDLC_STAGES]
 SDLC_STAGE_LABELS = dict(SDLC_STAGES)
+
+# Blog posts shorter than this are too thin to rank. The generator targets at
+# least this many words, and the admin API attaches a (non-blocking) warning
+# to any post below it.
+BLOG_MIN_RECOMMENDED_WORDS = 800

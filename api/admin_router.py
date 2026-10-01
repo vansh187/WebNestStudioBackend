@@ -34,8 +34,8 @@ from schemas.project_schemas import (
     AdminStageUpdateRequest,
 )
 from schemas.content_schemas import (
+    AdminBlogPostResponse,
     BlogPostCreateRequest,
-    BlogPostResponse,
     BlogPostUpdateRequest,
     FaqCreateRequest,
     FaqResponse,
@@ -254,17 +254,17 @@ async def admin_delete_faq(faq_id: uuid.UUID, faq_service: FaqService = Depends(
 # ---- Blog posts ----
 
 
-@router.get("/blog", response_model=list[BlogPostResponse])
+@router.get("/blog", response_model=list[AdminBlogPostResponse])
 async def admin_list_blog_posts(blog_service: BlogService = Depends(get_blog_service)) -> list[BlogPost]:
     return await blog_service.list_all()
 
 
-@router.post("/blog", response_model=BlogPostResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/blog", response_model=AdminBlogPostResponse, status_code=status.HTTP_201_CREATED)
 async def admin_create_blog_post(payload: BlogPostCreateRequest, blog_service: BlogService = Depends(get_blog_service)) -> BlogPost:
     return await blog_service.create(**payload.model_dump())
 
 
-@router.put("/blog/{post_id}", response_model=BlogPostResponse)
+@router.put("/blog/{post_id}", response_model=AdminBlogPostResponse)
 async def admin_update_blog_post(
     post_id: uuid.UUID, payload: BlogPostUpdateRequest, blog_service: BlogService = Depends(get_blog_service)
 ) -> BlogPost:
@@ -282,7 +282,7 @@ async def admin_trigger_blog_generation(
     generation_service: BlogGenerationService = Depends(get_blog_generation_service),
 ) -> BlogGenerationTriggerResponse:
     """Manually runs the automated blog generation pipeline right now,
-    bypassing the 2-day cooldown (SEO/slug validation still applies). For
+    bypassing the weekly cooldown (SEO/slug validation still applies). For
     recovery from a missed scheduled run, testing without waiting for the
     next cron fire, or - via the optional topic_hint - directing the model
     to write about a specific subject instead of picking its own. LLM/
@@ -294,7 +294,7 @@ async def admin_trigger_blog_generation(
         post = await generation_service.generate_and_publish(trigger_source="manual-admin", topic_hint=payload.topic_hint)
     except (BlogGenerationError, GenerationFailedError) as exc:
         return BlogGenerationTriggerResponse(success=False, detail=str(exc))
-    return BlogGenerationTriggerResponse(success=True, detail="Blog post generated and published", post_id=post.id, slug=post.slug)
+    return BlogGenerationTriggerResponse(success=True, detail=generation_service.last_outcome_detail, post_id=post.id, slug=post.slug)
 
 
 @router.get("/blog/generation-logs", response_model=list[BlogGenerationLogResponse])

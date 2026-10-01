@@ -124,6 +124,12 @@ class CodelabPersistence(BasePersistence):
         result = await self._execute(stmt.limit(1))
         return result.scalars().first()
 
+    async def list_all_problems(self) -> list[CodelabProblem]:
+        """Every problem in any status (without test cases), newest first -
+        what the generator checks a new problem against for duplicates."""
+        result = await self._execute(select(CodelabProblem).order_by(CodelabProblem.created_at.desc()))
+        return list(result.scalars().all())
+
     async def count_published_problems(self) -> int:
         result = await self._execute(
             select(func.count(CodelabProblem.id)).where(CodelabProblem.status == "published")

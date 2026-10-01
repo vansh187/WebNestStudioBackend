@@ -41,7 +41,7 @@ def register_blog_jobs(scheduler: AsyncIOScheduler, database: Database, settings
     scheduler.add_job(
         _archive_expired_job,
         trigger=CronTrigger(hour=0, minute=10, timezone=IST),
-        args=[database],
+        args=[database, settings],
         id="blog_archive_expired",
         replace_existing=True,
         misfire_grace_time=3600,
@@ -107,7 +107,7 @@ async def _launch_special_post_job(database: Database, settings: Settings) -> No
             # is meant to fire exactly once, ever. Relying only on "already
             # published today" would make it re-fire on every restart/redeploy
             # that happens on a day nothing else has published yet - which, on
-            # the every-2-days cadence, is most days after the launch date, as
+            # the weekly cadence, is most days after the launch date, as
             # long as BLOG_LAUNCH_SPECIAL_POST_AT is left set in the environment.
             if await service.has_launch_post_already_run():
                 logger.info("Skipping one-off launch post: it has already run previously")
@@ -123,10 +123,10 @@ async def _launch_special_post_job(database: Database, settings: Settings) -> No
         logger.critical("Unexpected error in the one-off launch blog post job", exc_info=True)
 
 
-async def _archive_expired_job(database: Database) -> None:
+async def _archive_expired_job(database: Database, settings: Settings) -> None:
     try:
         async with database.session_scope() as session:
-            archived = await BlogService(session).archive_expired()
+            archived = await BlogService(session, settings).archive_expired()
             if archived:
                 logger.info("Archived %s expired blog post(s)", archived)
     except Exception:

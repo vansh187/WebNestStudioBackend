@@ -242,3 +242,61 @@ Tables added:
 - `courses`, `course_modules`, `lessons`, `lesson_problem_map`
 - `quizzes`, `quiz_questions`, `quiz_attempts`
 - `user_course_progress`, `user_lesson_progress`, `user_lesson_bookmarks`, `user_lesson_notes`
+
+## Automated problem generation
+
+The backend adds new Python practice problems on its own: each run publishes
+one **easy**, one **medium** and one **hard** problem. It runs daily at 07:00
+IST by default (`CODELAB_GENERATION_INTERVAL_DAYS=2` makes it every other day,
+`CODELAB_GENERATION_ENABLED=false` turns it off).
+
+Generated problems look exactly like hand-written ones to the client
+(`track: "python"`, stdin in, stdout compared, 2-3 public tests, the rest
+hidden), so no frontend change is needed. After a run the Vercel deploy hook
+is called once so new problem pages are built.
+
+A problem is published only if it passes verification on the server:
+
+- Expected outputs are never taken from the model. They are what the model's
+  reference solution prints when it is actually run.
+- A second solution, written from the statement alone (no reference code, no
+  expected outputs) by the other LLM provider where available, must print the
+  same output on every test.
+- Runs must be clean and repeatable: no crash, no timeout, identical output
+  twice.
+- Tests with an empty expected output are dropped; at least 5 hidden tests
+  must remain and they must not all share one answer.
+- Starter code that already passes, crashes or is unsafe is replaced with a
+  neutral template.
+- A title or statement that closely matches an existing problem is rejected.
+
+Each difficulty rotates through its own topic list, always taking the topic
+that has had the fewest runs so far (failed runs count, so a topic that keeps
+failing does not block the rotation).
+
+The model-written solutions run on the backend in a separate, restricted
+process: an allowlist check before anything runs, then a time limit, bounded
+output, an empty environment and - on Linux - a memory cap and no ability to
+open files or sockets. Learner code is never run on the server.
+
+A draft that fails is discarded and a new one is tried (up to 4 per
+difficulty). A difficulty that still fails is logged and retried on the next
+run; it never stops the other difficulties or the app.
+
+### `POST /api/admin/codelab/generate` (admin)
+
+Body (optional): `{ "difficulties": ["easy", "hard"] }` - omit for all three.
+Returns `202` immediately; generation runs in the background (about a
+minute):
+
+```json
+{ "started": true, "detail": "Generation started. Check /api/admin/codelab/generation-logs for the result." }
+```
+
+### `GET /api/admin/codelab/generation-logs?limit=30` (admin)
+
+One row per difficulty per run: `attempted_at`, `success`, `difficulty`,
+`topic`, `llm_used`, `problem_id`, `problem_slug`, `error_message`,
+`trigger_source` (`scheduled` or `manual-admin`). A successful row identifies
+an auto-generated problem. To take one down, `PUT /api/admin/codelab/problems`
+with its slug and `"status": "archived"`.

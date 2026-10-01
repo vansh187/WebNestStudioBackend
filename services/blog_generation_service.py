@@ -8,36 +8,48 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import Settings
+from core.constants import BLOG_MIN_RECOMMENDED_WORDS
 from core.exceptions import ConflictError
 from database.blog_generation_log_persistence import BlogGenerationLogPersistence
 from database.blog_persistence import BlogPersistence
 from database.models import BlogGenerationLog, BlogPost
+from services.deploy_hook_service import DeployHookService
 from services.email_service import EmailService
 from services.llm_provider import GenerationFailedError, LLMProvider
 
 logger = logging.getLogger("webnest.blog_generation")
 
-MAX_WORDS = 300
-MAX_TOPIC_RETRIES = 3
+# Target article length. Below MIN_WORDS a post is too thin to rank; the
+# generator regenerates once when a draft lands outside the range. A draft is
+# only cut down when it exceeds HARD_MAX_WORDS, since trimming removes the
+# closing FAQ / call to action.
+MIN_WORDS = BLOG_MIN_RECOMMENDED_WORDS
+MAX_WORDS = 1200
+HARD_MAX_WORDS = 1400
+# How many times the model is asked for a different topic when its draft
+# matches an existing post. Each retry is a full-length article, so this is
+# kept low; if a draft still matches after the retries, the matching post is
+# refreshed in place instead of a new one being created.
+MAX_TOPIC_RETRIES = 2
 MAX_JSON_RETRIES = 2
-MAX_SLUG_RETRIES = 5
+# The scheduler's cron fires once a day at a fixed time, while the previous
+# run's timestamp lands a little after that time - so "exactly N days ago" is
+# always a few minutes short. Without this tolerance every interval silently
+# stretches by one day.
+RECURRING_SCHEDULE_TOLERANCE = timedelta(hours=2)
 # How many historical topics get sent into the prompt's exclusion list. The
-# *validation* below still checks the freshly generated topic against the
-# full historical set (unbounded) - this cap only bounds prompt token usage.
+# *validation* below still checks the freshly generated draft against every
+# existing post - this cap only bounds prompt token usage.
 MAX_EXCLUDED_TOPICS_IN_PROMPT = 40
 # How many recent post titles get shown to the model as "already published,
-# don't rephrase these". Same rationale as the topic cap - bounds token use
-# while the post-generation similarity check below still runs against every
-# historical title.
+# don't rephrase these". Same rationale as the topic cap.
 MAX_RECENT_TITLES_IN_PROMPT = 60
 # How many recent posts' "##" subheadings are shown to the model as ones not to
 # reuse, so every article doesn't end up with the same "Why It Matters" /
 # "The Bottom Line" skeleton.
 MAX_RECENT_POSTS_FOR_SUBHEADINGS = 15
 MAX_SUBHEADINGS_IN_PROMPT = 45
-# How many recent posts a new article body is compared against, and how many
-# of their opening lines are shown to the model as hooks not to repeat.
-MAX_RECENT_POSTS_FOR_CONTENT_CHECK = 60
+# How many recent opening lines are shown to the model as hooks not to repeat.
 MAX_RECENT_OPENINGS_IN_PROMPT = 15
 # A new article counts as a copy of an existing one when this share of its
 # 3-word phrases (Jaccard over word trigrams) also appear in that post, or its
@@ -46,21 +58,22 @@ MAX_RECENT_OPENINGS_IN_PROMPT = 15
 # rerun of the same article shares far more.
 CONTENT_SHINGLE_OVERLAP = 0.2
 OPENING_SIMILARITY_RATIO = 0.75
-# How many extra LLM calls are spent rewriting only the headline when the
-# article is fine but its title still duplicates an existing one.
-MAX_TITLE_REWRITES = 3
 # A freshly generated title is treated as a duplicate of an existing one when
 # the normalized character-level similarity ratio, the word-set overlap
 # (Jaccard), or the overlap relative to the shorter title is at or above these
 # thresholds, or when both titles share the same headline stem (the part
-# before a ":", "?", or " - "). Topics may repeat; headlines must not - so
-# "Website Development Cost in India: 2026 Guide" and "Website Development
-# Cost in India: What Drives Pricing" count as the same heading.
+# before a ":", "?", or " - ") - so "Website Development Cost in India: 2026
+# Guide" and "Website Development Cost in India: What Drives Pricing" count as
+# the same heading.
 TITLE_SIMILARITY_RATIO = 0.7
 TITLE_TOKEN_OVERLAP = 0.5
 TITLE_TOKEN_CONTAINMENT = 0.8
+# How much two headlines must share before an identical primary keyword is
+# taken to mean "the same article" (see _find_matching_post).
+KEYWORD_MATCH_TITLE_OVERLAP = 0.3
 _TITLE_STEM_SPLIT = re.compile(r"\s*(?::|\?|\s[-–—|]\s)\s*")
-_SUBHEADING = re.compile(r"^#{2,3}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_SUBHEADING = re.compile(r"^##\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_FAQ_HEADING = re.compile(r"^(faqs?|frequently asked)", re.IGNORECASE)
 # Common filler words stripped before the word-set comparison so near-identical
 # titles aren't hidden by, or falsely flagged from, shared connective tissue.
 _TITLE_STOPWORDS = frozenset(
@@ -114,6 +127,7 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _MULTI_HYPHEN = re.compile(r"-{2,}")
 _FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+_PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
 _WORD_PATTERN = re.compile(r"\S+")
 _MARKDOWN_NOISE = re.compile(r"[#*_`>]+")
 # Strips trailing/inline hashtag clusters (e.g. "#WebDesign #SmallBusiness")
@@ -126,7 +140,7 @@ _HASHTAG = re.compile(r"(?<!\w)#\w+")
 # own line - e.g. "...processes. ## Key Features". Without a preceding blank
 # line, markdown renderers show the literal "##" text instead of a heading,
 # which reads to a viewer like a stray hashtag.
-_GLUED_HEADING = re.compile(r"(?<!^)(?<!\n)(#{1,3} )")
+_GLUED_HEADING = re.compile(r"(?<!^)(?<!\n)(?<!#)(#{1,3} )")
 
 
 class BlogGenerationError(Exception):
@@ -136,12 +150,13 @@ class BlogGenerationError(Exception):
 
 
 class BlogGenerationService:
-    """Orchestrates automated blog post generation: topic-uniqueness
-    enforcement, LLM call with Gemini/Groq fallback, SEO-field validation
-    with graceful self-healing, slug-collision handling, and persistence.
-    Designed so a single bad run (malformed JSON, over-length content,
-    missing SEO fields, repeated topic) degrades gracefully instead of
-    throwing - the only exceptions that ever leave generate_and_publish are
+    """Orchestrates automated blog post generation: LLM call with Gemini/Groq
+    fallback, SEO-field validation with graceful self-healing, a duplicate
+    guard that refreshes the existing post on a topic instead of publishing a
+    second one, persistence, and the frontend rebuild trigger.
+    Designed so a single bad run (malformed JSON, off-length content, missing
+    SEO fields, repeated topic) degrades gracefully instead of throwing - the
+    only exceptions that ever leave generate_and_publish are
     BlogGenerationError (logged failure, no post) when every fallback was
     exhausted."""
 
@@ -151,6 +166,10 @@ class BlogGenerationService:
         self._settings = settings
         self._llm = LLMProvider(settings)
         self._email = EmailService(settings)
+        self._deploy_hook = DeployHookService(settings)
+        # Human-readable result of the last successful generate_and_publish
+        # call, for the admin "Generate now" response.
+        self.last_outcome_detail = ""
 
     async def list_recent_logs(self, limit: int = 20) -> list[BlogGenerationLog]:
         return await self._logs.list_recent(limit=limit)
@@ -158,11 +177,21 @@ class BlogGenerationService:
     # ---- Idempotency guards (used by the scheduler, bypassed by manual admin trigger) ----
 
     async def should_run_recurring(self) -> bool:
+        # A run that refreshes an existing post leaves published_at untouched,
+        # so the last successful generation is consulted as well as the newest
+        # post - otherwise a refresh would be followed by another run the very
+        # next day.
         latest = await self._blog_posts.get_latest()
-        if latest is None or latest.published_at is None:
+        last_run_candidates = [
+            latest.published_at if latest is not None else None,
+            await self._logs.latest_success_at(),
+        ]
+        last_runs = [_as_aware(value) for value in last_run_candidates if value is not None]
+        if not last_runs:
             return True
-        elapsed = datetime.now(timezone.utc) - _as_aware(latest.published_at)
-        return elapsed >= timedelta(days=self._settings.blog_generation_interval_days)
+        elapsed = datetime.now(timezone.utc) - max(last_runs)
+        interval = timedelta(days=self._settings.blog_generation_interval_days)
+        return elapsed >= interval - RECURRING_SCHEDULE_TOLERANCE
 
     async def already_published_on_ist_date(self, ist_now: datetime) -> bool:
         day_start_ist = ist_now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -178,7 +207,7 @@ class BlogGenerationService:
 
     async def generate_and_publish(self, trigger_source: str, topic_hint: str | None = None) -> BlogPost:
         try:
-            post, provider, topic_tag = await self._run_pipeline(topic_hint=topic_hint)
+            post, provider, topic_tag, outcome = await self._run_pipeline(topic_hint=topic_hint)
         except GenerationFailedError as exc:
             logger.critical("Blog generation failed: both LLM providers are unavailable (%s)", exc)
             await self._log_failure(trigger_source, topic_tag=None, error=str(exc))
@@ -188,7 +217,15 @@ class BlogGenerationService:
             logger.error("Blog generation failed: %s", exc)
             await self._log_failure(trigger_source, topic_tag=None, error=str(exc))
             raise
+        except Exception as exc:
+            # Anything unforeseen (the database being unreachable, a reply
+            # shaped in a way nothing anticipated) is still a logged, reported
+            # failure - callers only ever have BlogGenerationError to handle.
+            logger.critical("Unexpected error in blog generation", exc_info=True)
+            await self._log_failure(trigger_source, topic_tag=None, error=f"Unexpected error: {type(exc).__name__}")
+            raise BlogGenerationError(f"Unexpected error: {type(exc).__name__}") from exc
 
+        self.last_outcome_detail = _OUTCOME_DETAILS[outcome]
         try:
             await self._logs.create(
                 success=True,
@@ -198,46 +235,50 @@ class BlogGenerationService:
                 trigger_source=trigger_source,
             )
         except Exception:
-            # The post itself is already published at this point - a failure
-            # to write the audit-log row must not make an otherwise-successful
+            # The post itself is already saved at this point - a failure to
+            # write the audit-log row must not make an otherwise-successful
             # run look like a failed one to the caller.
-            logger.error("Blog post %s was published but its generation log row could not be written", post.id, exc_info=True)
+            logger.error("Blog post %s was saved but its generation log row could not be written", post.id, exc_info=True)
         logger.info(
-            "Published blog post %r (slug=%s, provider=%s, topic=%s, words=%s)",
+            "Blog generation outcome=%s for %r (slug=%s, provider=%s, topic=%s, words=%s)",
+            outcome,
             post.title,
             post.slug,
             provider,
             topic_tag,
             post.word_count,
         )
+        # The frontend pre-renders blog pages at build time, so nothing is
+        # visible (or re-crawlable) until it rebuilds. trigger() never raises.
+        await self._deploy_hook.trigger(f"blog post {outcome}: {post.slug}")
 
-        try:
-            await self._email.send_blog_published_notification(post.title or "Untitled post", post.slug)
-        except Exception:
-            # The post is already live either way - a notification-email
-            # failure must never be reported as a failed publish.
-            logger.error("Blog post %s was published but the publicity notification email failed to send", post.id, exc_info=True)
+        if outcome == "created":
+            try:
+                await self._email.send_blog_published_notification(post.title or "Untitled post", post.slug)
+            except Exception:
+                # The post is already live either way - a notification-email
+                # failure must never be reported as a failed publish.
+                logger.error("Blog post %s was published but the publicity notification email failed to send", post.id, exc_info=True)
 
         return post
 
     # ---- Pipeline internals ----
 
-    async def _run_pipeline(self, topic_hint: str | None = None) -> tuple[BlogPost, str, str]:
-        existing_topics = await self._blog_posts.list_topic_tags()
-        normalized_existing = {t.strip().lower() for t in existing_topics if t}
-        excluded_for_prompt = existing_topics[:MAX_EXCLUDED_TOPICS_IN_PROMPT]
-
-        existing_titles = await self._blog_posts.list_titles()
-        recent_titles = existing_titles[:MAX_RECENT_TITLES_IN_PROMPT]
-        existing_contents = await self._blog_posts.list_recent_contents(MAX_RECENT_POSTS_FOR_CONTENT_CHECK)
-        used_subheadings = _recent_subheadings(existing_contents[:MAX_RECENT_POSTS_FOR_SUBHEADINGS])
-        recent_openings = _recent_openings(existing_contents[:MAX_RECENT_OPENINGS_IN_PROMPT])
+    async def _run_pipeline(self, topic_hint: str | None = None) -> tuple[BlogPost, str, str, str]:
+        posts = await self._blog_posts.list_all()
+        excluded_for_prompt = list(dict.fromkeys(p.topic_tag for p in posts if p.topic_tag))[
+            :MAX_EXCLUDED_TOPICS_IN_PROMPT
+        ]
+        recent_titles = [p.title for p in posts if p.title][:MAX_RECENT_TITLES_IN_PROMPT]
+        contents = [p.content for p in posts if p.content]
+        used_subheadings = _recent_subheadings(contents[:MAX_RECENT_POSTS_FOR_SUBHEADINGS])
+        recent_openings = _recent_openings(contents[:MAX_RECENT_OPENINGS_IN_PROMPT])
 
         async def _draft() -> tuple[dict, str]:
             draft, draft_provider = await self._generate_json(
                 excluded_for_prompt, recent_titles, used_subheadings, recent_openings, topic_hint=topic_hint
             )
-            return await self._ensure_word_limit(
+            return await self._ensure_word_range(
                 draft,
                 draft_provider,
                 excluded_for_prompt,
@@ -248,76 +289,97 @@ class BlogGenerationService:
             )
 
         data, provider = await _draft()
-        topic_tag = _clean_str(data.get("topic_tag")) or "general"
-        title = _clean_str(data.get("title"))
+        match = _find_matching_post(data, posts)
 
-        # A directed topic (topic_hint) may repeat a prior post's subject - the
-        # caller asked for it deliberately - so only the topic_tag check is
-        # skipped for it. The headline and the article itself must always be
-        # new: two posts may share a topic, never a heading or a body.
-        def _content_duplicate_of() -> str | None:
-            content = _clean_str(data.get("content"))
-            match = _closest_content(content, existing_contents)
-            if match is not None:
-                return f"content closely matches an existing post ({match})"
-            return None
-
-        def _duplicate_of() -> str | None:
-            """Returns a human-readable reason string if the current draft
-            duplicates an existing post (by topic_tag, title, or content),
-            else None."""
-            if topic_hint is None and topic_tag.strip().lower() in normalized_existing:
-                return f"topic_tag {topic_tag!r}"
-            match = _closest_title(title, existing_titles)
-            if match is not None:
-                return f"title {title!r} closely matches existing {match!r}"
-            return _content_duplicate_of()
-
+        # A directed topic (topic_hint) is the caller deliberately asking for
+        # this subject, so no retry for a different one - a match goes straight
+        # to refreshing the existing post on that subject.
         attempts = 0
-        reason = _duplicate_of()
-        while reason is not None and attempts < MAX_TOPIC_RETRIES:
+        while match is not None and topic_hint is None and attempts < MAX_TOPIC_RETRIES:
             attempts += 1
-            logger.warning("Generated post duplicates a prior one (%s), retrying (%s/%s)", reason, attempts, MAX_TOPIC_RETRIES)
-            if topic_hint is None:
-                excluded_for_prompt = list(dict.fromkeys([*excluded_for_prompt, topic_tag]))
-            recent_titles = list(dict.fromkeys([title, *recent_titles]))[:MAX_RECENT_TITLES_IN_PROMPT]
-            opening = _opening_line(_clean_str(data.get("content")))
-            if opening:
-                recent_openings = list(dict.fromkeys([opening, *recent_openings]))[:MAX_RECENT_OPENINGS_IN_PROMPT]
-            data, provider = await _draft()
-            topic_tag = _clean_str(data.get("topic_tag")) or "general"
-            title = _clean_str(data.get("title"))
-            reason = _duplicate_of()
-
-        content_reason = _content_duplicate_of()
-        if content_reason is not None:
-            # Unlike a headline, a repeated body can't be patched in place -
-            # skip this run rather than publish a copy of an earlier article.
-            raise BlogGenerationError(f"Could not produce an original article after retries: {content_reason}")
-
-        if reason is not None and _closest_title(title, existing_titles) is not None:
-            # The article is usable but its headline still repeats an existing
-            # one - rewrite just the headline rather than publish a duplicate.
-            title = await self._rewrite_unique_title(data, existing_titles)
-            data["title"] = title
-            data["meta_title"] = ""  # re-derived from the new title in _validate_and_heal
-            reason = _duplicate_of()
-
-        if reason is not None:
-            # Only the topic_tag still repeats (the title is unique by now).
-            # Auto-uniquify the tag so the audit trail stays honest.
-            uniquified = f"{topic_tag} ({datetime.now(timezone.utc).date().isoformat()})"
+            matched_post, reason = match
             logger.warning(
-                "Publishing a repeated topic under a new headline (%s); topic_tag %r -> %r",
+                "Draft duplicates existing post %s (%s), asking for a different topic (%s/%s)",
+                matched_post.slug,
                 reason,
-                topic_tag,
-                uniquified,
+                attempts,
+                MAX_TOPIC_RETRIES,
             )
-            data["topic_tag"] = uniquified
+            draft_topic = _clean_str(data.get("topic_tag"))
+            draft_title = _clean_str(data.get("title"))
+            draft_opening = _opening_line(_clean_str(data.get("content")))
+            excluded_for_prompt = list(dict.fromkeys(t for t in [*excluded_for_prompt, draft_topic] if t))
+            recent_titles = list(dict.fromkeys(t for t in [draft_title, *recent_titles] if t))[:MAX_RECENT_TITLES_IN_PROMPT]
+            if draft_opening:
+                recent_openings = list(dict.fromkeys([draft_opening, *recent_openings]))[:MAX_RECENT_OPENINGS_IN_PROMPT]
+            data, provider = await _draft()
+            match = _find_matching_post(data, posts)
 
-        post_fields = self._validate_and_heal(data)
-        post = await self._persist_with_unique_slug(post_fields)
-        return post, provider, post.topic_tag or topic_tag
+        fields = self._validate_and_heal(data)
+        matched_post = match[0] if match is not None else None
+        if matched_post is None:
+            # Same slug means the same headline. Reuse that post rather than
+            # ever minting a "-2" variant of an existing URL.
+            matched_post = next((p for p in posts if p.slug == fields["slug"]), None)
+
+        if matched_post is not None:
+            if not matched_post.is_published:
+                # Whether an unpublished post comes back is the owner's call,
+                # never the generator's - so it is neither republished nor
+                # shadowed by a second post on the same subject. The run is
+                # logged as failed and tried again on the next cron fire.
+                raise BlogGenerationError(
+                    f"The draft covers the same ground as the unpublished post {matched_post.slug!r}. "
+                    "Nothing was published - republish that post by hand, or generate again for a different topic."
+                )
+            post = await self._refresh_existing(matched_post, fields, posts)
+            return post, provider, post.topic_tag or fields["topic_tag"], "refreshed"
+
+        _make_seo_fields_unique(fields, posts)
+        try:
+            post = await self._blog_posts.create(**fields)
+        except ConflictError as exc:
+            # Only reachable through a race with a concurrent writer taking
+            # the same slug between list_all() and here. Fail this run (it is
+            # logged and retried on the next cron fire) rather than invent a
+            # suffixed slug.
+            raise BlogGenerationError(f"Could not persist blog post: {exc}") from exc
+        return post, provider, post.topic_tag or fields["topic_tag"], "created"
+
+    async def _refresh_existing(self, post: BlogPost, fields: dict, posts: list[BlogPost]) -> BlogPost:
+        """Updates the existing published post on this topic with the new
+        draft instead of creating a second post. The slug never changes - its
+        URL may already be indexed."""
+        existing_words = post.word_count or _word_count(post.content or "")
+        if existing_words > fields["word_count"]:
+            # Never replace a post with a thinner draft - it may have been
+            # expanded by hand. Raised (and so logged as a failed run) rather
+            # than reported as a success: a run that changed nothing must not
+            # use up the week's publishing slot.
+            raise BlogGenerationError(
+                f"The draft covers the same ground as the existing post {post.slug!r}, which is longer "
+                f"({existing_words} words vs {fields['word_count']}). Nothing was changed."
+            )
+
+        others = [p for p in posts if p.id != post.id]
+        # Take the new headline only if no *other* post already has one like it.
+        title = fields["title"]
+        if post.title and _closest_title(title, [p.title for p in others if p.title]) is not None:
+            title = post.title
+        candidate = {**fields, "title": title}
+        _make_seo_fields_unique(candidate, others)
+        updates = {
+            key: candidate[key]
+            for key in ("title", "excerpt", "content", "meta_title", "meta_description", "keywords", "tags", "word_count")
+        }
+        if not post.topic_tag:
+            updates["topic_tag"] = fields["topic_tag"]
+
+        logger.info("Refreshing existing post %s instead of creating a duplicate", post.slug)
+        try:
+            return await self._blog_posts.update(post, **updates)
+        except ConflictError as exc:
+            raise BlogGenerationError(f"Could not update blog post {post.slug!r}: {exc}") from exc
 
     async def _generate_json(
         self,
@@ -325,18 +387,15 @@ class BlogGenerationService:
         recent_titles: list[str] | None = None,
         used_subheadings: list[str] | None = None,
         recent_openings: list[str] | None = None,
-        strict_word_limit: bool = False,
+        length_note: str = "",
         topic_hint: str | None = None,
     ) -> tuple[dict, str]:
         system_prompt = _build_system_prompt(
             excluded_topics, recent_titles or [], used_subheadings or [], recent_openings or [], topic_hint=topic_hint
         )
         user_message = "Generate today's blog post as JSON."
-        if strict_word_limit:
-            user_message += (
-                " IMPORTANT: the previous attempt exceeded the word limit - the "
-                "'content' field MUST be 300 words or fewer. Count carefully before responding."
-            )
+        if length_note:
+            user_message += f" IMPORTANT: {length_note}"
 
         last_error: Exception | None = None
         for attempt in range(MAX_JSON_RETRIES + 1):
@@ -350,7 +409,7 @@ class BlogGenerationService:
                 )
         raise BlogGenerationError(f"LLM did not return valid JSON after {MAX_JSON_RETRIES + 1} attempt(s): {last_error}")
 
-    async def _ensure_word_limit(
+    async def _ensure_word_range(
         self,
         data: dict,
         provider: str,
@@ -360,58 +419,32 @@ class BlogGenerationService:
         recent_openings: list[str] | None = None,
         topic_hint: str | None = None,
     ) -> tuple[dict, str]:
-        content = data.get("content") if isinstance(data.get("content"), str) else ""
-        if _word_count(content) <= MAX_WORDS:
+        """Regenerates once when the draft is outside MIN_WORDS..MAX_WORDS and
+        keeps whichever draft is closer to the range."""
+        words = _word_count(_draft_content(data))
+        if MIN_WORDS <= words <= MAX_WORDS:
             return data, provider
-        logger.warning("Generated content exceeded %s words; regenerating once", MAX_WORDS)
+        if words < MIN_WORDS:
+            note = (
+                f"the previous attempt was only {words} words - the 'content' field MUST be between "
+                f"{MIN_WORDS} and {MAX_WORDS} words. Develop every section in more depth."
+            )
+        else:
+            note = (
+                f"the previous attempt was {words} words - the 'content' field MUST be between "
+                f"{MIN_WORDS} and {MAX_WORDS} words. Tighten it."
+            )
+        logger.warning("Generated content was %s words (target %s-%s); regenerating once", words, MIN_WORDS, MAX_WORDS)
         try:
-            return await self._generate_json(
-                excluded_topics,
-                recent_titles,
-                used_subheadings,
-                recent_openings,
-                strict_word_limit=True,
-                topic_hint=topic_hint,
+            retry, retry_provider = await self._generate_json(
+                excluded_topics, recent_titles, used_subheadings, recent_openings, length_note=note, topic_hint=topic_hint
             )
         except BlogGenerationError:
-            logger.warning("Word-limit regeneration failed; will truncate at a sentence boundary instead")
+            logger.warning("Word-range regeneration failed; keeping the original draft")
             return data, provider
-
-    async def _rewrite_unique_title(self, data: dict, existing_titles: list[str]) -> str:
-        """Asks the model for a fresh headline for an already-written article,
-        rejecting any candidate that still matches an existing title. Raises
-        BlogGenerationError rather than let a duplicate heading go live."""
-        forbidden = list(existing_titles[:MAX_RECENT_TITLES_IN_PROMPT])
-        excerpt = _clean_str(data.get("excerpt")) or _derive_excerpt(_clean_str(data.get("content")))
-        for attempt in range(MAX_TITLE_REWRITES):
-            system_prompt = f"""You write blog headlines for Webnest Studio, a tech consultancy.
-Write ONE new headline (at most 70 characters) for the article summarised below.
-It must be clearly different in wording AND structure from every headline in the
-forbidden list - do not reuse their opening phrase, do not just add or swap a word
-or a year. Try a different angle: a question, a number, a specific scenario, a
-mistake to avoid, or a bold claim. No hashtags, no quotes.
-
-Article summary: {excerpt}
-
-Forbidden headlines: {"; ".join(f'"{t}"' for t in forbidden) or "(none)"}
-
-Return ONLY valid JSON: {{"title": "..."}}"""
-            raw_text, _ = await self._llm.generate_text(system_prompt, "Write the new headline as JSON.")
-            try:
-                candidate = _strip_hashtags(_clean_str(_parse_json(raw_text).get("title")))
-            except ValueError:
-                continue
-            if not candidate:
-                continue
-            match = _closest_title(candidate, existing_titles)
-            if match is None:
-                logger.info("Rewrote duplicate headline to %r", candidate)
-                return candidate
-            logger.warning(
-                "Rewritten headline %r still matches %r (%s/%s)", candidate, match, attempt + 1, MAX_TITLE_REWRITES
-            )
-            forbidden = [candidate, *forbidden]
-        raise BlogGenerationError("Could not produce a headline distinct from existing posts")
+        if _distance_from_range(_word_count(_draft_content(retry))) <= _distance_from_range(words):
+            return retry, retry_provider
+        return data, provider
 
     def _validate_and_heal(self, data: dict) -> dict:
         title = _strip_hashtags(_clean_str(data.get("title")))
@@ -422,10 +455,13 @@ Return ONLY valid JSON: {{"title": "..."}}"""
             raise BlogGenerationError("LLM response was missing a non-empty 'content'")
 
         words = _word_count(content)
-        if words > MAX_WORDS:
-            logger.warning("Truncating content at a sentence boundary: %s words -> <= %s", words, MAX_WORDS)
+        if words > HARD_MAX_WORDS:
+            logger.warning("Trimming content at a paragraph boundary: %s words -> <= %s", words, MAX_WORDS)
             content = _truncate_to_word_limit(content, MAX_WORDS)
         word_count = _word_count(content)
+        if word_count < MIN_WORDS:
+            # Not blocked - the admin API flags short posts for expansion.
+            logger.warning("Publishing a short post: %s words (recommended minimum %s)", word_count, MIN_WORDS)
 
         excerpt = _strip_hashtags(_clean_str(data.get("excerpt"))) or _derive_excerpt(content)
 
@@ -446,7 +482,6 @@ Return ONLY valid JSON: {{"title": "..."}}"""
         if not (3 <= len(keywords) <= 8):
             keywords = _fallback_keywords(topic_tag)
 
-        now = datetime.now(timezone.utc)
         return {
             "title": title,
             "slug": _slugify(title),
@@ -459,39 +494,10 @@ Return ONLY valid JSON: {{"title": "..."}}"""
             "topic_tag": topic_tag,
             "word_count": word_count,
             "is_published": True,
-            "published_at": now,
-            "expires_at": now + timedelta(days=self._settings.blog_post_lifetime_days),
+            "published_at": datetime.now(timezone.utc),
+            # Posts are permanent - expires_at is only ever set by hand.
+            "expires_at": None,
         }
-
-    async def _persist_with_unique_slug(self, fields: dict) -> BlogPost:
-        base_slug = fields["slug"]
-        slug = base_slug
-        for attempt in range(MAX_SLUG_RETRIES):
-            existing = await self._blog_posts.get_by_slug(slug)
-            if existing is None:
-                break
-            slug = f"{base_slug}-{attempt + 2}"
-        else:
-            slug = f"{base_slug}-{uuid.uuid4().hex[:8]}"
-        fields["slug"] = slug
-        try:
-            return await self._blog_posts.create(**fields)
-        except ConflictError:
-            # Extremely unlikely race with the check-loop above (e.g. a
-            # concurrent worker), but must never bubble up as an unhandled 500
-            # from a background job - force a guaranteed-unique slug and retry once.
-            fields["slug"] = f"{base_slug}-{uuid.uuid4().hex[:8]}"
-            try:
-                return await self._blog_posts.create(**fields)
-            except ConflictError as exc:
-                # A raw ConflictError escaping here would skip generate_and_publish's
-                # except clauses entirely (it only matches BlogGenerationError/
-                # GenerationFailedError), silently breaking the "every attempt is
-                # logged" guarantee. Wrap it so this run is always logged and
-                # reported the same way as any other exhausted-fallback failure.
-                raise BlogGenerationError(
-                    f"Could not persist blog post: slug collision could not be resolved ({exc})"
-                ) from exc
 
     async def _log_failure(self, trigger_source: str, topic_tag: str | None, error: str) -> None:
         try:
@@ -522,6 +528,12 @@ Return ONLY valid JSON: {{"title": "..."}}"""
             )
         except Exception:
             logger.error("Failed to send the blog-generation failure alert email", exc_info=True)
+
+
+_OUTCOME_DETAILS = {
+    "created": "Blog post generated and published",
+    "refreshed": "An existing post already covers this topic - it was updated instead of creating a duplicate",
+}
 
 
 def _build_system_prompt(
@@ -556,12 +568,25 @@ medium businesses.
 {topic_instruction}
 
 Rules:
-- The article body ("content") must be at most 300 words, markdown format,
-  with a punchy hook opening (a bold claim, surprising stat, or relatable pain
-  point - not a generic "In today's world..." line), 2-3 short "##"
-  subheadings, at least one concrete example, number, or actionable tip so it
-  reads as genuinely useful rather than generic filler, and a closing call-to-
-  action toward Webnest Studio's services.
+- The article body ("content") must be {MIN_WORDS}-{MAX_WORDS} words of markdown
+  (aim for about 1,000 - anything under {MIN_WORDS} is rejected), in this
+  structure:
+  1. An introduction of 2-3 short paragraphs with no heading, opening on a
+     hook (a relatable pain point, a sharp question, or a bold claim - not a
+     generic "In today's world..." line).
+  2. 3 to 5 sections, each under its own "##" subheading, each giving
+     practical, specific guidance a business owner can act on.
+  3. A "## Frequently Asked Questions" section with 3 short questions, each
+     as a "###" heading followed by a 1-3 sentence answer.
+  4. One closing paragraph with a single call to action toward Webnest
+     Studio's services. This is the ONLY call to action in the article.
+- Put a blank line before and after every heading.
+- Do NOT invent facts. No made-up statistics, percentages, survey results,
+  prices, rupee amounts, client names, case studies, testimonials, or
+  timelines presented as fact. When discussing cost, explain what drives it
+  and how to compare options instead of quoting figures. Illustrative
+  examples must be clearly hypothetical ("a clinic that takes bookings by
+  phone...") and never name a real or invented client.
 - Write in an engaging, confident, conversational tone - vary sentence length,
   avoid clichés and corporate buzzwords, and make it something a small
   business owner would actually enjoy reading.
@@ -571,35 +596,35 @@ Rules:
 - Include 4-6 realistic SEO keywords/phrases naturally within the content
   (not stuffed) - prefer specific, moderately-searched, long-tail phrases a
   small business owner would actually type into Google, over generic single
-  words, so the post can realistically rank and drive traffic.
+  words. List the single primary keyword FIRST in the "keywords" array.
 - When writing cost/comparison posts, include India-specific buying context
-  and practical ranges or decision factors without making unverifiable promises.
+  and decision factors without making unverifiable promises.
 - Keep the article aligned with the selected cluster's service page so it can
   work as part of a topic cluster, not as an unrelated standalone post.
-- meta_title: at most 60 characters, includes a primary keyword near the start.
-- meta_description: 150-160 characters, includes a keyword and a soft call to action.
+- meta_title: at most 60 characters, includes the primary keyword near the
+  start, and is unique to this post.
+- meta_description: 150-160 characters, includes a keyword and a soft call to
+  action, and is unique to this post.
 - slug: lowercase, hyphen-separated, url-safe, derived from the title.
 - topic_tag: a short 2-5 word label for this topic, distinct in wording from the title.
 - Do NOT reuse or closely rephrase any of these previously covered topics: {excluded_str}
 - The topic clusters above are SUBJECTS, not headlines - never copy a cluster
   topic verbatim as the title.
-- The title must be unique: even when the subject overlaps an earlier post, the
-  headline must differ in wording AND structure. Do NOT reuse or lightly reword
-  any of these already-published titles, do not start with the same lead phrase
-  (e.g. the words before a ":" or "?"), and do not just add a year, "Guide", or
-  one swapped word: {recent_titles_str}
-- Vary the headline format - rotate between a question, a number/list, a
-  specific scenario or persona, a mistake to avoid, a comparison, or a bold
-  claim - and avoid the format the recent titles above use most.
-- The "##" subheadings must be specific to this article's content (e.g.
-  "What a ₹40,000 Website Actually Includes"), never generic labels like
-  "Why It Matters", "The Bottom Line", "Conclusion", "Key Benefits", or
-  "Getting Started". Do NOT reuse any of these recently used subheadings:
-  {subheadings_str}
+- The title must be unique. Do NOT reuse or lightly reword any of these
+  already-published titles, do not start with the same lead phrase (e.g. the
+  words before a ":" or "?"), and do not just add a year, "Guide", or one
+  swapped word: {recent_titles_str}
+- Vary the headline format - rotate between a question, a list, a specific
+  scenario or persona, a mistake to avoid, a comparison, or a bold claim -
+  and avoid the format the recent titles above use most.
+- The "##" subheadings (other than the FAQ heading) must be specific to this
+  article's content, never generic labels like "Why It Matters", "The Bottom
+  Line", "Conclusion", "Key Benefits", or "Getting Started". Do NOT reuse any
+  of these recently used subheadings: {subheadings_str}
 - The whole article must be original, not a remix of an earlier post: use a
-  fresh angle, a new concrete example or scenario, different numbers, and a
-  different structure. Do NOT open the way any of these recent posts opened
-  (no same hook, stat, or first sentence pattern): {openings_str}
+  fresh angle, new scenarios, and a different structure. Do NOT open the way
+  any of these recent posts opened (no same hook or first sentence pattern):
+  {openings_str}
 
 Return ONLY valid JSON, no markdown code fences, no extra commentary:
 {{
@@ -644,6 +669,18 @@ def _clean_str(value: object) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()
+
+
+def _draft_content(data: dict) -> str:
+    return data.get("content") if isinstance(data.get("content"), str) else ""
+
+
+def _distance_from_range(words: int) -> int:
+    if words < MIN_WORDS:
+        return MIN_WORDS - words
+    if words > MAX_WORDS:
+        return words - MAX_WORDS
+    return 0
 
 
 def _truncate(text: str, max_length: int) -> str:
@@ -693,24 +730,35 @@ def _word_count(text: str) -> int:
 
 
 def _truncate_to_word_limit(content: str, max_words: int) -> str:
-    words = _WORD_PATTERN.findall(content)
-    if len(words) <= max_words:
+    """Drops whole trailing paragraphs/sections until the article fits, so the
+    markdown structure (headings, blank lines) survives the cut."""
+    if _word_count(content) <= max_words:
         return content
 
-    sentences = _SENTENCE_BOUNDARY.split(content)
     kept: list[str] = []
     count = 0
-    for sentence in sentences:
-        sentence_words = len(_WORD_PATTERN.findall(sentence))
-        if count + sentence_words > max_words and kept:
+    for block in _PARAGRAPH_BREAK.split(content.strip()):
+        block_words = _word_count(block)
+        if kept and count + block_words > max_words:
             break
-        kept.append(sentence)
-        count += sentence_words
-        if count >= max_words:
-            break
+        kept.append(block)
+        count += block_words
+    while len(kept) > 1 and kept[-1].lstrip().startswith("#"):
+        kept.pop()  # a heading left with nothing under it
+    truncated = "\n\n".join(kept).strip()
+    if _word_count(truncated) <= max_words:
+        return truncated
 
-    truncated = " ".join(kept).strip()
-    return truncated if truncated else " ".join(words[:max_words])
+    # A single oversized block - fall back to cutting at a sentence boundary.
+    sentences: list[str] = []
+    count = 0
+    for sentence in _SENTENCE_BOUNDARY.split(truncated):
+        sentence_words = _word_count(sentence)
+        if sentences and count + sentence_words > max_words:
+            break
+        sentences.append(sentence)
+        count += sentence_words
+    return " ".join(sentences).strip()
 
 
 def _normalize_title(title: str) -> str:
@@ -765,10 +813,6 @@ def _closest_title(candidate: str, existing: list[str]) -> str | None:
     return None
 
 
-def _extract_subheadings(content: str) -> list[str]:
-    return [m.group(1).strip() for m in _SUBHEADING.finditer(content or "") if m.group(1).strip()]
-
-
 def _plain_words(content: str) -> list[str]:
     return _normalize_title(_MARKDOWN_NOISE.sub(" ", content or "")).split()
 
@@ -809,8 +853,99 @@ def _closest_content(candidate: str, existing: list[str]) -> str | None:
         if cand_shingles and other_shingles:
             overlap = len(cand_shingles & other_shingles) / len(cand_shingles | other_shingles)
             if overlap >= CONTENT_SHINGLE_OVERLAP:
-                return f"{overlap:.0%} phrase overlap with the post opening {other_opening_raw!r}"
+                return f"{overlap:.0%} phrase overlap"
     return None
+
+
+def _normalize_phrase(value: object) -> str:
+    return _normalize_title(value) if isinstance(value, str) else ""
+
+
+def _primary_keyword(keywords: object) -> str:
+    if isinstance(keywords, list) and keywords:
+        return _normalize_phrase(keywords[0])
+    return ""
+
+
+def _title_overlap(first: str, second: str) -> float:
+    """Share of content words two headlines have in common (Jaccard)."""
+    first_words, second_words = _title_word_set(first), _title_word_set(second)
+    if not first_words or not second_words:
+        return 0.0
+    return len(first_words & second_words) / len(first_words | second_words)
+
+
+def _find_matching_post(data: dict, posts: list[BlogPost]) -> tuple[BlogPost, str] | None:
+    """The existing post this draft duplicates, with the reason - same
+    topic_tag, a closely matching title, the same primary keyword on an
+    overlapping title, or a copied body - or None if the draft covers new
+    ground. Published posts are preferred over unpublished ones when several
+    match."""
+    title = _clean_str(data.get("title"))
+    topic_tag = _normalize_phrase(data.get("topic_tag"))
+    primary_keyword = _primary_keyword(data.get("keywords"))
+    content = _draft_content(data)
+
+    for post in sorted(posts, key=lambda p: not p.is_published):
+        if topic_tag and topic_tag == _normalize_phrase(post.topic_tag):
+            return post, f"same topic_tag {post.topic_tag!r}"
+        if post.title and _closest_title(title, [post.title]) is not None:
+            return post, f"title {title!r} closely matches {post.title!r}"
+        # A shared primary keyword alone is not proof of the same article -
+        # two different posts can target one phrase - so it only counts when
+        # the headlines overlap as well. Otherwise a new draft could overwrite
+        # an unrelated older post in place.
+        if (
+            primary_keyword
+            and primary_keyword == _primary_keyword(post.keywords)
+            and _title_overlap(title, post.title or "") >= KEYWORD_MATCH_TITLE_OVERLAP
+        ):
+            return post, f"same primary keyword {primary_keyword!r} and an overlapping title"
+        if post.content:
+            content_reason = _closest_content(content, [post.content])
+            if content_reason is not None:
+                return post, f"content: {content_reason}"
+    return None
+
+
+def _make_seo_fields_unique(fields: dict, others: list[BlogPost]) -> None:
+    """Guarantees meta_title and meta_description differ from every other
+    post's, deriving replacements from this post's own (already unique) title
+    and excerpt. Mutates `fields`."""
+    taken_titles = {_normalize_phrase(p.meta_title) for p in others} - {""}
+    taken_descriptions = {_normalize_phrase(p.meta_description) for p in others} - {""}
+
+    meta_title = fields.get("meta_title") or ""
+    if not meta_title or _normalize_phrase(meta_title) in taken_titles:
+        for candidate in (_truncate(fields["title"], 60), _truncate(fields["title"], 70), fields["title"]):
+            if _normalize_phrase(candidate) not in taken_titles:
+                meta_title = candidate
+                break
+        else:
+            raise BlogGenerationError("Could not produce a meta_title distinct from existing posts")
+    fields["meta_title"] = meta_title
+
+    meta_description = fields.get("meta_description") or ""
+    if not meta_description or _normalize_phrase(meta_description) in taken_descriptions:
+        for candidate in (
+            _truncate(fields.get("excerpt") or "", 155),
+            _truncate(_derive_excerpt(fields.get("content") or ""), 155),
+            _truncate(f'{fields["title"]} - {fields.get("excerpt") or ""}', 155),
+        ):
+            if candidate and _normalize_phrase(candidate) not in taken_descriptions:
+                meta_description = candidate
+                break
+        else:
+            raise BlogGenerationError("Could not produce a meta_description distinct from existing posts")
+    fields["meta_description"] = meta_description
+
+
+def _extract_subheadings(content: str) -> list[str]:
+    return [
+        m.group(1).strip()
+        for m in _SUBHEADING.finditer(content or "")
+        if m.group(1).strip() and not _FAQ_HEADING.match(m.group(1).strip())
+    ]
 
 
 def _recent_subheadings(contents: list[str]) -> list[str]:

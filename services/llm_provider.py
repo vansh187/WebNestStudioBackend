@@ -35,6 +35,21 @@ class LLMProvider:
         caller. Used by non-HTML text generation (e.g. blog post JSON)."""
         return await self.generate_html(system_prompt, user_message)
 
+    async def generate_text_avoiding(self, system_prompt: str, user_message: str, avoid: str) -> tuple[str, str]:
+        """Like generate_text, but tries the provider other than `avoid` first
+        - for an independent second opinion on something `avoid` wrote. Falls
+        back to `avoid` itself if the other provider is unavailable."""
+        calls = {"gemini": (self._settings.gemini_api_key, self._call_gemini), "groq": (self._settings.groq_api_key, self._call_groq)}
+        for name in sorted(calls, key=lambda provider: provider == avoid):
+            api_key, call = calls[name]
+            if not api_key:
+                continue
+            try:
+                return await call(system_prompt, user_message), name
+            except (RateLimitError, ProviderError) as exc:
+                logger.warning("%s generation failed: %s", name, exc)
+        raise GenerationFailedError("All configured LLM providers failed to generate a response")
+
     async def generate_html(self, system_prompt: str, user_message: str) -> tuple[str, str]:
         if self._settings.gemini_api_key:
             try:

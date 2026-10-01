@@ -8,6 +8,16 @@ from database.base_persistence import BasePersistence
 from database.models import BlogPost
 
 
+def _publicly_visible() -> tuple:
+    # Posts are permanent by default (expires_at is null). expires_at is only
+    # ever set by hand, and is enforced here in real time so a manually-dated
+    # post disappears on time even before the daily sweep flips is_published.
+    return (
+        BlogPost.is_published.is_(True),
+        or_(BlogPost.expires_at.is_(None), BlogPost.expires_at > func.now()),
+    )
+
+
 class BlogPersistence(BasePersistence):
     """CRUD access to the blog_posts table."""
 
@@ -29,17 +39,21 @@ class BlogPersistence(BasePersistence):
         result = await self._execute(select(BlogPost).where(BlogPost.slug == slug))
         return result.scalar_one_or_none()
 
+    async def get_published_by_slug(self, slug: str) -> BlogPost | None:
+        """A post only if it is publicly visible - same rule as
+        list_published(), so the detail endpoint can never serve a post the
+        list has dropped."""
+        query = select(BlogPost).where(BlogPost.slug == slug, *_publicly_visible())
+        result = await self._execute(query)
+        return result.scalar_one_or_none()
+
     async def list_published(self, tag: str | None = None) -> list[BlogPost]:
-        # expires_at is enforced here (not only by the daily archive sweep) so a
-        # post never stays publicly visible past its 15-day window even if the
-        # sweep job is delayed or hasn't run yet since expiry.
-        query = select(BlogPost).where(
-            BlogPost.is_published.is_(True),
-            or_(BlogPost.expires_at.is_(None), BlogPost.expires_at > func.now()),
-        )
+        """Every publicly visible post, newest first. Deliberately unpaginated:
+        the frontend build pre-renders one page per item in this list."""
+        query = select(BlogPost).where(*_publicly_visible())
         if tag:
             query = query.where(BlogPost.tags.any(tag))
-        query = query.order_by(BlogPost.published_at.desc())
+        query = query.order_by(BlogPost.published_at.desc().nulls_last(), BlogPost.created_at.desc())
         result = await self._execute(query)
         return list(result.scalars().all())
 
@@ -49,7 +63,7 @@ class BlogPersistence(BasePersistence):
 
     async def get_latest(self) -> BlogPost | None:
         """Most recently *live* post, used to gate the recurring-generation
-        2-day cooldown. Filtered to is_published=True so an unpublished draft
+        cooldown. Filtered to is_published=True so an unpublished draft
         with a manually-set published_at can't be mistaken for the last real
         publish and delay the next scheduled run."""
         query = (
@@ -68,27 +82,6 @@ class BlogPersistence(BasePersistence):
         result = await self._execute(query)
         return [row[0] for row in result.all() if row[0]]
 
-    async def list_titles(self) -> list[str]:
-        """Every historical post title ever used (any status), newest first, so
-        a freshly generated post can be rejected if its title merely rephrases
-        an existing one (the topic_tag check only catches exact-tag repeats)."""
-        query = select(BlogPost.title).where(BlogPost.title.is_not(None)).order_by(BlogPost.created_at.desc())
-        result = await self._execute(query)
-        return [row[0] for row in result.all() if row[0]]
-
-    async def list_recent_contents(self, limit: int) -> list[str]:
-        """Markdown bodies of the most recent posts (any status), newest first,
-        so their "##" subheadings can be fed back to the generator as ones
-        not to reuse."""
-        query = (
-            select(BlogPost.content)
-            .where(BlogPost.content.is_not(None))
-            .order_by(BlogPost.created_at.desc())
-            .limit(limit)
-        )
-        result = await self._execute(query)
-        return [row[0] for row in result.all() if row[0]]
-
     async def has_published_on_date(self, day_start: datetime, day_end: datetime) -> bool:
         """Whether any *live* post's published_at falls within
         [day_start, day_end) - used to make the one-off launch post
@@ -104,9 +97,9 @@ class BlogPersistence(BasePersistence):
         return result.scalar_one_or_none() is not None
 
     async def archive_expired(self) -> int:
-        """Flips is_published=False for posts past their expiry. Housekeeping
-        only - list_published() already filters expiry in real time - but this
-        keeps the admin list and DB state tidy."""
+        """Flips is_published=False for posts past a manually-set expires_at.
+        Housekeeping only - list_published() already filters expiry in real
+        time - but this keeps the admin list and DB state tidy."""
         query = select(BlogPost).where(
             BlogPost.is_published.is_(True),
             BlogPost.expires_at.is_not(None),

@@ -1,4 +1,6 @@
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.base_persistence import BasePersistence
@@ -22,6 +24,14 @@ class BlogGenerationLogPersistence(BasePersistence):
         query = select(BlogGenerationLog).order_by(BlogGenerationLog.attempted_at.desc()).limit(limit)
         result = await self._execute(query)
         return list(result.scalars().all())
+
+    async def latest_success_at(self) -> datetime | None:
+        """When the generator last succeeded (created *or* refreshed a post).
+        A refresh leaves published_at untouched, so the recurring cooldown
+        can't be judged from the posts table alone."""
+        query = select(func.max(BlogGenerationLog.attempted_at)).where(BlogGenerationLog.success.is_(True))
+        result = await self._execute(query)
+        return result.scalar_one_or_none()
 
     async def has_successful_run(self, trigger_source: str) -> bool:
         """Whether a run with this trigger_source has ever succeeded, ever -
