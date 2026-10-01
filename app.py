@@ -29,6 +29,7 @@ from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
 from services.blog_scheduler import register_blog_jobs
+from services.codelab_scheduler import register_codelab_jobs
 
 LoggingConfigurator().configure()
 
@@ -57,6 +58,13 @@ async def lifespan(app: FastAPI):
         # registering/starting it must never prevent the API itself from
         # coming up and serving requests.
         logger.critical("Could not start the blog generation scheduler", exc_info=True)
+
+    try:
+        # Jobs can be added to a running scheduler; registered separately so
+        # a problem here can never take the blog jobs down with it.
+        register_codelab_jobs(container.scheduler, container.database, container.settings)
+    except Exception:
+        logger.critical("Could not register the CodeLab generation job", exc_info=True)
 
     yield
 

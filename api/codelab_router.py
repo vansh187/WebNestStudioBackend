@@ -1,11 +1,21 @@
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 
-from core.dependencies import get_codelab_service, get_current_user, get_optional_current_user, require_admin
+from core.dependencies import (
+    container,
+    get_codelab_generation_service,
+    get_codelab_service,
+    get_current_user,
+    get_optional_current_user,
+    require_admin,
+)
 from database.models import User
 from schemas.codelab_schemas import (
     AdminProblemResponse,
     AdminProblemUpsertRequest,
     CodelabDashboardResponse,
+    CodelabGenerationLogResponse,
+    CodelabGenerationTriggerRequest,
+    CodelabGenerationTriggerResponse,
     ProblemDetailResponse,
     ProblemListResponse,
     SubmissionCreateRequest,
@@ -13,6 +23,8 @@ from schemas.codelab_schemas import (
     SubmissionHistoryResponse,
     TrackListResponse,
 )
+from services.codelab_generation_service import CodelabGenerationService
+from services.codelab_scheduler import run_manual_generation
 from services.codelab_service import CodelabService
 
 router = APIRouter(prefix="/api/codelab", tags=["codelab"])
@@ -99,3 +111,29 @@ async def upsert_problem(
 ) -> AdminProblemResponse:
     """Create or replace a problem, keyed by slug. Replaces its full test-case set."""
     return await codelab.upsert_problem(payload)
+
+
+@admin_router.post("/generate", response_model=CodelabGenerationTriggerResponse, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_problem_generation(
+    background_tasks: BackgroundTasks,
+    payload: CodelabGenerationTriggerRequest = CodelabGenerationTriggerRequest(),
+) -> CodelabGenerationTriggerResponse:
+    """Starts automated problem generation now (one problem per requested
+    difficulty, all three by default), bypassing the schedule. Generating and
+    verifying a set takes a minute or more, so it runs in the background -
+    poll GET /generation-logs for the outcome of each difficulty."""
+    background_tasks.add_task(run_manual_generation, container.database, container.settings, payload.difficulties)
+    return CodelabGenerationTriggerResponse(
+        started=True, detail="Generation started. Check /api/admin/codelab/generation-logs for the result."
+    )
+
+
+@admin_router.get("/generation-logs", response_model=list[CodelabGenerationLogResponse])
+async def list_generation_logs(
+    limit: int = Query(default=30, ge=1, le=200),
+    generation: CodelabGenerationService = Depends(get_codelab_generation_service),
+) -> list:
+    """Recent generation attempts. A successful row's problem_slug identifies
+    an auto-generated problem; a failed row's error_message says why the
+    draft was rejected."""
+    return await generation.list_recent_logs(limit=limit)

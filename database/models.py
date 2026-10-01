@@ -687,6 +687,28 @@ class CodelabAchievement(Base):
     earned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class CodelabGenerationLog(Base):
+    """Audit trail for every automated problem-generation attempt (success or
+    failure), one row per difficulty per run. Also what the scheduler reads to
+    decide which difficulties are due, and how auto-generated problems are
+    told apart from hand-written ones."""
+
+    __tablename__ = "codelab_generation_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    difficulty: Mapped[str] = mapped_column(Text, nullable=False)
+    topic: Mapped[str | None] = mapped_column(Text)
+    llm_used: Mapped[str | None] = mapped_column(Text)
+    problem_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("codelab_problems.id", ondelete="SET NULL")
+    )
+    problem_slug: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    trigger_source: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class Course(Base):
     __tablename__ = "courses"
     __table_args__ = (CheckConstraint("status in ('draft','published','archived')", name="ck_course_status"),)

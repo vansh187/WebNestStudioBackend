@@ -15,6 +15,7 @@ from services.blog_scheduler import create_scheduler
 from services.blog_service import BlogService
 from services.chat_orchestrator_service import ChatOrchestratorService
 from services.chatbot_service import ChatbotService
+from services.codelab_generation_service import CodelabGenerationService
 from services.codelab_service import CodelabService
 from services.coding_service import CodingService
 from services.client_service import ClientService
@@ -131,6 +132,10 @@ def get_java_playground_service(session: AsyncSession = Depends(get_db_session))
 
 def get_codelab_service(session: AsyncSession = Depends(get_db_session)) -> CodelabService:
     return CodelabService(session=session)
+
+
+def get_codelab_generation_service(session: AsyncSession = Depends(get_db_session)) -> CodelabGenerationService:
+    return CodelabGenerationService(session=session, settings=container.settings)
 
 
 def get_learning_service(session: AsyncSession = Depends(get_db_session)) -> LearningService:
