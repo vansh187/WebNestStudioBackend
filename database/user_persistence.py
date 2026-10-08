@@ -46,8 +46,12 @@ class UserPersistence(BasePersistence):
         await self._refresh(user)
         return user
 
-    async def update_password_hash(self, user: User, password_hash: str) -> User:
+    async def update_password_hash(self, user: User, password_hash: str, commit: bool = True) -> User:
+        """With commit=False the change stays pending in the session, for a
+        caller that commits it together with related writes."""
         user.password_hash = password_hash
+        if not commit:
+            return user
         await self._commit()
         await self._refresh(user)
         return user
@@ -84,10 +88,16 @@ class UserPersistence(BasePersistence):
         await self._execute(delete(CodingExecution).where(CodingExecution.user_id == user.id))
         await self._delete(user)
 
-    async def search(self, query: str, exclude_user_id: uuid.UUID, limit: int = 20) -> list[User]:
+    async def search(
+        self, query: str, exclude_user_id: uuid.UUID, limit: int = 20, match_email: bool = True
+    ) -> list[User]:
         """Case-insensitive ILIKE match on full_name OR email, active accounts
         only, never the caller. Used by the messaging feature's people picker -
-        there is no way to add a non-registered person to a chat."""
+        there is no way to add a non-registered person to a chat.
+
+        With match_email=False only the name is searched: matching on the
+        address, even the whole address, would let a caller test which
+        addresses have an account and learn the name behind each one."""
         limit = min(max(limit, 1), 50)
         term = query.strip()
         if len(term) < 2:
@@ -96,15 +106,14 @@ class UserPersistence(BasePersistence):
         # those literal characters instead of turning the pattern into a wildcard.
         escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
+        name_match = User.full_name.ilike(pattern, escape="\\")
+        matches = or_(name_match, User.email.ilike(pattern, escape="\\")) if match_email else name_match
         statement = (
             select(User)
             .where(
                 User.id != exclude_user_id,
                 User.is_active.is_(True),
-                or_(
-                    User.full_name.ilike(pattern, escape="\\"),
-                    User.email.ilike(pattern, escape="\\"),
-                ),
+                matches,
             )
             .order_by(User.full_name.asc().nullslast(), User.email.asc())
             .limit(limit)

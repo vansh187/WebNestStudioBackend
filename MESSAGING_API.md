@@ -22,8 +22,12 @@ reply-quote, emoji reactions and unread counts. Freshness is **client polling**
 ```json
 { "id": "b3f1c8e2-…", "full_name": "Vansh Duggal", "email": "vansh@webneststudio.co.in" }
 ```
-In **`GET /api/users/search`** results the `email` is **masked** (`va******@gmail.com`).
-Everywhere else (participants, message senders) it is the real address.
+The `email` of **another person** is **masked** (`va******@gmail.com`) in
+search results and in `participants`, unless that person created the
+conversation. Message `sender` and reply-preview `sender` carry the real
+address: that person chose to write there. You always get your own real
+address, and site admins get everyone's. Identify people by `id`, never by
+`email`.
 
 ### Attachment (inside a Message)
 ```json
@@ -401,7 +405,8 @@ A `2xx` means the bytes are stored. Now send the message (#9) with the `url_path
 | `q` | — | required, **≥ 2 chars** after trim |
 | `limit` | `20` | max `50` |
 
-Case-insensitive match on `full_name` **or** `email`, active accounts only,
+Case-insensitive match on part of `full_name`. Site admins also match on
+`email`; other users cannot search by email at all. Active accounts only,
 **excludes you**. `email` in results is **masked**.
 
 **200**

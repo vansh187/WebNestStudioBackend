@@ -21,6 +21,8 @@ from services.blog_generation_service import (
     SLUG_PATTERN,
     BlogGenerationError,
     BlogGenerationService,
+    INTERNAL_LINKS,
+    _build_system_prompt,
     _closest_title,
     _normalize_headings,
     _truncate_to_word_limit,
@@ -70,7 +72,7 @@ def draft(**overrides) -> dict:
         "title": "Seven Signs Your Sales Team Has Outgrown Spreadsheets",
         "slug": "ignored",
         "excerpt": "How to tell when spreadsheets are holding your sales team back.",
-        "content": body("crm", 900),
+        "content": body("crm", 1300),
         "meta_title": "Signs You Have Outgrown Spreadsheets",
         "meta_description": "Seven practical signs your sales team needs a CRM instead of spreadsheets, and what to do next. Talk to Webnest Studio.",
         "keywords": ["custom crm for sales teams", "crm vs spreadsheets", "sales pipeline software"],
@@ -204,33 +206,44 @@ def test_new_topic_creates_a_permanent_post_and_triggers_the_deploy_hook():
         },
     ],
 )
-def test_matching_topic_updates_the_existing_post_instead_of_adding_a_slug(overrides):
+def test_matching_topic_never_modifies_the_existing_post(overrides):
+    # A shorter existing post and a longer draft - the case that used to
+    # trigger an in-place refresh.
     existing = make_post()
-    original_slug = existing.slug
+    before = dict(vars(existing))
     # The model keeps returning the same duplicate, so every retry matches too.
     service = make_generator([existing], draft(**overrides))
 
-    post = asyncio.run(service.generate_and_publish("scheduled-recurring"))
+    with pytest.raises(BlogGenerationError, match="Nothing was changed"):
+        asyncio.run(service.generate_and_publish("scheduled-recurring"))
 
-    assert post is existing
-    assert service._blog_posts.created == []
-    assert len(service._blog_posts.posts) == 1
-    assert post.slug == original_slug
-    assert post.word_count >= MIN_WORDS
-    assert post.updated_at == NOW
-    assert "slug" not in service._blog_posts.updated[0][1]
-    assert service._deploy_hook.reasons == [f"blog post refreshed: {original_slug}"]
-    assert "updated instead" in service.last_outcome_detail
+    assert vars(existing) == before
+    assert service._blog_posts.created == [] and service._blog_posts.updated == []
+    assert service._deploy_hook.reasons == []
+    # Logged as a failure, so should_run_recurring() tries again at the next cron fire.
+    assert [row["success"] for row in service._logs.rows] == [False]
 
 
-def test_identical_title_never_creates_a_numeric_suffix_slug():
+def test_identical_title_never_overwrites_or_creates_a_numeric_suffix_slug():
     existing = make_post()
+    before = dict(vars(existing))
     service = make_generator([existing], draft(title=existing.title, topic_tag="A different label"))
+
+    with pytest.raises(BlogGenerationError, match="Nothing was changed"):
+        asyncio.run(service.generate_and_publish("manual-admin", topic_hint="clinic booking"))
+
+    assert [p.slug for p in service._blog_posts.posts] == [existing.slug]
+    assert vars(existing) == before
+
+
+def test_directed_topic_retries_for_a_different_angle():
+    existing = make_post()
+    service = make_generator([existing], draft(topic_tag="Clinic booking systems"), draft())
 
     post = asyncio.run(service.generate_and_publish("manual-admin", topic_hint="clinic booking"))
 
-    assert [p.slug for p in service._blog_posts.posts] == [existing.slug]
-    assert post.slug == existing.slug
+    assert post is not existing
+    assert service._blog_posts.updated == []
 
 
 def test_retry_that_finds_a_fresh_topic_creates_a_new_post():
@@ -257,15 +270,16 @@ def test_shared_primary_keyword_alone_does_not_overwrite_an_unrelated_post():
 
 
 def test_shorter_draft_does_not_overwrite_a_longer_post_or_use_up_the_weekly_slot():
-    existing = make_post(content=body("clinic", 1100), word_count=1100)
+    existing = make_post(content=body("clinic", 1700), word_count=1700)
+    before = dict(vars(existing))
     service = make_generator([existing], draft(topic_tag="Clinic booking systems"))
 
     with pytest.raises(BlogGenerationError, match="Nothing was changed"):
         asyncio.run(service.generate_and_publish("scheduled-recurring"))
 
+    assert vars(existing) == before
     assert service._blog_posts.updated == [] and service._blog_posts.created == []
     assert service._deploy_hook.reasons == []
-    # Logged as a failure, so should_run_recurring() tries again at the next cron fire.
     assert [row["success"] for row in service._logs.rows] == [False]
 
 
@@ -537,3 +551,24 @@ def test_truncation_keeps_markdown_structure():
     assert _word_count(result) <= 110
     assert "## One" in result and "\n\n" in result
     assert not result.rstrip().endswith("## Two")
+
+
+# ---- Prompt and SEO fields ----
+
+
+def test_prompt_lists_published_titles_internal_links_and_originality_rules():
+    prompt = _build_system_prompt(["Clinic booking systems"], ["Why Your Clinic Needs Online Booking"])
+    assert "Why Your Clinic Needs Online Booking" in prompt
+    assert all(url in prompt for url in INTERNAL_LINKS)
+    assert "ORIGINALITY" in prompt and "Never copy" in prompt
+    assert "{" not in prompt.split("OUTPUT")[0]  # no unfilled template placeholders
+
+
+def test_model_tags_are_used_and_fall_back_to_keywords():
+    service = make_generator([], draft(tags=["CRM", "#Sales", "Spreadsheets"]))
+    post = asyncio.run(service.generate_and_publish("manual-admin"))
+    assert post.tags == ["CRM", "Spreadsheets"]
+
+    service = make_generator([], draft(tags="not a list"))
+    post = asyncio.run(service.generate_and_publish("manual-admin"))
+    assert post.tags == draft()["keywords"][:3]

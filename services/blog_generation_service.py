@@ -19,17 +19,20 @@ from services.llm_provider import GenerationFailedError, LLMProvider
 
 logger = logging.getLogger("webnest.blog_generation")
 
-# Target article length. Below MIN_WORDS a post is too thin to rank; the
-# generator regenerates once when a draft lands outside the range. A draft is
-# only cut down when it exceeds HARD_MAX_WORDS, since trimming removes the
-# closing FAQ / call to action.
-MIN_WORDS = BLOG_MIN_RECOMMENDED_WORDS
-MAX_WORDS = 1200
-HARD_MAX_WORDS = 1400
+# Target article length. The prompt asks for TARGET_MIN_WORDS..MAX_WORDS;
+# below MIN_WORDS a post is too thin to rank or to pass an AdSense content
+# review, so the generator regenerates once when a draft lands outside
+# MIN_WORDS..MAX_WORDS. A draft is only cut down when it exceeds
+# HARD_MAX_WORDS, since trimming removes the closing FAQ / call to action.
+MIN_WORDS = max(BLOG_MIN_RECOMMENDED_WORDS, 1000)
+TARGET_MIN_WORDS = 1200
+MAX_WORDS = 1600
+HARD_MAX_WORDS = 1900
 # How many times the model is asked for a different topic when its draft
 # matches an existing post. Each retry is a full-length article, so this is
-# kept low; if a draft still matches after the retries, the matching post is
-# refreshed in place instead of a new one being created.
+# kept low; if a draft still matches after the retries, the run fails and
+# nothing is written. The generator never edits an existing post - published
+# posts are only ever changed by hand.
 MAX_TOPIC_RETRIES = 2
 MAX_JSON_RETRIES = 2
 # The scheduler's cron fires once a day at a fixed time, while the previous
@@ -89,35 +92,50 @@ FALLBACK_KEYWORD_POOL = [
     "social media marketing for startups",
 ]
 
+SITE_URL = "https://www.webneststudio.co.in"
+# The only pages an article may link to. Each topic cluster supports one of
+# them, so posts build topical authority around a real service page.
+INTERNAL_LINKS = [
+    f"{SITE_URL}/software-development-company-gurugram",
+    f"{SITE_URL}/ai-development-company-india",
+    f"{SITE_URL}/custom-crm-development",
+    f"{SITE_URL}/services",
+    f"{SITE_URL}/contact",
+]
+
 PREFERRED_TOPIC_CLUSTERS = [
     {
-        "cluster": "Website Development",
-        "service_page": "Website Development",
+        "cluster": "Website & Software Development",
+        "service_url": f"{SITE_URL}/software-development-company-gurugram",
         "topics": [
-            "Website Development Cost in India",
-            "React frontend with Python and Java backend development",
+            "What drives website and custom software development cost in India",
+            "React frontend with a Java/Spring Boot or Python/FastAPI backend - how to choose",
+            "Writing a software requirements brief before you ask agencies for quotes",
+            "Ecommerce store development for Indian brands (UPI, GST invoices, festive-sale traffic)",
             "Website conversion improvements for lead generation",
-            "Ecommerce website development cost in India",
+            "Hiring a local development partner vs freelancers vs an in-house team",
         ],
     },
     {
-        "cluster": "AI & Automation",
-        "service_page": "AI Development",
+        "cluster": "AI Development & Automation",
+        "service_url": f"{SITE_URL}/ai-development-company-india",
         "topics": [
-            "How Much Does an AI Chatbot Cost in India?",
-            "Lead automation for small and medium businesses",
+            "What drives AI chatbot cost for an Indian business",
             "WhatsApp automation for sales and support",
-            "SEO vs GEO: How to Rank on Google, ChatGPT and AI Search",
+            "Lead qualification and follow-up automation for SMEs",
+            "Adding AI features to existing software without a rebuild",
+            "SEO vs GEO: ranking on Google and in AI search answers",
         ],
     },
     {
-        "cluster": "CRM & Enterprise Software",
-        "service_page": "CRM Development",
+        "cluster": "CRM & Business Software",
+        "service_url": f"{SITE_URL}/custom-crm-development",
         "topics": [
-            "How Much Does Custom CRM Development Cost in India?",
-            "Custom CRM vs Zoho vs Salesforce",
+            "Custom CRM vs off-the-shelf CRMs such as Zoho or Salesforce",
+            "What drives custom CRM development cost in India",
             "SaaS vs custom software for Indian businesses",
-            "CRM development for sales, support, and operations teams",
+            "CRM workflows for sales, support and field operations teams",
+            "Signs your team has outgrown spreadsheets",
         ],
     },
 ]
@@ -152,8 +170,9 @@ class BlogGenerationError(Exception):
 class BlogGenerationService:
     """Orchestrates automated blog post generation: LLM call with Gemini/Groq
     fallback, SEO-field validation with graceful self-healing, a duplicate
-    guard that refreshes the existing post on a topic instead of publishing a
-    second one, persistence, and the frontend rebuild trigger.
+    guard that asks for a different topic and otherwise fails without writing
+    (existing posts are never modified), persistence, and the frontend
+    rebuild trigger.
     Designed so a single bad run (malformed JSON, off-length content, missing
     SEO fields, repeated topic) degrades gracefully instead of throwing - the
     only exceptions that ever leave generate_and_publish are
@@ -177,10 +196,10 @@ class BlogGenerationService:
     # ---- Idempotency guards (used by the scheduler, bypassed by manual admin trigger) ----
 
     async def should_run_recurring(self) -> bool:
-        # A run that refreshes an existing post leaves published_at untouched,
-        # so the last successful generation is consulted as well as the newest
-        # post - otherwise a refresh would be followed by another run the very
-        # next day.
+        # The last successful generation is consulted as well as the newest
+        # post, so a run is never repeated early when the newest post's
+        # published_at is older than the last run (e.g. posts refreshed by
+        # earlier versions of the generator).
         latest = await self._blog_posts.get_latest()
         last_run_candidates = [
             latest.published_at if latest is not None else None,
@@ -291,11 +310,10 @@ class BlogGenerationService:
         data, provider = await _draft()
         match = _find_matching_post(data, posts)
 
-        # A directed topic (topic_hint) is the caller deliberately asking for
-        # this subject, so no retry for a different one - a match goes straight
-        # to refreshing the existing post on that subject.
+        # A directed topic (topic_hint) is retried too: the prompt then asks
+        # for a clearly different angle on the same subject.
         attempts = 0
-        while match is not None and topic_hint is None and attempts < MAX_TOPIC_RETRIES:
+        while match is not None and attempts < MAX_TOPIC_RETRIES:
             attempts += 1
             matched_post, reason = match
             logger.warning(
@@ -318,22 +336,19 @@ class BlogGenerationService:
         fields = self._validate_and_heal(data)
         matched_post = match[0] if match is not None else None
         if matched_post is None:
-            # Same slug means the same headline. Reuse that post rather than
-            # ever minting a "-2" variant of an existing URL.
+            # Same slug means the same headline - never mint a "-2" variant
+            # of an existing URL.
             matched_post = next((p for p in posts if p.slug == fields["slug"]), None)
 
         if matched_post is not None:
-            if not matched_post.is_published:
-                # Whether an unpublished post comes back is the owner's call,
-                # never the generator's - so it is neither republished nor
-                # shadowed by a second post on the same subject. The run is
-                # logged as failed and tried again on the next cron fire.
-                raise BlogGenerationError(
-                    f"The draft covers the same ground as the unpublished post {matched_post.slug!r}. "
-                    "Nothing was published - republish that post by hand, or generate again for a different topic."
-                )
-            post = await self._refresh_existing(matched_post, fields, posts)
-            return post, provider, post.topic_tag or fields["topic_tag"], "refreshed"
+            # Existing posts (published or not) are never overwritten by the
+            # generator. The run is logged as failed and tried again on the
+            # next cron fire.
+            state = "published" if matched_post.is_published else "unpublished"
+            raise BlogGenerationError(
+                f"The draft covers the same ground as the {state} post {matched_post.slug!r}. "
+                "Nothing was changed - generate again for a different topic."
+            )
 
         _make_seo_fields_unique(fields, posts)
         try:
@@ -345,41 +360,6 @@ class BlogGenerationService:
             # suffixed slug.
             raise BlogGenerationError(f"Could not persist blog post: {exc}") from exc
         return post, provider, post.topic_tag or fields["topic_tag"], "created"
-
-    async def _refresh_existing(self, post: BlogPost, fields: dict, posts: list[BlogPost]) -> BlogPost:
-        """Updates the existing published post on this topic with the new
-        draft instead of creating a second post. The slug never changes - its
-        URL may already be indexed."""
-        existing_words = post.word_count or _word_count(post.content or "")
-        if existing_words > fields["word_count"]:
-            # Never replace a post with a thinner draft - it may have been
-            # expanded by hand. Raised (and so logged as a failed run) rather
-            # than reported as a success: a run that changed nothing must not
-            # use up the week's publishing slot.
-            raise BlogGenerationError(
-                f"The draft covers the same ground as the existing post {post.slug!r}, which is longer "
-                f"({existing_words} words vs {fields['word_count']}). Nothing was changed."
-            )
-
-        others = [p for p in posts if p.id != post.id]
-        # Take the new headline only if no *other* post already has one like it.
-        title = fields["title"]
-        if post.title and _closest_title(title, [p.title for p in others if p.title]) is not None:
-            title = post.title
-        candidate = {**fields, "title": title}
-        _make_seo_fields_unique(candidate, others)
-        updates = {
-            key: candidate[key]
-            for key in ("title", "excerpt", "content", "meta_title", "meta_description", "keywords", "tags", "word_count")
-        }
-        if not post.topic_tag:
-            updates["topic_tag"] = fields["topic_tag"]
-
-        logger.info("Refreshing existing post %s instead of creating a duplicate", post.slug)
-        try:
-            return await self._blog_posts.update(post, **updates)
-        except ConflictError as exc:
-            raise BlogGenerationError(f"Could not update blog post {post.slug!r}: {exc}") from exc
 
     async def _generate_json(
         self,
@@ -427,12 +407,13 @@ class BlogGenerationService:
         if words < MIN_WORDS:
             note = (
                 f"the previous attempt was only {words} words - the 'content' field MUST be between "
-                f"{MIN_WORDS} and {MAX_WORDS} words. Develop every section in more depth."
+                f"{TARGET_MIN_WORDS} and {MAX_WORDS} words. Develop every section in more depth "
+                "with concrete steps, trade-offs and examples - not filler."
             )
         else:
             note = (
                 f"the previous attempt was {words} words - the 'content' field MUST be between "
-                f"{MIN_WORDS} and {MAX_WORDS} words. Tighten it."
+                f"{TARGET_MIN_WORDS} and {MAX_WORDS} words. Tighten it."
             )
         logger.warning("Generated content was %s words (target %s-%s); regenerating once", words, MIN_WORDS, MAX_WORDS)
         try:
@@ -482,6 +463,14 @@ class BlogGenerationService:
         if not (3 <= len(keywords) <= 8):
             keywords = _fallback_keywords(topic_tag)
 
+        tags_raw = data.get("tags")
+        tags: list[str] = []
+        if isinstance(tags_raw, list):
+            tags = [_strip_hashtags(_clean_str(t)) for t in tags_raw if _clean_str(t)]
+            tags = [t for t in dict.fromkeys(tags) if t and len(t) <= 40]
+        if not (1 <= len(tags) <= 5):
+            tags = keywords[:3]
+
         return {
             "title": title,
             "slug": _slugify(title),
@@ -490,7 +479,7 @@ class BlogGenerationService:
             "meta_title": meta_title,
             "meta_description": meta_description,
             "keywords": keywords,
-            "tags": keywords[:3],
+            "tags": tags,
             "topic_tag": topic_tag,
             "word_count": word_count,
             "is_published": True,
@@ -532,7 +521,6 @@ class BlogGenerationService:
 
 _OUTCOME_DETAILS = {
     "created": "Blog post generated and published",
-    "refreshed": "An existing post already covers this topic - it was updated instead of creating a duplicate",
 }
 
 
@@ -552,98 +540,135 @@ def _build_system_prompt(
 but stay on this subject - do not substitute a different topic):
 {topic_hint}"""
     else:
-        topic_instruction = f"""Pick ONE fresh, specific topic from the preferred topic clusters below unless
-the exact subject has already been covered. Prioritize commercial-intent posts
-that attract Indian founders, marketing heads, operations teams, and B2B buyers
-who are close to requesting a quote.
+        topic_instruction = f"""Pick ONE fresh, specific topic from the clusters below unless that exact
+subject has already been covered. Each cluster supports one service page; the
+article should help a buyer evaluating that service, and its closing section
+should link to that page. Clusters are SUBJECTS, not headlines - never copy
+one verbatim as the title.
 
 {_format_preferred_topic_clusters()}
 
-If every preferred topic is already covered, choose a closely related long-tail
-angle that still supports one of these service pages."""
-    return f"""You are writing a blog post for Webnest Studio, a tech consultancy offering
-web development, AI/ML solutions, and social media growth for small and
-medium businesses.
+If every listed topic is already covered, choose a closely related long-tail
+angle (a different audience, problem or depth) that still supports one of
+these service pages."""
+    links_str = "\n".join(f"  {url}" for url in INTERNAL_LINKS)
+    return f"""You are a senior technical writer for WebNest Studio, a web and AI software
+development company in Gurugram, Haryana, India. WebNest builds websites,
+custom software (React frontends with Java/Spring Boot or Python/FastAPI
+backends), AI integrations and ecommerce stores. It also runs a free
+coding-education platform (courses and CodeLab).
 
+Write ONE original blog article.
+
+AUDIENCE: Indian founders, business owners and decision-makers who are
+evaluating a software or website project. They are smart but not necessarily
+technical.
+
+TOPIC
 {topic_instruction}
 
-Rules:
-- The article body ("content") must be {MIN_WORDS}-{MAX_WORDS} words of markdown
-  (aim for about 1,000 - anything under {MIN_WORDS} is rejected), in this
-  structure:
-  1. An introduction of 2-3 short paragraphs with no heading, opening on a
-     hook (a relatable pain point, a sharp question, or a bold claim - not a
-     generic "In today's world..." line).
-  2. 3 to 5 sections, each under its own "##" subheading, each giving
-     practical, specific guidance a business owner can act on.
-  3. A "## Frequently Asked Questions" section with 3 short questions, each
-     as a "###" heading followed by a 1-3 sentence answer.
-  4. One closing paragraph with a single call to action toward Webnest
-     Studio's services. This is the ONLY call to action in the article.
-- Put a blank line before and after every heading.
-- Do NOT invent facts. No made-up statistics, percentages, survey results,
-  prices, rupee amounts, client names, case studies, testimonials, or
-  timelines presented as fact. When discussing cost, explain what drives it
-  and how to compare options instead of quoting figures. Illustrative
-  examples must be clearly hypothetical ("a clinic that takes bookings by
-  phone...") and never name a real or invented client.
-- Write in an engaging, confident, conversational tone - vary sentence length,
-  avoid clichés and corporate buzzwords, and make it something a small
-  business owner would actually enjoy reading.
-- Do NOT include any hashtags (e.g. "#SmallBusiness", "#WebDesign") anywhere
-  in the title, excerpt, or content - this is a blog article, not a social
-  media caption. Use the dedicated "keywords" field for SEO terms instead.
-- Include 4-6 realistic SEO keywords/phrases naturally within the content
-  (not stuffed) - prefer specific, moderately-searched, long-tail phrases a
-  small business owner would actually type into Google, over generic single
-  words. List the single primary keyword FIRST in the "keywords" array.
-- When writing cost/comparison posts, include India-specific buying context
-  and decision factors without making unverifiable promises.
-- Keep the article aligned with the selected cluster's service page so it can
-  work as part of a topic cluster, not as an unrelated standalone post.
-- meta_title: at most 60 characters, includes the primary keyword near the
-  start, and is unique to this post.
-- meta_description: 150-160 characters, includes a keyword and a soft call to
-  action, and is unique to this post.
-- slug: lowercase, hyphen-separated, url-safe, derived from the title.
-- topic_tag: a short 2-5 word label for this topic, distinct in wording from the title.
-- Do NOT reuse or closely rephrase any of these previously covered topics: {excluded_str}
-- The topic clusters above are SUBJECTS, not headlines - never copy a cluster
-  topic verbatim as the title.
-- The title must be unique. Do NOT reuse or lightly reword any of these
-  already-published titles, do not start with the same lead phrase (e.g. the
-  words before a ":" or "?"), and do not just add a year, "Guide", or one
-  swapped word: {recent_titles_str}
-- Vary the headline format - rotate between a question, a list, a specific
-  scenario or persona, a mistake to avoid, a comparison, or a bold claim -
-  and avoid the format the recent titles above use most.
-- The "##" subheadings (other than the FAQ heading) must be specific to this
-  article's content, never generic labels like "Why It Matters", "The Bottom
-  Line", "Conclusion", "Key Benefits", or "Getting Started". Do NOT reuse any
-  of these recently used subheadings: {subheadings_str}
-- The whole article must be original, not a remix of an earlier post: use a
-  fresh angle, new scenarios, and a different structure. Do NOT open the way
-  any of these recent posts opened (no same hook or first sentence pattern):
-  {openings_str}
+ALREADY PUBLISHED - do not repeat these titles or angles, and do not write a
+near-duplicate of any of them. If your topic overlaps heavily with one, choose
+a clearly different angle (a different audience, problem or depth):
+{recent_titles_str}
+Previously covered topics (do not reuse or closely rephrase): {excluded_str}
 
-Return ONLY valid JSON, no markdown code fences, no extra commentary:
+ORIGINALITY (strict - this site is reviewed for Google AdSense)
+- Write every sentence from scratch in your own words. Never copy, translate,
+  or closely paraphrase any existing article, competitor page, documentation
+  or Wikipedia text, and never reproduce boilerplate definitions.
+- Add value a reader cannot get from the top search results: concrete decision
+  criteria, checklists, trade-offs, questions to ask a vendor, and India-
+  specific context.
+- People-first content only: write to help the reader decide or act, not to
+  pad length for search engines. No keyword stuffing, no doorway-style text.
+- The title must accurately describe the article. No clickbait, no misleading
+  claims, no guarantees ("rank #1", "double your sales").
+- Keep it family-safe and policy-safe: no adult, gambling, hacking, weapons,
+  drugs, or medical/financial/legal advice presented as professional advice.
+- Never mention ads, ask readers to click anything other than the one call to
+  action, or refer to AdSense.
+- Do not open the way any of these recent posts opened (no same hook or first
+  sentence pattern): {openings_str}
+
+LENGTH AND DEPTH
+- {TARGET_MIN_WORDS} to {MAX_WORDS} words of body content. Never under {MIN_WORDS}.
+- Every section must teach something specific: steps, trade-offs, examples,
+  checklists or decision criteria. No filler, no restating the intro, no
+  generic motivational lines.
+
+STRUCTURE (Markdown in the "content" field)
+- Do NOT include the title as a heading. Start with a 2-3 sentence hook that
+  names a concrete problem the reader has.
+- Use "## " for main sections and "### " for subsections. Never use a single
+  "#", never output empty heading lines, and put a blank line before and
+  after every heading.
+- 6 to 9 "##" sections. Include at least:
+  - a practical step-by-step section or checklist
+  - a section on when this approach is NOT the right choice, or common mistakes
+  - an India-specific section where relevant (UPI/payment gateways, GST,
+    festive-season traffic, mobile-first users, local hiring)
+  - "## Frequently asked questions" with 3-4 questions, each question in
+    **bold** on its own line followed by a 1-3 sentence answer
+- End with a short "## " closing section containing one natural call to action
+  and 1-2 internal links (as Markdown links), chosen only from:
+{links_str}
+- "##" subheadings must be specific to this article - never generic labels
+  like "Why It Matters", "The Bottom Line", "Conclusion", "Key Benefits" or
+  "Getting Started". Do not reuse any of these recently used subheadings:
+  {subheadings_str}
+- Use bullet lists and short paragraphs (2-4 sentences). Bold only key terms,
+  and sparingly. No hashtags anywhere.
+
+ACCURACY RULES (strict)
+- Do NOT invent statistics, percentages, survey results, client names, case
+  studies, testimonials or quotes.
+- Do NOT state prices, rupee amounts, timelines or performance numbers as
+  facts. If you mention cost or time, describe the factors that drive it, or
+  use clearly hedged language ("typically", "depends on scope").
+- Name real tools, platforms and companies only for what they are widely
+  known to do. Do not quote their prices or fees.
+- Do not claim WebNest Studio built anything specific for a named client.
+- Hypothetical examples are fine, but frame them as hypothetical ("For
+  example, a mid-sized ecommerce brand might...").
+
+STYLE
+- Plain, confident, practical. Second person ("you"). Indian English spelling.
+- No hype words: "revolutionary", "game-changer", "unlock", "supercharge",
+  "in today's fast-paced world", "masterclass", "lightning-fast".
+- Choose one primary keyword (a phrase an Indian buyer would actually type
+  into Google). Use it naturally in the first 100 words, in one "##" heading
+  and in the closing section. Do not keyword-stuff.
+- Vary the headline format - a question, a list, a scenario, a mistake to
+  avoid, a comparison - and avoid the format the published titles use most.
+  Do not start with the same lead phrase as a published title, and do not
+  just add a year, "Guide" or one swapped word.
+
+OUTPUT
+Return ONLY valid JSON, with no code fences and no commentary:
 {{
-  "title": "...",
-  "slug": "...",
-  "excerpt": "...",
-  "content": "...",
-  "meta_title": "...",
-  "meta_description": "...",
-  "keywords": ["...", "..."],
-  "topic_tag": "..."
-}}"""
+  "title": "50-70 characters, specific, includes the primary keyword",
+  "slug": "lowercase-words-with-dashes, max 80 chars, no numeric suffix",
+  "excerpt": "1-2 sentences, 140-200 characters",
+  "meta_title": "under 60 characters, primary keyword near the start",
+  "meta_description": "140-160 characters, includes the primary keyword and a reason to click",
+  "keywords": ["4-6 relevant phrases, primary keyword first"],
+  "tags": ["3 short tags"],
+  "topic_tag": "a short 2-5 word label for this specific topic, worded differently from the title",
+  "content": "the full Markdown body"
+}}
+
+Before returning, check that: content is at least {MIN_WORDS} words; there are
+no invented numbers, quotes or clients; there are no empty headings; there is
+no single "#"; every internal link is from the list above; and the title is
+not a near-duplicate of a published one."""
 
 
 def _format_preferred_topic_clusters() -> str:
     lines: list[str] = []
     for cluster in PREFERRED_TOPIC_CLUSTERS:
         topics = "; ".join(cluster["topics"])
-        lines.append(f'- {cluster["cluster"]} -> {cluster["service_page"]} service page: {topics}')
+        lines.append(f'- {cluster["cluster"]} (supports {cluster["service_url"]}): {topics}')
     return "\n".join(lines)
 
 

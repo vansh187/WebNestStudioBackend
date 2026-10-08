@@ -117,6 +117,11 @@ already-consumed code, and expired code (codes expire after
 UI can't distinguish "wrong" from "expired" — just show a generic error and
 offer resend.
 
+A code allows **5 wrong guesses**. The 5th returns `422` with `"Too many
+incorrect attempts. Please request a new code"` and the code stops working —
+the user must resend. The same applies to the code in
+`POST /api/auth/reset-password`.
+
 ---
 
 ### `POST /api/auth/resend-otp`
@@ -142,7 +147,11 @@ offer resend.
   detail message is like `"Please wait 42s before requesting another
   code"` — a resend button spammed repeatedly should show that message
   and/or disable itself, not treat it as a generic failure. Cooldown is 60s
-  between resends.
+  between resends. Also `429` (`"Too many incorrect attempts for this
+  account. Please try again in an hour"`) once 25 wrong codes have been
+  entered for the same email and purpose within an hour. Requesting codes
+  alone never triggers it.
+- A new code replaces every earlier one: only the most recent email works.
 
 ---
 

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import random
+import secrets
 import string
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -106,7 +106,9 @@ class OtpGenerator:
     def generate_code(self, length: int = 6) -> str:
         if length <= 0:
             raise ValueError("OTP length must be a positive integer")
-        return "".join(random.choices(string.digits, k=length))
+        # secrets, not random: the code is a credential and must not be
+        # predictable from earlier codes.
+        return "".join(secrets.choice(string.digits) for _ in range(length))
 
     def expiry(self) -> datetime:
         return datetime.now(timezone.utc) + timedelta(minutes=self._settings.otp_expire_minutes)
