@@ -68,6 +68,20 @@ class OtpVerification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class OtpFailedAttempt(Base):
+    """Wrong-guess counter for one OTP, so a code can be locked after a few
+    misses. A separate table (not a column on otp_verifications) because
+    create_all adds new tables at startup but never alters existing ones."""
+
+    __tablename__ = "otp_failed_attempts"
+
+    otp_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("otp_verifications.id", ondelete="CASCADE"), primary_key=True
+    )
+    failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class Lead(Base):
     __tablename__ = "leads"
 

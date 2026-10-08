@@ -41,6 +41,8 @@ MAX_ATTACHMENTS_PER_MESSAGE = 10
 PREVIEW_LENGTH = 200
 REPLY_PREVIEW_LENGTH = 140
 _ADMIN_ROLES = ("owner", "admin")
+# users.role value (not a conversation role) that may see other people's emails.
+_SITE_ADMIN_ROLE = "admin"
 # How many signed-download lookups may be in flight at once while serialising a
 # page of messages. The StorageService cache means most calls are cache hits;
 # this just caps the cold-start burst against Supabase.
@@ -102,7 +104,7 @@ class MessagingService:
             self._serialize_conversation(
                 conversation,
                 unread_count,
-                user.id,
+                user,
                 self._last_message_view(conversation, latest.get(conversation.id)),
             )
             for conversation, unread_count in rows
@@ -127,7 +129,7 @@ class MessagingService:
             created_by=user.id,
             members=members,
         )
-        return await self._conversation_view(conversation, 0, user.id)
+        return await self._conversation_view(conversation, 0, user)
 
     async def create_direct(
         self, user: User, other_user_id: uuid.UUID
@@ -151,7 +153,7 @@ class MessagingService:
                 await self._messaging.add_participants(existing, rejoin)
                 existing = await self._messaging.get_conversation(existing.id) or existing
             unread = await self._unread_for(existing, user.id)
-            return await self._conversation_view(existing, unread, user.id), False
+            return await self._conversation_view(existing, unread, user), False
 
         conversation = await self._messaging.create_conversation(
             conversation_type="direct",
@@ -159,7 +161,7 @@ class MessagingService:
             created_by=user.id,
             members=[(user.id, "member"), (other_user_id, "member")],
         )
-        return await self._conversation_view(conversation, 0, user.id), True
+        return await self._conversation_view(conversation, 0, user), True
 
     async def get_conversation(
         self, user: User, conversation_id: uuid.UUID
@@ -167,7 +169,7 @@ class MessagingService:
         conversation = await self._load_conversation_or_404(conversation_id)
         self._require_participant(conversation, user.id)
         unread = await self._unread_for(conversation, user.id)
-        return await self._conversation_view(conversation, unread, user.id)
+        return await self._conversation_view(conversation, unread, user)
 
     async def rename_conversation(
         self, user: User, conversation_id: uuid.UUID, title: str
@@ -179,7 +181,7 @@ class MessagingService:
         self._require_admin(participant)
         conversation = await self._messaging.rename_conversation(conversation, title.strip())
         unread = await self._unread_for(conversation, user.id)
-        return await self._conversation_view(conversation, unread, user.id)
+        return await self._conversation_view(conversation, unread, user)
 
     async def add_participants(
         self, user: User, conversation_id: uuid.UUID, user_ids: list[uuid.UUID]
@@ -203,7 +205,7 @@ class MessagingService:
             conversation = await self._messaging.get_conversation(conversation_id) or conversation
 
         unread = await self._unread_for(conversation, user.id)
-        return await self._conversation_view(conversation, unread, user.id)
+        return await self._conversation_view(conversation, unread, user)
 
     async def remove_participant(
         self, user: User, conversation_id: uuid.UUID, target_user_id: uuid.UUID
@@ -302,7 +304,7 @@ class MessagingService:
             conversation_id, limit, before_id, after_id
         )
         return MessageListResponse(
-            messages=await self._serialize_messages(rows, user.id),
+            messages=await self._serialize_messages(rows, user),
             has_more=has_more,
         )
 
@@ -349,7 +351,7 @@ class MessagingService:
             attachments=stored_attachments or None,
             preview=self._preview(clean_body, stored_attachments),
         )
-        serialized = await self._serialize_messages([message], user.id)
+        serialized = await self._serialize_messages([message], user)
         return serialized[0]
 
     async def mark_read(
@@ -389,7 +391,7 @@ class MessagingService:
             raise ForbiddenError("You can only delete your own messages")
         if not message.is_deleted:
             message = await self._messaging.soft_delete_message(message)
-        serialized = await self._serialize_messages([message], user.id)
+        serialized = await self._serialize_messages([message], user)
         return serialized[0]
 
     # ================================================================== #
@@ -407,12 +409,15 @@ class MessagingService:
         term = (query or "").strip()
         if len(term) < 2:
             raise BadRequestError("Search needs at least 2 characters")
-        found = await self._users.search(term, user.id, limit)
         # The people-picker only needs to disambiguate names; it must not hand a
         # logged-in user a harvestable list of every active account's real
-        # email. Names come through in full, the address is masked. (Full
-        # emails are still shown for people you already share a conversation
-        # with, via participant / sender summaries.)
+        # email. Names come through in full, the address is masked. Matching
+        # on the address would undo that (a partial match spells it out one
+        # character at a time, a full match confirms who has an account), so
+        # only admins search by email; everyone else searches by name.
+        found = await self._users.search(
+            term, user.id, limit, match_email=getattr(user, "role", None) == _SITE_ADMIN_ROLE
+        )
         return UserSearchResponse(
             results=[
                 UserSummary(
@@ -497,14 +502,14 @@ class MessagingService:
         )
 
     async def _conversation_view(
-        self, conversation: Conversation, unread_count: int, me_id: uuid.UUID
+        self, conversation: Conversation, unread_count: int, viewer: User
     ) -> ConversationOut:
         """Serialise one conversation, resolving its last_message with a single
         batched query (not an N+1 - see latest_messages_for_conversations)."""
         return self._serialize_conversation(
             conversation,
             unread_count,
-            me_id,
+            viewer,
             await self._one_last_message(conversation),
         )
 
@@ -520,7 +525,7 @@ class MessagingService:
         self,
         conversation: Conversation,
         unread_count: int,
-        me_id: uuid.UUID,
+        viewer: User,
         last_message: LastMessageOut | None,
     ) -> ConversationOut:
         active = sorted(
@@ -529,7 +534,9 @@ class MessagingService:
         )
         participants = [
             ParticipantOut(
-                user=self._user_summary(member.user),
+                user=self._user_summary(
+                    member.user, viewer, reveal_email=member.user_id == conversation.created_by
+                ),
                 role=member.role,
                 joined_at=member.joined_at,
                 last_read_at=member.last_read_at,
@@ -578,10 +585,11 @@ class MessagingService:
         )
 
     async def _serialize_messages(
-        self, messages: list[Message], me_id: uuid.UUID
+        self, messages: list[Message], viewer: User
     ) -> list[MessageOut]:
         if not messages:
             return []
+        me_id = viewer.id
         groups_by_id = await self._messaging.reaction_groups_for_messages(
             [message.id for message in messages], me_id
         )
@@ -624,7 +632,7 @@ class MessagingService:
                     )
 
         return [
-            self._build_message_out(message, groups_by_id.get(message.id, []), signed)
+            self._build_message_out(message, groups_by_id.get(message.id, []), signed, viewer)
             for message in messages
         ]
 
@@ -633,6 +641,7 @@ class MessagingService:
         message: Message,
         reaction_rows: list[tuple[str, int, bool]],
         signed: dict[tuple[uuid.UUID, int], str | None],
+        viewer: User,
     ) -> MessageOut:
         attachments: list[AttachmentOut] = []
         if not message.is_deleted and message.attachments:
@@ -658,7 +667,7 @@ class MessagingService:
             replied = message.reply_to
             reply_to = ReplyPreview(
                 id=replied.id,
-                sender=self._user_summary(replied.sender),
+                sender=self._user_summary(replied.sender, viewer, reveal_email=True),
                 body_preview=None if replied.is_deleted else _truncate(replied.body, REPLY_PREVIEW_LENGTH),
                 is_deleted=replied.is_deleted,
             )
@@ -675,7 +684,7 @@ class MessagingService:
         return MessageOut(
             id=message.id,
             conversation_id=message.conversation_id,
-            sender=self._user_summary(message.sender),
+            sender=self._user_summary(message.sender, viewer, reveal_email=True),
             body=message.body,
             attachments=attachments,
             reply_to=reply_to,
@@ -685,13 +694,30 @@ class MessagingService:
             edited_at=message.edited_at,
         )
 
-    def _user_summary(self, user: User | None) -> UserSummary:
+    def _user_summary(
+        self, user: User | None, viewer: User | None, reveal_email: bool = False
+    ) -> UserSummary:
+        """reveal_email is for people who chose to be visible in this
+        conversation: whoever created it and whoever wrote a message in it."""
         # sender_id / reaction user_id are NOT NULL with ON DELETE CASCADE, so a
         # loaded message always has its sender row. Guard anyway rather than
         # dereference None.
         if user is None:
             return UserSummary(id=uuid.UUID(int=0), full_name=None, email="")
-        return UserSummary(id=user.id, full_name=user.full_name, email=user.email)
+        show = reveal_email or self._may_see_email(viewer, user)
+        return UserSummary(
+            id=user.id, full_name=user.full_name, email=user.email if show else _mask_email(user.email)
+        )
+
+    def _may_see_email(self, viewer: User | None, user: User) -> bool:
+        """Being put in a conversation is not consent: anyone can start a chat
+        with (or add to a group) any account, so a participant list would
+        otherwise hand out the full addresses the people picker masks. Someone
+        who was only added stays masked to everyone but themselves and site
+        admins."""
+        if viewer is None:
+            return False
+        return viewer.id == user.id or getattr(viewer, "role", None) == _SITE_ADMIN_ROLE
 
     async def _reaction_response(
         self, message_id: uuid.UUID, me_id: uuid.UUID
