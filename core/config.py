@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     blog_generation_enabled: bool = True
     blog_generation_interval_days: int = 7
     blog_generation_hour_ist: int = 6
+    # Generated posts are saved as unpublished drafts for an editor to review,
+    # fact-check and publish from the admin panel. Publishing unreviewed LLM
+    # output is what got the blog rejected as "low-value content" - only set
+    # this to True if every generated post really is checked after it goes live.
+    blog_auto_publish: bool = False
     # Vercel deploy hook for the pre-rendered frontend. Called after a post is
     # published, updated or unpublished so the static blog pages are rebuilt.
     # Empty string disables it (local dev).

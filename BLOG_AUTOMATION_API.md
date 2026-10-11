@@ -1,10 +1,23 @@
 # Automated Blog System — Notes for the Frontend Team
 
-**Status:** Backend live. One new post a week (06:00 IST), plus any an admin
-triggers manually.
+**Status:** Backend live. One new **draft** a week (06:00 IST), plus any an
+admin triggers manually.
 
 ## What changed (October 2026)
 
+- **Generated posts are drafts.** The generator saves each post with
+  `is_published = false` and `published_at = null`, and emails
+  `BLOG_PUBLISH_NOTIFICATION_EMAIL` that a draft is waiting. An editor reviews
+  and fact-checks it, then publishes it from the admin panel (`PUT
+  /api/admin/blog/{id}` with `"is_published": true`), which sets
+  `published_at` and triggers the frontend rebuild. Nothing reaches
+  `GET /api/blog` without that step. `BLOG_AUTO_PUBLISH=true` restores direct
+  publishing; leave it off. Unreviewed generated posts are what got the blog
+  rejected by AdSense as low-value content.
+- **The frontend shows exactly what is published.** There is no word-count
+  filter: a post the API returns is listed, indexable and in the sitemap, and
+  any other slug is a 404 (or a permanent redirect in `vercel.json` when it was
+  merged into another post).
 - **Posts are permanent.** The 15-day auto-expiry is gone: a published post
   stays published until someone unpublishes it. `expires_at` is now an
   optional manual field and is `null` by default.
@@ -15,17 +28,15 @@ triggers manually.
 - **No duplicate posts.** If the generator's draft matches an existing post
   (same `topic_tag`, a closely matching title, the same primary keyword on an
   overlapping title, or a copied body) it first asks the model for a different
-  topic; if the draft still matches a **published** post, that post is updated
-  in place - same slug, new `updated_at` - instead of a second post being
-  created. Two cases publish nothing and are logged as a failed run (retried
-  at the next daily check): the draft is shorter than the post it matches, or
-  the post it matches is unpublished (the generator never republishes a post;
-  that is an admin decision). Slugs never get a
+  topic; if the draft still matches any existing post, published or not,
+  nothing is written and the run is logged as failed (retried at the next
+  daily check). The generator never edits an existing post. Slugs never get a
   numeric suffix such as `-2`, and the slug of a post that has been published
   cannot be changed through the admin API.
 - **`meta_title` and `meta_description` are unique** across published posts.
-- **Longer posts.** The generator targets 800-1,200 words: intro, 3-5 `##`
-  sections, a short FAQ (`###` questions), one call to action.
+- **Longer posts.** The generator targets 1,200-1,600 words: intro, `##`
+  sections, a short FAQ (`###` questions), one call to action. Length is a
+  target for the model, not a quality check; the editor's review is.
 - **The frontend is rebuilt automatically.** After a post is published,
   updated, unpublished or deleted the backend calls the Vercel deploy hook
   (`VERCEL_DEPLOY_HOOK_URL`). A failed hook call is logged and never fails

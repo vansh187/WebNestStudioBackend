@@ -154,12 +154,17 @@ class FakeEmail:
     async def send_blog_published_notification(self, title, slug):
         self.sent.append(slug)
 
+    async def send_blog_draft_notification(self, title, slug):
+        self.sent.append(f"draft:{slug}")
 
-def make_generator(posts, *drafts):
+
+def make_generator(posts, *drafts, auto_publish=True):
     service = BlogGenerationService.__new__(BlogGenerationService)
     service._blog_posts = FakeBlogs(posts)
     service._logs = FakeLogs()
-    service._settings = SimpleNamespace(blog_generation_interval_days=7, team_notification_email="")
+    service._settings = SimpleNamespace(
+        blog_generation_interval_days=7, team_notification_email="", blog_auto_publish=auto_publish
+    )
     service._llm = FakeLLM(*drafts)
     service._email = FakeEmail()
     service._deploy_hook = FakeHook()
@@ -192,6 +197,27 @@ def test_new_topic_creates_a_permanent_post_and_triggers_the_deploy_hook():
     assert post.word_count >= MIN_WORDS
     assert service._deploy_hook.reasons == [f"blog post created: {post.slug}"]
     assert service._email.sent == [post.slug]
+
+
+def test_by_default_a_generated_post_is_saved_as_an_unpublished_draft_for_review():
+    service = make_generator([make_post()], draft(), auto_publish=False)
+
+    post = asyncio.run(service.generate_and_publish("scheduled-recurring"))
+
+    assert post.is_published is False
+    assert post.published_at is None
+    # Nothing public changed, so no frontend rebuild and no "post is live" email.
+    assert service._deploy_hook.reasons == []
+    assert service._email.sent == [f"draft:{post.slug}"]
+    assert "draft" in service.last_outcome_detail
+    # Logged as a successful run, so the weekly cadence still holds.
+    assert service._logs.rows[0]["success"] is True
+
+
+def test_auto_publish_defaults_to_off():
+    from core.config import Settings
+
+    assert Settings.model_fields["blog_auto_publish"].default is False
 
 
 @pytest.mark.parametrize(
