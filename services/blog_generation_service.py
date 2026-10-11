@@ -244,6 +244,8 @@ class BlogGenerationService:
             await self._log_failure(trigger_source, topic_tag=None, error=f"Unexpected error: {type(exc).__name__}")
             raise BlogGenerationError(f"Unexpected error: {type(exc).__name__}") from exc
 
+        if not post.is_published:
+            outcome = "drafted"
         self.last_outcome_detail = _OUTCOME_DETAILS[outcome]
         try:
             await self._logs.create(
@@ -267,6 +269,15 @@ class BlogGenerationService:
             topic_tag,
             post.word_count,
         )
+        if outcome == "drafted":
+            # Nothing public changed, so no rebuild - the editor's publish
+            # through the admin API triggers it (BlogService.update).
+            try:
+                await self._email.send_blog_draft_notification(post.title or "Untitled post", post.slug)
+            except Exception:
+                logger.error("Blog draft %s was saved but the review notification email failed to send", post.id, exc_info=True)
+            return post
+
         # The frontend pre-renders blog pages at build time, so nothing is
         # visible (or re-crawlable) until it rebuilds. trigger() never raises.
         await self._deploy_hook.trigger(f"blog post {outcome}: {post.slug}")
@@ -442,7 +453,8 @@ class BlogGenerationService:
         word_count = _word_count(content)
         if word_count < MIN_WORDS:
             # Not blocked - the admin API flags short posts for expansion.
-            logger.warning("Publishing a short post: %s words (recommended minimum %s)", word_count, MIN_WORDS)
+            logger.warning("Generated a short post: %s words (recommended minimum %s)", word_count, MIN_WORDS)
+        auto_publish = self._settings.blog_auto_publish
 
         excerpt = _strip_hashtags(_clean_str(data.get("excerpt"))) or _derive_excerpt(content)
 
@@ -482,8 +494,9 @@ class BlogGenerationService:
             "tags": tags,
             "topic_tag": topic_tag,
             "word_count": word_count,
-            "is_published": True,
-            "published_at": datetime.now(timezone.utc),
+            # A draft gets its published_at when an editor publishes it.
+            "is_published": auto_publish,
+            "published_at": datetime.now(timezone.utc) if auto_publish else None,
             # Posts are permanent - expires_at is only ever set by hand.
             "expires_at": None,
         }
@@ -521,6 +534,7 @@ class BlogGenerationService:
 
 _OUTCOME_DETAILS = {
     "created": "Blog post generated and published",
+    "drafted": "Blog post generated as an unpublished draft - review and fact-check it, then publish it from the admin panel",
 }
 
 

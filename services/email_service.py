@@ -151,6 +151,23 @@ class EmailService:
         sent, _detail = await self._send(self._settings.blog_publish_notification_email, subject, body)
         return sent
 
+    async def send_blog_draft_notification(self, title: str, slug: str) -> bool:
+        """Best-effort "a generated draft is waiting for review" ping - never
+        raises. Goes to the same recipient as the published notification."""
+        if not self._settings.blog_publish_notification_email:
+            logger.warning("Skipping blog-draft notification: no recipient configured")
+            return False
+        admin_url = f"{self._settings.frontend_base_url.rstrip('/')}/admin/blog"
+        subject = f"Blog draft ready for review: {title}"
+        body = (
+            f'A new blog draft was generated: "{title}" (slug: {slug})\n\n'
+            "It is NOT live. Before publishing, check every claim, example and figure, "
+            "add first-hand detail where you can, and remove anything you cannot verify.\n\n"
+            f"Review and publish it here: {admin_url}"
+        )
+        sent, _detail = await self._send(self._settings.blog_publish_notification_email, subject, body)
+        return sent
+
     async def send_plan_email(self, to_address: str, project_type: str, pdf_bytes: bytes) -> bool:
         subject = f"Your WebNest Studio project plan - {project_type}"
         body = "Attached is your week-by-week project plan from WebNest Studio. Reply to this email anytime with questions."
