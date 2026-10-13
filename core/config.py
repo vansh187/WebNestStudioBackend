@@ -119,6 +119,14 @@ class Settings(BaseSettings):
     coding_project_limit_per_user: int = 100
     coding_project_source_limit_bytes: int = 262144
 
+    # Push notifications (chat messages, new blog posts) via Firebase Cloud
+    # Messaging. Paste the full service-account JSON key of the Firebase
+    # project the Android app's google-services.json belongs to. Empty =
+    # push is off and every send is a logged no-op.
+    firebase_service_account_json: str = ""
+    # FCM topic every app install subscribes to for "new blog post" pushes.
+    push_blog_topic: str = "blog"
+
     # Java 17 playground: a private Cloud Run service that only accepts calls
     # carrying a Google ID token minted for exactly java_playground_url.
     # java_playground_invoker_key is the full service-account JSON key pasted

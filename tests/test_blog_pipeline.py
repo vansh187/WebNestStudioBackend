@@ -128,6 +128,15 @@ class FakeHook:
         return True
 
 
+class FakePush:
+    def __init__(self):
+        self.blog_slugs: list[str] = []
+
+    async def notify_blog_published(self, post) -> bool:
+        self.blog_slugs.append(post.slug)
+        return True
+
+
 class FakeLLM:
     def __init__(self, *drafts: dict):
         self._drafts = list(drafts)
@@ -168,6 +177,7 @@ def make_generator(posts, *drafts, auto_publish=True):
     service._llm = FakeLLM(*drafts)
     service._email = FakeEmail()
     service._deploy_hook = FakeHook()
+    service._push = FakePush()
     service.last_outcome_detail = ""
     return service
 
@@ -177,6 +187,7 @@ def make_blog_service(posts):
     service._blog_posts = FakeBlogs(posts)
     service._settings = None
     service._deploy_hook = FakeHook()
+    service._push = FakePush()
     return service
 
 

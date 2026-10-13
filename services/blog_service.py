@@ -9,6 +9,7 @@ from core.exceptions import BadRequestError, ConflictError, NotFoundError
 from database.blog_persistence import BlogPersistence
 from database.models import BlogPost
 from services.deploy_hook_service import DeployHookService
+from services.push_service import PushService
 
 _WORD_PATTERN = re.compile(r"\S+")
 
@@ -28,6 +29,7 @@ class BlogService:
         self._blog_posts = BlogPersistence(session)
         self._settings = settings
         self._deploy_hook = DeployHookService(settings)
+        self._push = PushService(settings)
 
     async def list_published(self, tag: str | None = None) -> list[BlogPost]:
         return await self._blog_posts.list_published(tag=tag)
@@ -68,6 +70,7 @@ class BlogService:
         post = await self._blog_posts.create(**fields)
         if post.is_published:
             await self._deploy_hook.trigger(f"post published: {post.slug}")
+            await self._push.notify_blog_published(post)
         return post
 
     async def update(self, post_id: uuid.UUID, **fields) -> BlogPost:
@@ -85,6 +88,7 @@ class BlogService:
             raise BadRequestError("The slug of a post that has been published cannot be changed")
 
         was_published = post.is_published
+        had_been_published = post.published_at is not None
         is_publishing = fields.get("is_published") is True and not was_published
         if is_publishing:
             if fields.get("published_at") is None and post.published_at is None:
@@ -106,6 +110,10 @@ class BlogService:
         if was_published or post.is_published:
             action = "unpublished" if was_published and not post.is_published else "updated"
             await self._deploy_hook.trigger(f"post {action}: {post.slug}")
+        if is_publishing and post.is_published and not had_been_published:
+            # Only the first time a post goes live - not on every edit, and
+            # not when an unpublished post is put back.
+            await self._push.notify_blog_published(post)
         return post
 
     async def delete(self, post_id: uuid.UUID) -> None:

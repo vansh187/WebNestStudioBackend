@@ -14,6 +14,7 @@ from database.blog_generation_log_persistence import BlogGenerationLogPersistenc
 from database.blog_persistence import BlogPersistence
 from database.models import BlogGenerationLog, BlogPost
 from services.deploy_hook_service import DeployHookService
+from services.push_service import PushService
 from services.email_service import EmailService
 from services.llm_provider import GenerationFailedError, LLMProvider
 
@@ -186,6 +187,7 @@ class BlogGenerationService:
         self._llm = LLMProvider(settings)
         self._email = EmailService(settings)
         self._deploy_hook = DeployHookService(settings)
+        self._push = PushService(settings)
         # Human-readable result of the last successful generate_and_publish
         # call, for the admin "Generate now" response.
         self.last_outcome_detail = ""
@@ -283,6 +285,7 @@ class BlogGenerationService:
         await self._deploy_hook.trigger(f"blog post {outcome}: {post.slug}")
 
         if outcome == "created":
+            await self._push.notify_blog_published(post)  # never raises
             try:
                 await self._email.send_blog_published_notification(post.title or "Untitled post", post.slug)
             except Exception:

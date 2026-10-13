@@ -809,13 +809,19 @@ class MessagingService:
         }
 
     def _preview(self, body: str | None, attachments: list[dict]) -> str | None:
-        if body:
-            return _truncate(body, PREVIEW_LENGTH)
-        if attachments:
-            first = attachments[0].get("name") or "attachment"
-            extra = len(attachments) - 1
-            return f"\U0001f4ce {first}" + (f" +{extra}" if extra > 0 else "")
-        return None
+        return message_preview(body, attachments)
+
+
+def message_preview(body: str | None, attachments: list[dict] | None) -> str | None:
+    """One-line summary of a message: the conversation list's last-message
+    line, and the text of its push notification."""
+    if body:
+        return _truncate(body, PREVIEW_LENGTH)
+    if attachments:
+        first = attachments[0].get("name") or "attachment"
+        extra = len(attachments) - 1
+        return f"\U0001f4ce {first}" + (f" +{extra}" if extra > 0 else "")
+    return None
 
 
 def _coerce_int(value: object) -> int:

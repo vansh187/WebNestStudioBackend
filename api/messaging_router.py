@@ -1,8 +1,8 @@
 import uuid
 
-from fastapi import APIRouter, Depends, Path, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query, Response, status
 
-from core.dependencies import get_current_user, get_messaging_service
+from core.dependencies import container, get_current_user, get_messaging_service
 from database.models import User
 from schemas.messaging_schemas import (
     AddParticipantsRequest,
@@ -23,6 +23,7 @@ from schemas.messaging_schemas import (
     SignUploadResponse,
 )
 from services.messaging_service import MessagingService
+from services.push_service import notify_new_chat_message
 
 router = APIRouter(prefix="/api/messaging", tags=["messaging"])
 
@@ -127,16 +128,28 @@ async def list_messages(
 async def send_message(
     conversation_id: uuid.UUID,
     payload: SendMessageRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     messaging: MessagingService = Depends(get_messaging_service),
 ) -> MessageOut:
-    return await messaging.send_message(
+    message = await messaging.send_message(
         current_user,
         conversation_id,
         payload.body,
         payload.reply_to_message_id,
         payload.attachments,
     )
+    # Pushing to the other members' phones is a slow, best-effort network
+    # call - it runs after the response, never delaying the sender.
+    background_tasks.add_task(
+        notify_new_chat_message,
+        container.database,
+        container.settings,
+        conversation_id,
+        message.id,
+        current_user.id,
+    )
+    return message
 
 
 @router.post(
