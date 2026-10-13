@@ -15,6 +15,7 @@ from api.codelab_router import admin_router as codelab_admin_router
 from api.codelab_router import router as codelab_router
 from api.coding_router import router as coding_router
 from api.content_router import router as content_router
+from api.devices_router import router as devices_router
 from api.generation_router import router as generation_router
 from api.home_router import router as home_router
 from api.java_playground_router import router as java_playground_router
@@ -113,6 +114,7 @@ class WebNestStudioApp:
             home_router,
             admin_router,
             client_router,
+            devices_router,
             sitemap_router,
             generation_router,
             chat_router,

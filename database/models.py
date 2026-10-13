@@ -55,6 +55,21 @@ class RefreshToken(Base):
     user: Mapped["User"] = relationship(back_populates="refresh_tokens")
 
 
+class DeviceToken(Base):
+    """An FCM registration token for one installed app on one device. A token
+    belongs to whoever last registered it (signing into a shared phone moves
+    it), and is dropped on logout or when FCM reports it unregistered."""
+
+    __tablename__ = "device_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False, server_default="android")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class OtpVerification(Base):
     __tablename__ = "otp_verifications"
 
