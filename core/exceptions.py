@@ -63,3 +63,15 @@ class ContentRejectedError(DomainError):
 
 class GenerationUnavailableError(DomainError):
     """Raised when every configured LLM provider failed to produce a result."""
+
+
+class GitHubError(DomainError):
+    """A CodeLab GitHub sync failure with the contract's machine-readable
+    `code` (GITHUB_INTEGRATION_BACKEND.md section 2). `extra` fields are merged
+    into the response body, e.g. retry_after or remote_commit_sha."""
+
+    def __init__(self, status_code: int, code: str | None, message: str, **extra) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.extra = extra

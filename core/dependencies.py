@@ -23,6 +23,7 @@ from services.learning_service import LearningService
 from services.email_service import EmailService
 from services.faq_service import FaqService
 from services.generation_service import GenerationService
+from services.github_service import GitHubService
 from services.java_playground_service import JavaPlaygroundService
 from services.lead_service import LeadService
 from services.messaging_service import MessagingService
@@ -140,6 +141,10 @@ def get_codelab_generation_service(session: AsyncSession = Depends(get_db_sessio
 
 def get_learning_service(session: AsyncSession = Depends(get_db_session)) -> LearningService:
     return LearningService(session=session)
+
+
+def get_github_service(session: AsyncSession = Depends(get_db_session)) -> GitHubService:
+    return GitHubService(session=session, settings=container.settings)
 
 
 def get_plan_pdf_service() -> PlanPdfService:

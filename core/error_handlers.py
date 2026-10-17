@@ -15,6 +15,7 @@ from core.exceptions import (
     ExternalServiceError,
     ForbiddenError,
     GenerationUnavailableError,
+    GitHubError,
     InvalidPromptError,
     NotFoundError,
     PayloadTooLargeError,
@@ -57,8 +58,27 @@ def register_error_handlers(app: FastAPI) -> None:
 
         app.add_exception_handler(exception_type, _make_domain_handler(status_code))
 
+    @app.exception_handler(GitHubError)
+    async def _github_exception_handler(request: Request, exc: GitHubError) -> JSONResponse:
+        content: dict = {"detail": exc.message}
+        if exc.code:
+            content["code"] = exc.code
+        content.update(exc.extra)
+        headers = {}
+        if "retry_after" in exc.extra:
+            headers["Retry-After"] = str(exc.extra["retry_after"])
+        return JSONResponse(status_code=exc.status_code, content=content, headers=headers)
+
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> Response:
+        if request.url.path.startswith("/api/github/"):
+            # GitHub sync contract: {loc, msg} only - never echo the input,
+            # which for a commit is whole file contents.
+            errors = [
+                {"loc": list(error.get("loc", ())), "msg": str(error.get("msg", "")).removeprefix("Value error, ")}
+                for error in exc.errors()
+            ]
+            return JSONResponse(status_code=422, content={"detail": "Request validation failed", "errors": errors})
         # exc.errors() may embed a raw exception object under ctx.error (from a
         # raised ValueError inside a validator) which json.dumps cannot serialize.
         safe_errors = []
