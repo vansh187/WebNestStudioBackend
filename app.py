@@ -16,6 +16,7 @@ from api.codelab_router import router as codelab_router
 from api.coding_router import router as coding_router
 from api.content_router import router as content_router
 from api.generation_router import router as generation_router
+from api.github_router import router as github_router
 from api.home_router import router as home_router
 from api.java_playground_router import router as java_playground_router
 from api.leads_router import router as leads_router
@@ -28,6 +29,7 @@ from api.users_router import router as users_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
+from core.request_limits import GitHubBodyLimitMiddleware
 from services.blog_scheduler import register_blog_jobs
 from services.codelab_scheduler import register_codelab_jobs
 
@@ -96,6 +98,8 @@ class WebNestStudioApp:
         register_error_handlers(self.instance)
 
     def _configure_middleware(self) -> None:
+        # Added before CORS so CORS wraps it and its 413 still reaches the browser.
+        self.instance.add_middleware(GitHubBodyLimitMiddleware)
         self.instance.add_middleware(
             CORSMiddleware,
             allow_origins=container.settings.cors_origin_list,
@@ -122,6 +126,7 @@ class WebNestStudioApp:
             codelab_admin_router,
             learning_router,
             learning_admin_router,
+            github_router,
             messaging_router,
             users_router,
         ):

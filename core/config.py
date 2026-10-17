@@ -143,6 +143,25 @@ class Settings(BaseSettings):
     chat_storage_bucket: str = "chat-attachments"
     chat_max_attachment_mb: int = 25
 
+    # CodeLab GitHub sync: a GitHub OAuth App (Settings > Developer settings >
+    # OAuth Apps). Its callback URL must equal github_oauth_redirect_uri, which
+    # defaults to <frontend_base_url>/codelab/github/callback. Left blank, the
+    # /api/github OAuth endpoints answer 502 github_unavailable.
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_oauth_redirect_uri: str = ""
+    # Fernet key (Fernet.generate_key()) encrypting stored GitHub tokens. When
+    # blank, a key is derived from jwt_secret_key - rotating that secret then
+    # just asks every learner to reconnect GitHub.
+    github_token_encryption_key: str = ""
+    github_api_timeout_seconds: float = 20.0
+
+    @property
+    def github_redirect_uri(self) -> str:
+        return self.github_oauth_redirect_uri.strip() or (
+            self.frontend_base_url.rstrip("/") + "/codelab/github/callback"
+        )
+
     @property
     def async_database_url(self) -> str:
         raw = self.supabase_url.strip()
