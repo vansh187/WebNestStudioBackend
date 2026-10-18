@@ -44,7 +44,7 @@ def settings(**overrides):
         exam_duplicate_jaccard=0.8, exam_duplicate_cosine=0.9, exam_duplicate_cosine_same_lesson=0.85,
         exam_code_run_daily_limit=150, exam_max_per_concept=2, exam_max_serves=0, exam_reports_to_quarantine=2,
         gemini_daily_request_limit=0, gemini_daily_token_limit=0, groq_daily_request_limit=0, groq_daily_token_limit=0,
-        gemini_model="gemini-x", groq_model="groq-x",
+        gemini_model="gemini-x", groq_model="groq-x", exam_enabled=False, exam_auto_exclude="",
         certificate_verify_base_url="https://www.webneststudio.co.in/certificates",
     )  # fmt: skip
     values.update(overrides)
@@ -125,6 +125,7 @@ class Courses:
         self.modules: dict[uuid.UUID, list[ModuleRecord]] = {}
         self.lessons: dict[uuid.UUID, list[LessonRecord]] = {}
         self.ready_marked: list[uuid.UUID] = []
+        self.materials: dict = {}
         self.fail_mark_ready = False
 
     def add(self, slug="java-core", code="JAVA", enabled=True, ready=True, status="published", module_lessons=(2, 1)):
@@ -159,10 +160,11 @@ class Courses:
     async def list_lessons(self, course_id):
         return list(self.lessons.get(course_id, []))
 
-    async def set_exam_settings(self, course_id, enabled, exam_code):
+    async def set_exam_settings(self, course_id, enabled, exam_code, admin_disabled=None):
         for slug, c in self.courses.items():
             if c.id == course_id:
-                self.courses[slug] = replace(c, exam_enabled=enabled, exam_code=exam_code)
+                flag = c.exam_admin_disabled if admin_disabled is None else admin_disabled
+                self.courses[slug] = replace(c, exam_enabled=enabled, exam_code=exam_code, exam_admin_disabled=flag)
 
     async def mark_ready(self, course_id, now):
         if self.fail_mark_ready:
@@ -174,6 +176,15 @@ class Courses:
 
     async def list_enabled_courses(self):
         return [c for c in self.courses.values() if c.exam_enabled]
+
+    async def list_published_courses(self):
+        return [c for c in self.courses.values() if c.status == "published"]
+
+    async def used_exam_codes(self):
+        return {c.exam_code for c in self.courses.values() if c.exam_code}
+
+    async def lesson_materials(self, course_id):
+        return list(self.materials.get(course_id, []))
 
 
 class Progress:

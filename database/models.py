@@ -793,6 +793,9 @@ class Course(Base):
     # Set the first time every module reached its pool share; once set, the
     # exam stays visible while the pool can still supply a full draw.
     exam_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # An admin switched this course's exam off: automatic exams
+    # (EXAM_ENABLED) leave it off until an admin switches it on again.
+    exam_admin_disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

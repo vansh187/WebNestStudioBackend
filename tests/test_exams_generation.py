@@ -9,6 +9,7 @@ import json
 import math
 import random
 import re
+import uuid
 
 import pytest
 
@@ -386,3 +387,56 @@ def test_manual_question_admin_views_enable_and_context(gen):
         quota = client.get("/api/admin/learning/exams/quota", headers=headers).json()["models"]
         assert {m["provider"] for m in quota} == {"gemini", "groq"}
         assert client.get("/api/admin/learning/exam-questions/summary?course=java-core").status_code == 401
+
+
+def test_fully_automatic_exam_with_no_admin_steps(gen, monkeypatch):
+    """EXAM_ENABLED=true: no context upload and no admin call. The fill job
+    switches the course on, builds context from the lesson text in the
+    database, fills the pool, and the exam opens for a learner at 100%."""
+    h, clock, course, _ = gen
+    run(h.execute("update courses set exam_enabled = false, exam_code = null, exam_ready_at = null"))
+    for module in course["modules"]:
+        for lesson in module["lessons"]:
+            body = (f"<h2>{lesson['key']}</h2><p>The javac compiler of {lesson['key']} turns source into bytecode. "
+                    "The JVM verifies bytecode before running it.</p>"
+                    f"<ul><li>The javac compiler of {lesson['key']} turns source into bytecode</li></ul>")  # fmt: skip
+            run(h.execute("update lessons set content = cast(:c as jsonb) where id = :i",
+                          c=json.dumps({"format": "html", "body": body}), i=lesson["id"]))  # fmt: skip
+    h.settings.exam_enabled = True
+    llm = FakeLlm()
+
+    async def switch_on():
+        async with h.sessions() as session:
+            return await ExamServices(session, h.settings).auto_exam_service().enable_all()
+
+    assert [c.slug for c in run(switch_on())] == ["java-core"]
+    job = run_job(h, llm, clock)
+    assert job.status == "done", job.errors
+    assert run(h.scalar("select exam_code from courses where slug = 'java-core'")) == "JAVA"
+    sources = {r[0] for r in run(h.rows("select context->>'source' from exam_module_context"))}
+    assert sources == {"auto"}, "built from the lessons - no upload was needed"
+    run(h.add_user("auto"))
+    with h.client() as client:
+        assert client.get("/api/learning/courses/java-core/exam").json()["enabled"] is True
+        refused = client.post("/api/learning/courses/java-core/exam/attempts", json={"recipient_name": "Auto Learner"}, headers={"X-Test-User": "auto"})
+        assert refused.status_code == 409 and refused.json()["reason"] == "lessons_incomplete"
+        run(h.complete_all_lessons(h.users["auto"], course))
+        started = client.post("/api/learning/courses/java-core/exam/attempts", json={"recipient_name": "Auto Learner"}, headers={"X-Test-User": "auto"})
+        assert started.status_code == 201 and len(started.json()["questions"]) == 10
+
+
+
+def test_only_published_quiz_prompts_are_avoided(gen):
+    h, _, course, _ = gen
+    lesson = course["modules"][0]["lessons"][0]
+    for status, prompt in (("published", "Public quiz prompt about javac"), ("draft", "Unpublished draft prompt")):
+        quiz_id = uuid.uuid4()
+        run(h.execute("insert into quizzes (id, lesson_id, title, status) values (:i, :l, 'q', :s)", i=quiz_id, l=lesson["id"], s=status))
+        run(h.execute("insert into quiz_questions (quiz_id, prompt) values (:q, :p)", q=quiz_id, p=prompt))
+
+    async def materials():
+        async with h.sessions() as session:
+            return await ExamServices(session, h.settings).courses.lesson_materials(course["id"])
+
+    prompts = {p for m in run(materials()) for p in m.quiz_prompts}
+    assert prompts == {"Public quiz prompt about javac"}

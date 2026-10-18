@@ -4,6 +4,7 @@ session and catches everything: a failing job is logged, never fatal."""
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -15,6 +16,8 @@ from exams.dependencies import ExamServices
 from services.blog_scheduler import IST
 
 logger = logging.getLogger("webnest.exams.jobs")
+
+FIRST_FILL_DELAY = timedelta(minutes=2)
 
 # One refill per course per process at a time (the database also allows only
 # one running job per course).
@@ -54,6 +57,21 @@ async def expire_overdue_attempts(database: Database, settings: Settings) -> Non
 
 async def fill_pools(database: Database, settings: Settings) -> None:
     try:
+        if settings.exam_enabled:
+            # Automatic exams: switch on every published course, then pick up
+            # lesson changes (re-grounding questions they no longer support),
+            # even for courses whose pool is already full.
+            async with database.session_scope() as session:
+                services = ExamServices(session, settings)
+                await services.auto_exam_service().enable_all()
+                provider = services.context_provider()
+                for course in await services.courses.list_enabled_courses():
+                    try:
+                        await provider.refresh(course)
+                        await services.uow.commit()
+                    except Exception:
+                        await services.uow.rollback()
+                        logger.error("Could not refresh the lesson material of %s", course.slug, exc_info=True)
         async with database.session_scope() as session:
             due = await ExamServices(session, settings).maintenance_service().courses_needing_fill()
         for course in due:
@@ -93,8 +111,14 @@ def register_exam_jobs(scheduler: AsyncIOScheduler, database: Database, settings
         misfire_grace_time=6 * 3600, **common,
     )  # fmt: skip
     if settings.exam_generation_enabled:
+        # First run shortly after startup, so a fresh deploy doesn't wait 30 minutes.
         scheduler.add_job(
-            fill_pools, trigger=IntervalTrigger(minutes=30), id="exam_fill_pools", misfire_grace_time=900, **common
+            fill_pools, trigger=IntervalTrigger(minutes=30), id="exam_fill_pools", misfire_grace_time=900,
+            next_run_time=datetime.now(timezone.utc) + FIRST_FILL_DELAY, **common,
+        )  # fmt: skip
+    elif settings.exam_enabled:
+        logger.warning(
+            "EXAM_ENABLED is true but EXAM_GENERATION_ENABLED is false: exams can't get questions, so none will appear"
         )
     else:
         logger.info("Exam pool refills are disabled (exam_generation_enabled=false)")

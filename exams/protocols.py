@@ -16,6 +16,7 @@ from exams.records import (
     DedupeRow,
     GenerationLogEntry,
     JobRecord,
+    LessonMaterial,
     LessonRecord,
     ModuleContextRecord,
     ModuleRecord,
@@ -70,11 +71,21 @@ class CourseReader(Protocol):
 
     async def list_lessons(self, course_id: uuid.UUID) -> list[LessonRecord]: ...
 
-    async def set_exam_settings(self, course_id: uuid.UUID, enabled: bool, exam_code: str | None) -> None: ...
+    async def set_exam_settings(
+        self, course_id: uuid.UUID, enabled: bool, exam_code: str | None, admin_disabled: bool | None = None
+    ) -> None:
+        """admin_disabled None = leave the admin flag as it is."""
 
     async def mark_ready(self, course_id: uuid.UUID, now: datetime) -> None: ...
 
     async def list_enabled_courses(self) -> list[CourseRecord]: ...
+
+    async def list_published_courses(self) -> list[CourseRecord]: ...
+
+    async def used_exam_codes(self) -> set[str]: ...
+
+    async def lesson_materials(self, course_id: uuid.UUID) -> list[LessonMaterial]:
+        """Published lessons with their content and public quiz prompts."""
 
 
 class ProgressReader(Protocol):

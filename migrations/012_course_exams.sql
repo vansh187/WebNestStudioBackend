@@ -12,6 +12,7 @@
 ALTER TABLE courses ADD COLUMN IF NOT EXISTS exam_code text;
 ALTER TABLE courses ADD COLUMN IF NOT EXISTS exam_enabled boolean NOT NULL DEFAULT false;
 ALTER TABLE courses ADD COLUMN IF NOT EXISTS exam_ready_at timestamptz;
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS exam_admin_disabled boolean NOT NULL DEFAULT false;
 ALTER TABLE course_modules ADD COLUMN IF NOT EXISTS key text;
 ALTER TABLE lessons ADD COLUMN IF NOT EXISTS key text;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_courses_exam_code ON courses (exam_code);

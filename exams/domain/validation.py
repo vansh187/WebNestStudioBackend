@@ -181,7 +181,8 @@ def context_passages(context: dict) -> list[str]:
     for lesson in context.get("lessons") or []:
         if not isinstance(lesson, dict):
             continue
-        for value in (lesson.get("title"), lesson.get("summary")):
+        # "text" = the whole lesson, present on contexts built from the lessons.
+        for value in (lesson.get("title"), lesson.get("summary"), lesson.get("text")):
             if isinstance(value, str) and value.strip():
                 passages.extend(p for p in _SENTENCE_SPLIT.split(value) if p.strip())
         for point in lesson.get("key_points") or []:

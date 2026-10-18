@@ -16,6 +16,7 @@ class CourseRecord:
     exam_code: str | None
     exam_enabled: bool
     exam_ready_at: datetime | None
+    exam_admin_disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,18 @@ class ModuleRecord:
     title: str
     display_order: int
     published_lessons: int
+
+
+@dataclass(frozen=True)
+class LessonMaterial:
+    """A published lesson's text, used to build exam context automatically."""
+
+    lesson_id: uuid.UUID
+    key: str | None
+    module_id: uuid.UUID
+    title: str
+    content: dict | None
+    quiz_prompts: list[str]
 
 
 @dataclass(frozen=True)

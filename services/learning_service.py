@@ -711,10 +711,10 @@ class LearningService:
                         estimated_minutes=lesson.estimated_minutes,
                         practice_problem_slugs=practice.get(lesson.id, []),
                     )
-                    for lesson in sorted(module.lessons or [], key=lambda l: l.display_order)
+                    for lesson in sorted(module.lessons or [], key=lambda l: (l.display_order, str(l.id)))
                 ],
             )
-            for module in sorted(course.modules, key=lambda m: m.display_order)
+            for module in sorted(course.modules, key=lambda m: (m.display_order, str(m.id)))
         ]
 
         return AdminCourseResponse(
