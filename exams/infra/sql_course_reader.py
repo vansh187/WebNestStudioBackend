@@ -8,10 +8,10 @@ from sqlalchemy.orm import aliased
 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from database.models import Course, CourseModule, Lesson, UserLessonProgress
+from database.models import Course, CourseModule, Lesson, Quiz, QuizQuestion, UserLessonProgress
 from exams.errors import ExamConflict, ExamStoreUnavailable
 from exams.infra.sql_base import SqlStore, constraint_name
-from exams.records import CourseRecord, LessonRecord, ModuleRecord
+from exams.records import CourseRecord, LessonMaterial, LessonRecord, ModuleRecord
 
 _COURSE_COLUMNS = (
     Course.id,
@@ -21,6 +21,7 @@ _COURSE_COLUMNS = (
     Course.exam_code,
     Course.exam_enabled,
     Course.exam_ready_at,
+    Course.exam_admin_disabled,
 )
 
 
@@ -33,6 +34,7 @@ def _course(row) -> CourseRecord:
         exam_code=row.exam_code,
         exam_enabled=bool(row.exam_enabled),
         exam_ready_at=row.exam_ready_at,
+        exam_admin_disabled=bool(row.exam_admin_disabled),
     )
 
 
@@ -78,11 +80,14 @@ class SqlCourseReader(SqlStore):
             for r in result.all()
         ]
 
-    async def set_exam_settings(self, course_id: uuid.UUID, enabled: bool, exam_code: str | None) -> None:
+    async def set_exam_settings(
+        self, course_id: uuid.UUID, enabled: bool, exam_code: str | None, admin_disabled: bool | None = None
+    ) -> None:
+        values = {"exam_enabled": enabled, "exam_code": exam_code}
+        if admin_disabled is not None:
+            values["exam_admin_disabled"] = admin_disabled
         try:
-            await self._session.execute(
-                update(Course).where(Course.id == course_id).values(exam_enabled=enabled, exam_code=exam_code)
-            )
+            await self._session.execute(update(Course).where(Course.id == course_id).values(**values))
         except IntegrityError as exc:
             if "uq_courses_exam_code" in constraint_name(exc):
                 raise ExamConflict("This exam code is already used by another course.") from exc
@@ -95,6 +100,46 @@ class SqlCourseReader(SqlStore):
             update(Course).where(Course.id == course_id, Course.exam_ready_at.is_(None)).values(exam_ready_at=now),
             "mark exam ready",
         )
+
+    async def list_published_courses(self) -> list[CourseRecord]:
+        result = await self._execute(
+            select(*_COURSE_COLUMNS).where(Course.status == "published").order_by(Course.display_order),
+            "list published courses",
+        )
+        return [_course(row) for row in result.all()]
+
+    async def used_exam_codes(self) -> set[str]:
+        result = await self._execute(select(Course.exam_code).where(Course.exam_code.is_not(None)), "list exam codes")
+        return set(result.scalars().all())
+
+    async def lesson_materials(self, course_id: uuid.UUID) -> list[LessonMaterial]:
+        lessons = (
+            await self._execute(
+                select(Lesson.id, Lesson.key, Lesson.module_id, Lesson.title, Lesson.content)
+                .where(Lesson.course_id == course_id, Lesson.status == "published")
+                .order_by(Lesson.display_order),
+                "load lesson materials",
+            )
+        ).all()
+        prompts: dict = {}
+        if lessons:
+            rows = (
+                await self._execute(
+                    select(Quiz.lesson_id, QuizQuestion.prompt)
+                    .join(QuizQuestion, QuizQuestion.quiz_id == Quiz.id)
+                    .where(Quiz.lesson_id.in_([row[0] for row in lessons]), Quiz.status == "published"),
+                    "load lesson quiz prompts",
+                )
+            ).all()
+            for lesson_id, prompt in rows:
+                prompts.setdefault(lesson_id, []).append(prompt)
+        return [
+            LessonMaterial(
+                lesson_id=row[0], key=row[1], module_id=row[2], title=row[3],
+                content=row[4] if isinstance(row[4], dict) else None, quiz_prompts=prompts.get(row[0], []),
+            )  # fmt: skip
+            for row in lessons
+        ]
 
     async def list_enabled_courses(self) -> list[CourseRecord]:
         result = await self._execute(

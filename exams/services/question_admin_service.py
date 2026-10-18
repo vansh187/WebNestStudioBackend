@@ -1,7 +1,5 @@
 """Admin pool management (contract section 7, plan 6.7-6.8)."""
 
-import hashlib
-import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -9,7 +7,6 @@ from datetime import timedelta
 
 from exams.domain.certificate_id import EXAM_CODE_PATTERN, EXAM_CODE_RULE
 from exams.domain.grading import regrade
-from exams.domain.validation import context_passages, is_grounded
 from exams.errors import (
     CourseNotFound,
     DuplicateQuestion,
@@ -34,6 +31,7 @@ from exams.services.certificate_service import CertificateService
 from exams.services.common import audit, guarded
 from exams.services.generation_prompts import parse_draft_item
 from exams.services.generation_service import store_candidates
+from exams.services.context_provider import ModuleContextProvider, context_hash
 from exams.services.pool_service import PoolService
 from exams.services.verification import Candidate, VerificationPipeline
 
@@ -54,10 +52,6 @@ class ImportResult:
     rejected: list[dict] = field(default_factory=list)
 
 
-def context_hash(context: dict) -> str:
-    return hashlib.sha256(json.dumps(context, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-
-
 class QuestionAdminService:
     def __init__(
         self,
@@ -74,7 +68,9 @@ class QuestionAdminService:
         uow: UnitOfWork,
         clock: Clock,
         settings,
+        context_provider: ModuleContextProvider | None = None,
     ) -> None:
+        self._context_provider = context_provider or ModuleContextProvider(courses, contexts, questions, clock, settings)
         self._courses = courses
         self._questions = questions
         self._attempts = attempts
@@ -126,7 +122,9 @@ class QuestionAdminService:
             raise ExamValidationError("code is required to enable the exam")
         try:
             async with self._uow.savepoint():
-                await self._courses.set_exam_settings(course.id, enabled, new_code)
+                # Remembered so automatic exams (EXAM_ENABLED) never switch a
+                # course back on that an admin turned off.
+                await self._courses.set_exam_settings(course.id, enabled, new_code, admin_disabled=not enabled)
             await self._uow.commit()
         except Exception:
             await self._uow.rollback()
@@ -160,7 +158,7 @@ class QuestionAdminService:
                 await self._contexts.upsert(module_id, course.id, module, digest, now)
                 updated += 1
                 if previous is not None:
-                    quarantined += await self._reground(module_id, module)
+                    quarantined += await self._context_provider.reground(module_id, module)
             await self._uow.commit()
         except Exception:
             await self._uow.rollback()
@@ -168,18 +166,6 @@ class QuestionAdminService:
         if quarantined:
             logger.warning("Context change for course %s quarantined %d questions", course.slug, quarantined)
         return {"updated": updated, "unchanged": unchanged, "quarantined": quarantined}
-
-    async def _reground(self, module_id: uuid.UUID, context: dict) -> int:
-        """Plan 6.2: a rewritten lesson re-runs the grounding check on its
-        module's live questions; those that no longer match are quarantined."""
-        passages = context_passages(context)
-        stale = [
-            q.id for q in await self._questions.live_by_module(module_id)
-            if q.source_fact and not is_grounded(q.source_fact, passages)
-        ]  # fmt: skip
-        if stale:
-            await self._questions.set_status(stale, "quarantined", ("live",))
-        return len(stale)
 
     # ------------------------------------------------------------------ #
     # Pool views
@@ -258,8 +244,10 @@ class QuestionAdminService:
     # ------------------------------------------------------------------ #
     # Create / import / edit
     # ------------------------------------------------------------------ #
-    async def _contexts_for(self, course_id: uuid.UUID) -> dict[uuid.UUID, dict]:
-        return {m: c.context for m, c in (await self._contexts.get_many(course_id)).items()}
+    async def _contexts_for(self, course: CourseRecord) -> dict[uuid.UUID, dict]:
+        # The same material the refill job grounds against (uploaded, else
+        # built from the lessons when EXAM_ENABLED is on).
+        return await self._context_provider.contexts(course)
 
     @guarded("create question")
     async def create_manual(self, payload: dict, admin_id: uuid.UUID) -> dict:
@@ -272,7 +260,7 @@ class QuestionAdminService:
         draft = parse_draft_item(payload)
         candidate = Candidate(line=1, draft=draft, expected_module_id=expected_module)
         await self._pipeline.verify(
-            course, await self._courses.list_lessons(course.id), await self._contexts_for(course.id), [candidate], mode="manual"
+            course, await self._courses.list_lessons(course.id), await self._contexts_for(course), [candidate], mode="manual"
         )
         if candidate.status == "invalid":
             await self._uow.rollback()
@@ -305,7 +293,7 @@ class QuestionAdminService:
                 continue
             refs, _ = await self._module_ref_map(course.id)
             lessons = await self._courses.list_lessons(course.id)
-            contexts = await self._contexts_for(course.id)
+            contexts = await self._contexts_for(course)
             candidates: list[Candidate] = []
             for line, item in entries:
                 module_ref = item.get("module_id")
@@ -366,7 +354,7 @@ class QuestionAdminService:
             merged.update({k: v for k, v in changes.items() if k in CONTENT_FIELDS and v is not None})
             candidate = Candidate(line=1, draft=parse_draft_item(merged))
             await self._pipeline.verify(
-                course, await self._courses.list_lessons(course.id), await self._contexts_for(course.id),
+                course, await self._courses.list_lessons(course.id), await self._contexts_for(course),
                 [candidate], mode="manual", exclude_id=q.id,
             )  # fmt: skip
             if candidate.status == "invalid":

@@ -37,6 +37,11 @@ COLUMN_STEPS: tuple[tuple[str, str, str], ...] = (
         "ALTER TABLE courses ADD COLUMN IF NOT EXISTS exam_enabled boolean NOT NULL DEFAULT false",
     ),
     ("courses", "exam_ready_at", "ALTER TABLE courses ADD COLUMN IF NOT EXISTS exam_ready_at timestamptz"),
+    (
+        "courses",
+        "exam_admin_disabled",
+        "ALTER TABLE courses ADD COLUMN IF NOT EXISTS exam_admin_disabled boolean NOT NULL DEFAULT false",
+    ),
     ("course_modules", "key", "ALTER TABLE course_modules ADD COLUMN IF NOT EXISTS key text"),
     ("lessons", "key", "ALTER TABLE lessons ADD COLUMN IF NOT EXISTS key text"),
 )

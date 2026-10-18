@@ -157,6 +157,13 @@ class Settings(BaseSettings):
     github_api_timeout_seconds: float = 20.0
 
     # Course final exams and certificates (COURSE_EXAMS_BACKEND_PLAN.md section 8).
+    # True = fully automatic exams: every published course gets its exam
+    # switched on (exam code assigned, questions generated from the lesson
+    # content in the database, no admin steps). Each learner can take it once
+    # they complete 100% of the course. A course an admin switched off stays off.
+    exam_enabled: bool = False
+    # Comma-separated course slugs kept off while exam_enabled is true.
+    exam_auto_exclude: str = ""
     exam_question_count: int = 30
     exam_duration_minutes: int = 60
     exam_pass_percent: int = 70

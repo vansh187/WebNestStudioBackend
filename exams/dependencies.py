@@ -32,7 +32,9 @@ from exams.infra.system import (
 )
 from exams.services.attempt_lifecycle import AttemptLifecycle
 from exams.services.attempt_service import AttemptService
+from exams.services.auto_exam_service import AutoExamService
 from exams.services.certificate_service import CertificateService, PdfCache
+from exams.services.context_provider import ModuleContextProvider
 from exams.services.eligibility_service import EligibilityService
 from exams.services.generation_service import GenerationService
 from exams.services.maintenance_service import MaintenanceService
@@ -92,17 +94,23 @@ class ExamServices:
             clock, random.SystemRandom(), self.settings,
         )  # fmt: skip
 
+    def context_provider(self) -> ModuleContextProvider:
+        return ModuleContextProvider(self.courses, self.contexts, self.questions, clock, self.settings)
+
     def admin_service(self) -> QuestionAdminService:
         return QuestionAdminService(
             self.courses, self.questions, self.attempts, self.reports, self.contexts, self.jobs, self.logs,
-            self.pool, self.pipeline(), self.certificates, self.uow, clock, self.settings,
+            self.pool, self.pipeline(), self.certificates, self.uow, clock, self.settings, self.context_provider(),
         )  # fmt: skip
 
     def generation_service(self) -> GenerationService:
         return GenerationService(
             self.courses, self.questions, self.contexts, self.jobs, self.pool, self.pipeline(), self.llm,
-            self.uow, clock, self.settings,
+            self.uow, clock, self.settings, self.context_provider(),
         )  # fmt: skip
+
+    def auto_exam_service(self) -> AutoExamService:
+        return AutoExamService(self.courses, self.uow, self.settings)
 
     def maintenance_service(self) -> MaintenanceService:
         return MaintenanceService(

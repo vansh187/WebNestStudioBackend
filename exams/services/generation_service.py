@@ -28,6 +28,7 @@ from exams.services.generation_prompts import (
     parse_draft_item,
     parse_draft_reply,
 )
+from exams.services.context_provider import ModuleContextProvider
 from exams.services.pool_service import PoolService
 from exams.services.verification import Candidate, QuotaPause, VerificationPipeline
 from exams.domain.validation import DraftQuestion
@@ -117,10 +118,12 @@ class GenerationService:
         uow: UnitOfWork,
         clock: Clock,
         settings,
+        context_provider: ModuleContextProvider | None = None,
     ) -> None:
         self._courses = courses
         self._questions = questions
         self._contexts = contexts
+        self._context_provider = context_provider or ModuleContextProvider(courses, contexts, questions, clock, settings)
         self._jobs = jobs
         self._pool = pool
         self._pipeline = pipeline
@@ -194,7 +197,10 @@ class GenerationService:
 
     async def _fill(self, course: CourseRecord, job: JobRecord) -> None:
         state = await self._pool.state(course.id)
-        contexts = {m: c.context for m, c in (await self._contexts.get_many(course.id)).items()}
+        if await self._context_provider.refresh(course):
+            state = await self._pool.state(course.id)  # quarantines opened gaps
+        await self._uow.commit()
+        contexts = await self.module_contexts(course)
         lessons = await self._courses.list_lessons(course.id)
         modules = {m.id: m for m in state.modules}
         job.progress = {
@@ -297,6 +303,9 @@ class GenerationService:
             logger.info(
                 "Refill %s module %s: +%d live, %d rejected (%d/%d)", job.id, label, created, rejected, live, target
             )
+
+    async def module_contexts(self, course: CourseRecord) -> dict[uuid.UUID, dict]:
+        return await self._context_provider.contexts(course)
 
     async def _update_done(self, course_id: uuid.UUID, targets: dict, job: JobRecord) -> None:
         live = await self._questions.live_counts(course_id)
