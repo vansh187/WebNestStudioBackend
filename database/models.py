@@ -726,7 +726,10 @@ class CodelabGenerationLog(Base):
 
 class Course(Base):
     __tablename__ = "courses"
-    __table_args__ = (CheckConstraint("status in ('draft','published','archived')", name="ck_course_status"),)
+    __table_args__ = (
+        CheckConstraint("status in ('draft','published','archived')", name="ck_course_status"),
+        UniqueConstraint("exam_code", name="uq_courses_exam_code"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
     slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
@@ -735,6 +738,13 @@ class Course(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft", index=True)
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Final exam (COURSE_EXAMS_CERTIFICATES.md). These columns are added to an
+    # existing database by exams/schema_upgrade.py before create_all runs.
+    exam_code: Mapped[str | None] = mapped_column(Text)
+    exam_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Set the first time every module reached its pool share; once set, the
+    # exam stays visible while the pool can still supply a full draw.
+    exam_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -745,11 +755,20 @@ class Course(Base):
 
 class CourseModule(Base):
     __tablename__ = "course_modules"
+    __table_args__ = (
+        # Backs the composite foreign key that keeps an exam question inside
+        # its own course (exam_questions.course_id, module_id).
+        UniqueConstraint("course_id", "id", name="uq_course_modules_course_id_id"),
+        UniqueConstraint("course_id", "key", name="uq_course_modules_course_key"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
     course_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # The site's stable module id (e.g. mod_java_core_java_basics). Null only
+    # on rows created before keys existed.
+    key: Mapped[str | None] = mapped_column(Text)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="published")
@@ -763,7 +782,13 @@ class CourseModule(Base):
 
 class Lesson(Base):
     __tablename__ = "lessons"
-    __table_args__ = (CheckConstraint("status in ('draft','published','archived')", name="ck_lesson_status"),)
+    __table_args__ = (
+        CheckConstraint("status in ('draft','published','archived')", name="ck_lesson_status"),
+        # Backs the composite foreign key exam_questions(module_id, lesson_id).
+        UniqueConstraint("module_id", "id", name="uq_lessons_module_id_id"),
+        UniqueConstraint("course_id", "key", name="uq_lessons_course_key"),
+        Index("ix_lessons_key", "key"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
     module_id: Mapped[uuid.UUID] = mapped_column(
@@ -773,6 +798,9 @@ class Lesson(Base):
     course_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # The site's stable lesson id (e.g. lesson_java_core_variables), unique
+    # within a course; the same key may appear in two courses (aliases).
+    key: Mapped[str | None] = mapped_column(Text)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[dict | None] = mapped_column(JSONB)             # {format:"html", body:"..."}
     resources: Mapped[list | None] = mapped_column(JSONB)          # list[{type,language,content,...}]

@@ -256,10 +256,30 @@ class LearningService:
     # ------------------------------------------------------------------ #
     # Lessons
     # ------------------------------------------------------------------ #
-    async def get_lesson(self, user: User | None, lesson_id: uuid.UUID) -> LessonDetailResponse:
-        lesson = await self._learning.get_lesson(lesson_id)
-        if lesson is None:
+    async def _resolve_lessons(self, identifier: str | uuid.UUID, course_slug: str | None = None) -> list[Lesson]:
+        """Every published lesson with this UUID or site key (a key shared by
+        two courses resolves to all of them). The lesson of `course_slug` -
+        the course the learner is in - comes first; without it, course order.
+        Raises NotFoundError when none."""
+        lessons = await self._learning.resolve_lessons(str(identifier).strip()[:200])
+        if not lessons:
             raise NotFoundError("Lesson not found")
+        if course_slug:
+            lessons.sort(key=lambda lesson: not (lesson.course is not None and lesson.course.slug == course_slug))
+        return lessons
+
+    def _targets(self, lessons: list[Lesson], course_slug: str | None) -> list[Lesson]:
+        """Rows a per-user write goes to: the hinted course's lesson only, or -
+        with no hint - every alias, so it shows in whichever course the
+        learner opens next."""
+        if course_slug and lessons[0].course is not None and lessons[0].course.slug == course_slug:
+            return lessons[:1]
+        return lessons
+
+    async def get_lesson(
+        self, user: User | None, lesson_id: str | uuid.UUID, course_slug: str | None = None
+    ) -> LessonDetailResponse:
+        lesson = (await self._resolve_lessons(lesson_id, course_slug))[0]
 
         progress_row = bookmark_row = note_row = None
         if user is not None:
@@ -283,6 +303,7 @@ class LearningService:
 
         return LessonDetailResponse(
             id=lesson.id,
+            key=lesson.key,
             course_slug=lesson.course.slug if lesson.course else "",
             module_id=lesson.module_id,
             title=lesson.title,
@@ -300,12 +321,27 @@ class LearningService:
         )
 
     async def update_lesson_progress(
-        self, user: User, lesson_id: uuid.UUID, payload: LessonProgressUpdateRequest
+        self, user: User, lesson_id: str | uuid.UUID, payload: LessonProgressUpdateRequest, course_slug: str | None = None
     ) -> LessonProgressUpdateResponse:
-        lesson = await self._learning.get_lesson(lesson_id)
-        if lesson is None:
-            raise NotFoundError("Lesson not found")
+        lessons = await self._resolve_lessons(lesson_id, course_slug)
+        # A key shared by several courses counts as completed in every one of
+        # them (contract rule 10). Time spent, the streak and the response
+        # belong to the learner's actual action, so they count once - on the
+        # primary lesson (the hinted course, else the first by course order).
+        primary, aliases = lessons[0], lessons[1:]
+        response, newly = await self._update_one_lesson(user, primary, payload, payload.time_spent_seconds)
+        for alias in aliases:
+            _, alias_newly = await self._update_one_lesson(user, alias, payload, 0)
+            newly = newly or alias_newly
+        if newly:
+            await self._codelab.touch_streak(user.id, datetime.now(timezone.utc).date())
+        _, next_lesson = await self._neighbours(primary.course_id, primary.id)
+        response.next_lesson = _lesson_link(next_lesson)
+        return response
 
+    async def _update_one_lesson(
+        self, user: User, lesson: Lesson, payload: LessonProgressUpdateRequest, add_time_seconds: int
+    ) -> tuple[LessonProgressUpdateResponse, bool]:
         existing = await self._learning.get_lesson_progress(user.id, lesson.id)
         was_completed = existing is not None and existing.status == "completed"
 
@@ -328,13 +364,10 @@ class LearningService:
             lesson.id,
             status,
             percent,
-            payload.time_spent_seconds,
+            add_time_seconds,
             touch_updated_at=not (was_completed and status == "completed"),
         )
         course_percent = await self._learning.recompute_course_progress(user.id, lesson.course_id)
-        if newly_completed:
-            await self._codelab.touch_streak(user.id, datetime.now(timezone.utc).date())
-        _, next_lesson = await self._neighbours(lesson.course_id, lesson.id)
 
         return LessonProgressUpdateResponse(
             lesson_id=lesson.id,
@@ -344,17 +377,52 @@ class LearningService:
             newly_completed=newly_completed,
             course_slug=lesson.course.slug if lesson.course else "",
             course_completion_percent=course_percent,
-            next_lesson=_lesson_link(next_lesson),
+        ), newly_completed
+
+    async def bulk_progress(self, user: User, entries: list[tuple[str, str, int]]) -> tuple[int, list[str]]:
+        """(accepted, unknown refs). Entries are (lesson id or key, status,
+        percent). Never downgrades; every alias of a key is updated."""
+        refs = list(dict.fromkeys(ref.strip() for ref, _, _ in entries if ref.strip()))
+        rows = await self._learning.published_lessons_by_refs(refs)
+        by_ref: dict[str, list[tuple[uuid.UUID, uuid.UUID]]] = {}
+        for lesson_id, key, course_id in rows:
+            by_ref.setdefault(str(lesson_id), []).append((lesson_id, course_id))
+            if key:
+                by_ref.setdefault(key, []).append((lesson_id, course_id))
+        rank = {"not_started": 0, "in_progress": 1, "completed": 2}
+        merged: dict[uuid.UUID, tuple[str, int]] = {}
+        courses: set[uuid.UUID] = set()
+        accepted, unknown = 0, []
+        for ref, status, percent in entries:
+            matches = by_ref.get(ref.strip())
+            if not matches:
+                unknown.append(ref)
+                continue
+            accepted += 1
+            for lesson_id, course_id in matches:
+                courses.add(course_id)
+                previous = merged.get(lesson_id)
+                if previous is None or (rank[status], percent) > (rank[previous[0]], previous[1]):
+                    merged[lesson_id] = (status, percent)
+        before = await self._learning.lesson_progress_map(user.id, list(merged))
+        newly_completed = any(
+            status == "completed" and (lesson_id not in before or before[lesson_id].status != "completed")
+            for lesson_id, (status, _) in merged.items()
         )
+        await self._learning.bulk_upsert_progress(user.id, merged)
+        if newly_completed:
+            # Same streak rule as a single "Mark complete".
+            await self._codelab.touch_streak(user.id, datetime.now(timezone.utc).date())
+        for course_id in courses:
+            await self._learning.recompute_course_progress(user.id, course_id)
+        return accepted, list(dict.fromkeys(unknown))
 
     async def set_bookmark(
-        self, user: User, lesson_id: uuid.UUID, bookmarked: bool
+        self, user: User, lesson_id: str | uuid.UUID, bookmarked: bool, course_slug: str | None = None
     ) -> LessonBookmarkResponse:
-        lesson = await self._learning.get_lesson(lesson_id)
-        if lesson is None:
-            raise NotFoundError("Lesson not found")
-        row = await self._learning.upsert_bookmark(user.id, lesson.id, bookmarked)
-        return LessonBookmarkResponse(lesson_id=lesson.id, bookmarked=bool(row.bookmarked))
+        lessons = await self._resolve_lessons(lesson_id, course_slug)
+        rows = [await self._learning.upsert_bookmark(user.id, lesson.id, bookmarked) for lesson in self._targets(lessons, course_slug)]
+        return LessonBookmarkResponse(lesson_id=lessons[0].id, bookmarked=bool(rows[0].bookmarked))
 
     async def list_bookmarks(self, user: User, course_slug: str | None = None) -> BookmarkListResponse:
         course_id = None
@@ -381,12 +449,12 @@ class LearningService:
             ]
         )
 
-    async def set_note(self, user: User, lesson_id: uuid.UUID, note: str) -> LessonNoteResponse:
-        lesson = await self._learning.get_lesson(lesson_id)
-        if lesson is None:
-            raise NotFoundError("Lesson not found")
-        row = await self._learning.upsert_note(user.id, lesson.id, note)
-        return LessonNoteResponse(lesson_id=lesson.id, note=row.note, updated_at=row.updated_at)
+    async def set_note(
+        self, user: User, lesson_id: str | uuid.UUID, note: str, course_slug: str | None = None
+    ) -> LessonNoteResponse:
+        lessons = await self._resolve_lessons(lesson_id, course_slug)
+        rows = [await self._learning.upsert_note(user.id, lesson.id, note) for lesson in self._targets(lessons, course_slug)]
+        return LessonNoteResponse(lesson_id=lessons[0].id, note=rows[0].note, updated_at=rows[0].updated_at)
 
     # ------------------------------------------------------------------ #
     # Quizzes
@@ -574,6 +642,7 @@ class LearningService:
             )
 
         course_fields = {
+            **({"exam_code": payload.exam_code} if payload.exam_code else {}),
             "slug": payload.slug,
             "title": payload.title,
             "level": payload.level,
@@ -584,12 +653,14 @@ class LearningService:
         modules = [
             {
                 "id": module.id,
+                "key": module.key,
                 "title": module.title,
                 "display_order": module.display_order,
                 "status": module.status,
                 "lessons": [
                     {
                         "id": lesson.id,
+                        "key": lesson.key,
                         "title": lesson.title,
                         "content": (lesson.content.model_dump() if lesson.content else None),
                         "resources": lesson.resources,
@@ -626,12 +697,14 @@ class LearningService:
         modules = [
             AdminCourseModuleView(
                 id=module.id,
+                key=module.key,
                 title=module.title,
                 display_order=module.display_order,
                 status=module.status,
                 lessons=[
                     AdminCourseLessonView(
                         id=lesson.id,
+                        key=lesson.key,
                         title=lesson.title,
                         display_order=lesson.display_order,
                         status=lesson.status,
@@ -652,6 +725,8 @@ class LearningService:
             description=course.description,
             status=course.status,
             display_order=course.display_order,
+            exam_code=course.exam_code,
+            exam_enabled=bool(course.exam_enabled),
             modules=modules,
             created_at=course.created_at,
             updated_at=course.updated_at,

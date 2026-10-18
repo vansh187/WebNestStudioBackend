@@ -2,7 +2,9 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from exams.domain.certificate_id import EXAM_CODE_PATTERN, EXAM_CODE_RULE
 
 # --------------------------------------------------------------------------- #
 # Courses
@@ -96,6 +98,7 @@ class LessonProgressView(BaseModel):
 
 class LessonDetailResponse(BaseModel):
     id: uuid.UUID
+    key: str | None = None
     course_slug: str
     module_id: uuid.UUID
     title: str
@@ -249,8 +252,13 @@ class LearningDashboardResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 # Admin - courses / modules / lessons
 # --------------------------------------------------------------------------- #
+_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$"
+
+
 class AdminLessonInput(BaseModel):
     id: uuid.UUID | None = None
+    # The site's stable lesson key; upserts match on it (COURSE_EXAMS_CERTIFICATES.md section 1).
+    key: str | None = Field(default=None, max_length=200, pattern=_KEY_PATTERN)
     title: str = Field(min_length=1, max_length=200)
     content: LessonContent | None = None
     resources: list[dict] = Field(default_factory=list, max_length=50)
@@ -262,6 +270,7 @@ class AdminLessonInput(BaseModel):
 
 class AdminModuleInput(BaseModel):
     id: uuid.UUID | None = None
+    key: str | None = Field(default=None, max_length=200, pattern=_KEY_PATTERN)
     title: str = Field(min_length=1, max_length=200)
     display_order: int = Field(default=0, ge=0)
     status: Literal["draft", "published"] = "published"
@@ -276,6 +285,28 @@ class AdminCourseUpsertRequest(BaseModel):
     status: Literal["draft", "published", "archived"] = "draft"
     display_order: int = Field(default=0, ge=0)
     modules: list[AdminModuleInput] = Field(default_factory=list, max_length=100)
+    # Short code for certificate IDs (JAVA, PY, ...). Omitted = keep the current one.
+    exam_code: str | None = Field(default=None, max_length=12)
+
+    @field_validator("exam_code")
+    @classmethod
+    def _clean_exam_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().upper()
+        if not EXAM_CODE_PATTERN.fullmatch(value):
+            raise ValueError(EXAM_CODE_RULE)
+        return value
+
+    @model_validator(mode="after")
+    def _unique_keys(self):
+        module_keys = [m.key for m in self.modules if m.key]
+        lesson_keys = [l.key for m in self.modules for l in m.lessons if l.key]
+        if len(module_keys) != len(set(module_keys)):
+            raise ValueError("module keys must be unique within a course")
+        if len(lesson_keys) != len(set(lesson_keys)):
+            raise ValueError("lesson keys must be unique within a course")
+        return self
 
     @field_validator("slug")
     @classmethod
@@ -288,6 +319,7 @@ class AdminCourseUpsertRequest(BaseModel):
 
 class AdminCourseModuleView(BaseModel):
     id: uuid.UUID
+    key: str | None = None
     title: str
     display_order: int
     status: str
@@ -296,6 +328,7 @@ class AdminCourseModuleView(BaseModel):
 
 class AdminCourseLessonView(BaseModel):
     id: uuid.UUID
+    key: str | None = None
     title: str
     display_order: int
     status: str
@@ -311,6 +344,8 @@ class AdminCourseResponse(BaseModel):
     description: str
     status: str
     display_order: int
+    exam_code: str | None = None
+    exam_enabled: bool = False
     modules: list[AdminCourseModuleView]
     created_at: datetime
     updated_at: datetime
