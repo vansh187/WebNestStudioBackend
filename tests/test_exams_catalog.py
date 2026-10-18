@@ -41,7 +41,7 @@ def test_first_keyed_sync_adopts_legacy_rows_and_keeps_progress(h):
             {"title": "Java Basics", "lessons": [{"title": "Variables", "status": "published"}, {"title": "Loops", "status": "published"}]},
         ]), headers=ADMIN)  # fmt: skip
         assert legacy.status_code == 200, legacy.text
-        old_lesson = legacy.json()["modules"][0]["lessons"][0]
+        old_lesson = next(l for l in legacy.json()["modules"][0]["lessons"] if l["title"] == "Variables")
         run(h.add_user("learner"))
         run(h.execute(
             "insert into user_lesson_progress (user_id, lesson_id, status, completed_percent) values (:u, :l, 'completed', 100)",
@@ -57,8 +57,8 @@ def test_first_keyed_sync_adopts_legacy_rows_and_keeps_progress(h):
         assert keyed.status_code == 200, keyed.text
         body = keyed.json()
         assert body["exam_code"] == "JAVA"
-        lessons = body["modules"][0]["lessons"]
-        assert lessons[0]["id"] == old_lesson["id"] and lessons[0]["key"] == "lesson_variables"
+        variables = next(l for l in body["modules"][0]["lessons"] if l["title"] == "Variables")
+        assert variables["id"] == old_lesson["id"] and variables["key"] == "lesson_variables"
         assert run(h.scalar("select count(*) from lessons")) == 2
         progress = client.put("/api/learning/lessons/lesson_variables/progress",
                               json={"status": "in_progress", "completed_percent": 10}, headers={"X-Test-User": "learner"})  # fmt: skip
