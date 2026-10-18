@@ -22,6 +22,7 @@ from api.home_router import router as home_router
 from api.java_playground_router import router as java_playground_router
 from api.leads_router import router as leads_router
 from api.learning_router import admin_router as learning_admin_router
+from api.learning_router import progress_router as learning_progress_router
 from api.learning_router import router as learning_router
 from api.messaging_router import router as messaging_router
 from api.newsletter_router import router as newsletter_router
@@ -31,6 +32,12 @@ from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
 from core.request_limits import GitHubBodyLimitMiddleware
+from exams import models as exam_models  # noqa: F401 - registers the exam tables for create_all
+from exams.jobs import register_exam_jobs
+from exams.router_admin import router as exam_admin_router
+from exams.router_learner import router as exam_learner_router
+from exams.router_public import router as exam_public_router
+from exams.schema_upgrade import SchemaUpgradeError, upgrade_schema
 from services.blog_scheduler import register_blog_jobs
 from services.codelab_scheduler import register_codelab_jobs
 
@@ -45,6 +52,15 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        # Must run before create_all: it adds the exam columns/keys to existing
+        # tables that the new ORM models and exam foreign keys rely on. If it
+        # fails, startup fails and Render keeps the previous deploy serving.
+        await upgrade_schema(container.database.engine)
+    except SchemaUpgradeError:
+        logger.critical("Could not bring the database schema up to date for course exams", exc_info=True)
+        raise
+
     try:
         await container.database.create_all()
     except SQLAlchemyError:
@@ -68,6 +84,11 @@ async def lifespan(app: FastAPI):
         register_codelab_jobs(container.scheduler, container.database, container.settings)
     except Exception:
         logger.critical("Could not register the CodeLab generation job", exc_info=True)
+
+    try:
+        register_exam_jobs(container.scheduler, container.database, container.settings)
+    except Exception:
+        logger.critical("Could not register the course exam jobs", exc_info=True)
 
     yield
 
@@ -128,6 +149,10 @@ class WebNestStudioApp:
             codelab_admin_router,
             learning_router,
             learning_admin_router,
+            learning_progress_router,
+            exam_learner_router,
+            exam_public_router,
+            exam_admin_router,
             github_router,
             messaging_router,
             users_router,

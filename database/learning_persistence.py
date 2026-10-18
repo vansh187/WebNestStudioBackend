@@ -1,11 +1,14 @@
+import logging
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
 
+from core.exceptions import ConflictError, DatabaseError
 from database.base_persistence import BasePersistence
 from database.models import (
     CodelabProblemProgress,
@@ -20,6 +23,12 @@ from database.models import (
     UserLessonNote,
     UserLessonProgress,
 )
+
+
+UPSERT_CONFLICT_MESSAGE = "This course conflicts with existing data (duplicate slug, exam code or module/lesson key)"
+
+
+logger = logging.getLogger("webnest.learning")
 
 
 def _as_uuid(value) -> uuid.UUID | None:
@@ -109,6 +118,82 @@ class LearningPersistence(BasePersistence):
             stmt = stmt.where(Lesson.status == "published")
         result = await self._execute(stmt)
         return result.scalar_one_or_none()
+
+    async def resolve_lessons(self, identifier: str, include_unpublished: bool = False) -> list[Lesson]:
+        """Lessons matching a UUID or a site lesson key. A key can appear in
+        more than one course (aliases), so this may return several lessons,
+        ordered by course display order."""
+        as_uuid = _as_uuid(identifier)
+        match = Lesson.id == as_uuid if as_uuid is not None else Lesson.key == str(identifier)
+        stmt = (
+            select(Lesson)
+            .join(Course, Course.id == Lesson.course_id)
+            .where(match)
+            .options(
+                selectinload(Lesson.course),
+                selectinload(Lesson.practice_links).selectinload(LessonProblemMap.problem),
+            )
+            .order_by(Course.display_order, Course.slug)
+        )
+        if not include_unpublished:
+            stmt = stmt.where(Lesson.status == "published")
+        result = await self._execute(stmt)
+        return list(result.scalars().unique().all())
+
+    async def published_lessons_by_refs(self, refs: list[str]) -> list[tuple[uuid.UUID, str | None, uuid.UUID]]:
+        """(lesson_id, key, course_id) for published lessons whose id or key is in refs."""
+        if not refs:
+            return []
+        uuids = [u for u in (_as_uuid(r) for r in refs) if u is not None]
+        keys = [r for r in refs if _as_uuid(r) is None]
+        conditions = []
+        if uuids:
+            conditions.append(Lesson.id.in_(uuids))
+        if keys:
+            conditions.append(Lesson.key.in_(keys))
+        result = await self._execute(
+            select(Lesson.id, Lesson.key, Lesson.course_id).where(Lesson.status == "published", or_(*conditions))
+        )
+        return [tuple(row) for row in result.all()]
+
+    async def bulk_upsert_progress(self, user_id: uuid.UUID, rows: dict[uuid.UUID, tuple[str, int]]) -> None:
+        """One statement for many lessons. Never downgrades: completed stays
+        completed (and keeps its completion time), percent only grows."""
+        if not rows:
+            return
+        now = datetime.now(timezone.utc)
+        values = [
+            {
+                "user_id": user_id,
+                "lesson_id": lesson_id,
+                "status": status,
+                "completed_percent": {"completed": 100, "not_started": 0}.get(status, max(0, min(percent, 99))),
+                "time_spent_seconds": 0,
+                "updated_at": now,
+            }
+            for lesson_id, (status, percent) in rows.items()
+        ]
+        insert_stmt = pg_insert(UserLessonProgress).values(values)
+        existing, incoming = UserLessonProgress, insert_stmt.excluded
+        either_completed = or_(existing.status == "completed", incoming.status == "completed")
+        new_status = case(
+            (either_completed, "completed"),
+            (or_(existing.status == "in_progress", incoming.status == "in_progress"), "in_progress"),
+            else_="not_started",
+        )
+        stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[UserLessonProgress.user_id, UserLessonProgress.lesson_id],
+            set_={
+                "status": new_status,
+                "completed_percent": case(
+                    (either_completed, 100),
+                    else_=func.greatest(existing.completed_percent, incoming.completed_percent),
+                ),
+                "updated_at": case((existing.status == "completed", existing.updated_at), else_=incoming.updated_at),
+            },
+        )
+        await self._execute(stmt)
+        await self._commit()
 
     async def lesson_progress_map(
         self, user_id: uuid.UUID, lesson_ids: list[uuid.UUID]
@@ -499,7 +584,7 @@ class LearningPersistence(BasePersistence):
         return await self._load_course_tree(slug=slug)
 
     async def _load_course_tree(
-        self, *, slug: str | None = None, course_id: uuid.UUID | None = None
+        self, *, slug: str | None = None, course_id: uuid.UUID | None = None, refresh: bool = False
     ) -> Course | None:
         """Fully eager-loaded course -> modules -> lessons -> practice_links so
         the admin upsert never triggers a lazy load in the async session."""
@@ -513,12 +598,42 @@ class LearningPersistence(BasePersistence):
             stmt = stmt.where(Course.id == course_id)
         else:
             stmt = stmt.where(Course.slug == str(slug))
+        if refresh:
+            # After an upsert the identity map still holds new modules whose
+            # lessons collection was created empty; reload it from the rows.
+            stmt = stmt.execution_options(populate_existing=True)
         result = await self._execute(stmt.limit(1))
         return result.scalars().first()
 
     async def upsert_course_tree(
         self, slug: str | None, course_fields: dict, modules: list[dict]
     ) -> Course:
+        """See _apply_course_tree. Any unique violation while flushing (a
+        duplicate exam code, or a key still held by a row the payload didn't
+        match) becomes a 409, never a raw database error."""
+        try:
+            course_id = await self._apply_course_tree(slug, course_fields, modules)
+        except IntegrityError as exc:
+            await self._session.rollback()
+            logger.warning("Course upsert violated a constraint: %s", exc.orig)
+            raise ConflictError(UPSERT_CONFLICT_MESSAGE) from exc
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            logger.error("Course upsert failed", exc_info=True)
+            raise DatabaseError("Could not save the course right now. Please try again shortly.") from exc
+        await self._commit(conflict_message=UPSERT_CONFLICT_MESSAGE)
+        reloaded = await self._load_course_tree(course_id=course_id, refresh=True)
+        if reloaded is None:
+            raise DatabaseError("Saved, but could not reload the course. Please retry your request.")
+        return reloaded
+
+    async def _apply_course_tree(self, slug: str | None, course_fields: dict, modules: list[dict]) -> uuid.UUID:
+        """Modules and lessons are matched by id, then by the site's `key`,
+        then - for rows created before keys existed (key is null) - by title,
+        so the first keyed sync adopts existing rows (and their learners'
+        progress) instead of duplicating them. A lesson may move between
+        modules. When the payload carries keys, keyed rows whose key is no
+        longer sent are archived (never deleted)."""
         target_slug = slug or course_fields.get("slug")
         course = await self._load_course_tree(slug=target_slug) if target_slug else None
 
@@ -533,25 +648,65 @@ class LearningPersistence(BasePersistence):
                 setattr(course, key, value)
             await self._session.flush()
 
-        existing_modules = {m.id: m for m in course.modules}
+        existing_modules = list(course.modules)
+        existing_lessons = [lesson for module in existing_modules for lesson in (module.lessons or [])]
+        modules_by_id = {m.id: m for m in existing_modules}
+        modules_by_key = {m.key: m for m in existing_modules if m.key}
+        lessons_by_id = {l.id: l for l in existing_lessons}
+        lessons_by_key = {l.key: l for l in existing_lessons if l.key}
+        new_lessons: set = set()
+        used_modules: set = set()
+        used_lessons: set = set()
+        # Keys are assigned in one pass at the end (see below), so swapping
+        # keys between rows in one payload never trips the unique index.
+        wanted_keys: list[tuple[object, str]] = []
+
+        def legacy_match(rows, title: str, used: set):
+            folded = (title or "").strip().casefold()
+            for row in rows:
+                if row.key is None and row.id not in used and (row.title or "").strip().casefold() == folded:
+                    return row
+            return None
+
+        sent_module_keys = {m.get("key") for m in modules if m.get("key")}
+        sent_lesson_keys = {l.get("key") for m in modules for l in m.get("lessons", []) if l.get("key")}
+
         for m_index, module_payload in enumerate(modules):
-            module = existing_modules.get(module_payload.get("id"))
-            new_module = module is None
-            if new_module:
+            module_key = module_payload.get("key")
+            module = modules_by_id.get(module_payload.get("id"))
+            if module is None and module_key:
+                module = modules_by_key.get(module_key)
+            if module is None:
+                module = legacy_match(existing_modules, module_payload["title"], used_modules)
+            if module is None:
                 module = CourseModule(course_id=course.id, lessons=[])
                 self._session.add(module)
+            if module_key:
+                wanted_keys.append((module, module_key))
             module.title = module_payload["title"]
             module.display_order = int(module_payload.get("display_order", m_index))
             module.status = module_payload.get("status", "published")
             await self._session.flush()
+            used_modules.add(module.id)
 
-            existing_lessons = {} if new_module else {l.id: l for l in (module.lessons or [])}
             for l_index, lesson_payload in enumerate(module_payload.get("lessons", [])):
-                lesson = existing_lessons.get(lesson_payload.get("id"))
+                lesson_key = lesson_payload.get("key")
+                lesson = lessons_by_id.get(lesson_payload.get("id"))
+                if lesson is None and lesson_key:
+                    lesson = lessons_by_key.get(lesson_key)
+                if lesson is None:
+                    candidates = [l for l in existing_lessons if l.module_id == module.id]
+                    lesson = legacy_match(candidates, lesson_payload["title"], used_lessons)
                 new_lesson = lesson is None
                 if new_lesson:
                     lesson = Lesson(module_id=module.id, course_id=course.id, practice_links=[])
                     self._session.add(lesson)
+                elif lesson.module_id != module.id:
+                    # Move through the relationship so the old module's
+                    # collection lets go of it (and delete-orphan never fires).
+                    lesson.module = module
+                if lesson_key:
+                    wanted_keys.append((lesson, lesson_key))
                 lesson.module_id = module.id
                 lesson.course_id = course.id
                 lesson.title = lesson_payload["title"]
@@ -561,13 +716,34 @@ class LearningPersistence(BasePersistence):
                 lesson.status = lesson_payload.get("status", "draft")
                 lesson.display_order = int(lesson_payload.get("display_order", l_index))
                 await self._session.flush()
+                used_lessons.add(lesson.id)
+                if new_lesson:
+                    new_lessons.add(lesson.id)
                 await self._set_lesson_practice(
-                    lesson, lesson_payload.get("practice_problem_ids") or [], new_lesson
+                    lesson, lesson_payload.get("practice_problem_ids") or [], lesson.id in new_lessons
                 )
 
-        await self._commit(conflict_message="A course with this slug already exists")
-        reloaded = await self._load_course_tree(course_id=course.id)
-        return reloaded if reloaded is not None else course
+        changing = [(row, key) for row, key in wanted_keys if row.key != key]
+        if changing:
+            for row, _ in changing:
+                row.key = None
+            await self._session.flush()
+            for row, key in changing:
+                row.key = key
+            await self._session.flush()
+
+        if sent_module_keys or sent_lesson_keys:
+            for module in existing_modules:
+                if module.key and module.id not in used_modules and module.key not in sent_module_keys:
+                    module.status = "archived"
+                    for lesson in module.lessons or []:
+                        if lesson.id not in used_lessons:
+                            lesson.status = "archived"
+            for lesson in existing_lessons:
+                if lesson.key and lesson.id not in used_lessons and lesson.key not in sent_lesson_keys:
+                    lesson.status = "archived"
+            await self._session.flush()
+        return course.id
 
     async def _set_lesson_practice(
         self, lesson: Lesson, problem_ids: list[uuid.UUID], is_new_lesson: bool = False

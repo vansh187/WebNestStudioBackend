@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -25,7 +26,21 @@ from core.exceptions import (
     ValidationError,
 )
 
+from exams.errors import ExamDomainError
+from exams.routing import ExamContractRoute
+
 logger = logging.getLogger("webnest.errors")
+
+def _is_exam_contract_route(request: Request) -> bool:
+    """Routes declared with ExamContractRoute (exams/routing.py) use the
+    course-exams 422 shape; FastAPI puts the matched route in the scope."""
+    return isinstance(request.scope.get("route"), ExamContractRoute)
+
+
+def _exam_validation_message(error: dict) -> str:
+    location = ".".join(str(part) for part in error.get("loc", ()) if part not in ("body", "query", "path"))
+    message = str(error.get("msg", "Invalid value")).removeprefix("Value error, ")
+    return f"{location}: {message}" if location else message
 
 _STATUS_BY_EXCEPTION = (
     (NotFoundError, 404),
@@ -69,8 +84,38 @@ def register_error_handlers(app: FastAPI) -> None:
             headers["Retry-After"] = str(exc.extra["retry_after"])
         return JSONResponse(status_code=exc.status_code, content=content, headers=headers)
 
+    @app.exception_handler(ExamDomainError)
+    async def _exam_exception_handler(request: Request, exc: ExamDomainError) -> JSONResponse:
+        content: dict = {"detail": exc.message, "code": exc.code}
+        for key, value in exc.extra.items():
+            # Same UTC "Z" form as response models (cooldown_until etc.).
+            if isinstance(value, datetime):
+                value = value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            content[key] = value
+        headers = {}
+        if exc.extra.get("retry_after") is not None:
+            headers["Retry-After"] = str(exc.extra["retry_after"])
+        return JSONResponse(status_code=exc.status_code, content=jsonable_encoder(content), headers=headers)
+
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> Response:
+        if _is_exam_contract_route(request):
+            # Never echo the input back (answers, names); detail is the first
+            # problem as a plain string.
+            raw_errors = list(exc.errors())
+            errors = [
+                {"loc": [str(part) for part in error.get("loc", ())], "msg": _exam_validation_message(error)}
+                for error in raw_errors
+            ]
+            detail = errors[0]["msg"] if errors else "Request validation failed"
+            content = {"detail": detail, "code": "validation_error", "errors": errors}
+            try:
+                return JSONResponse(status_code=422, content=content)
+            except UnicodeEncodeError:
+                # A lone UTF-16 surrogate in a location (e.g. a JSON key).
+                return Response(
+                    status_code=422, content=json.dumps(content, ensure_ascii=True), media_type="application/json"
+                )
         if request.url.path.startswith("/api/github/"):
             # GitHub sync contract: {loc, msg} only - never echo the input,
             # which for a commit is whole file contents.

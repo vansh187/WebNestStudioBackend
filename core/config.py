@@ -164,6 +164,45 @@ class Settings(BaseSettings):
     github_token_encryption_key: str = ""
     github_api_timeout_seconds: float = 20.0
 
+    # Course final exams and certificates (COURSE_EXAMS_BACKEND_PLAN.md section 8).
+    exam_question_count: int = 30
+    exam_duration_minutes: int = 60
+    exam_pass_percent: int = 70
+    exam_retake_hours: int = 24
+    exam_submit_grace_seconds: int = 30
+    # Network-latency allowance for the last autosave: a save that left the
+    # browser before the timer hit 0 but arrives a moment later is kept.
+    # Deliberately much shorter than the submit grace, so it can't be used to
+    # keep answering after time is up.
+    exam_save_grace_seconds: int = 5
+    # Fixed pool of live questions per course, shared across modules by lesson count.
+    exam_pool_target: int = 90
+    exam_pool_min_per_module: int = 3
+    exam_gen_batch_size: int = 5
+    # LLM calls per UTC day across all courses (drafting + cross-checks + embeddings).
+    exam_gen_daily_call_limit: int = 300
+    exam_checker_min_confidence: float = 0.8
+    exam_duplicate_jaccard: float = 0.8
+    exam_duplicate_cosine: float = 0.90
+    exam_duplicate_cosine_same_lesson: float = 0.85
+    # Java/JavaScript verification runs use the JDoodle credits the coding
+    # playground also spends (Python and SQL run locally and are not counted).
+    exam_code_run_daily_limit: int = 150
+    exam_ping_interval_seconds: int = 240
+    exam_max_per_concept: int = 2
+    # 0 = off. When set, a question served this many times is retired and replaced.
+    exam_max_serves: int = 0
+    exam_reports_to_quarantine: int = 2
+    # False stops the background pool refill job (local development).
+    exam_generation_enabled: bool = True
+    exam_embedding_model: str = "gemini-embedding-001"
+    # Provider quotas copied from Google AI Studio / the Groq console; 0 = unknown.
+    gemini_daily_token_limit: int = 0
+    gemini_daily_request_limit: int = 0
+    groq_daily_token_limit: int = 0
+    groq_daily_request_limit: int = 0
+    certificate_verify_base_url: str = "https://www.webneststudio.co.in/certificates"
+
     @property
     def github_redirect_uri(self) -> str:
         return self.github_oauth_redirect_uri.strip() or (
