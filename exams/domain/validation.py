@@ -29,8 +29,11 @@ _BANNED_OPTION_PATTERNS = (
     re.compile(r"\bboth\s+(of\s+)?(the\s+)?above\b", re.IGNORECASE),
     re.compile(r"\bneither\s+\(?[a-d]\)?\s+nor\s+\(?[a-d]\)?\b", re.IGNORECASE),
 )
-_CODE_FENCE = re.compile(r"```.*?(```|$)", re.DOTALL)
+_CODE_FENCE = re.compile(r"```.*?(?:```|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"`[^`\n]*`")
+# Splitting on this keeps code segments at odd indexes (outside code = even).
+_CODE_SEGMENTS = re.compile(f"({_CODE_FENCE.pattern}|{_INLINE_CODE.pattern})", re.DOTALL)
+_HAS_CODE = re.compile(r"```[^`]*\S[^`]*```|```.*\S|`[^`\n]*\S[^`\n]*`", re.DOTALL)
 _RAW_HTML = re.compile(
     r"<\s*/?\s*(script|iframe|style|img|a|div|span|p|br|hr|html|head|body|object|embed|svg|math|form|input|"
     r"button|textarea|select|link|meta|base|table|tr|td|th|video|audio|source|frame|frameset|details|summary)\b[^>]*>",
@@ -90,20 +93,70 @@ def strip_code(text: str) -> str:
     return _INLINE_CODE.sub(" ", _CODE_FENCE.sub(" ", text or ""))
 
 
-_ANY_TAG = re.compile(r"</?[A-Za-z!][^<>\n]{0,300}>")
-_CODE_SEGMENTS = re.compile(r"(```.*?(?:```|$)|`[^`\n]*`)", re.DOTALL)
+_HTML_ELEMENTS = (
+    "a abbr address area article aside audio b base bdi bdo blockquote body br button canvas caption cite code col "
+    "colgroup data datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form frame "
+    "frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label legend li link main map "
+    "mark menu meta meter nav noscript object ol optgroup option output p param picture pre progress q rp rt ruby s "
+    "samp script search section select slot small source span strong style sub summary sup svg path circle rect g "
+    "table tbody td template textarea tfoot th thead time title tr track u ul var video wbr math"
+)
+# A markup tag that a Markdown renderer would treat as HTML: a real element
+# name in any case (or a custom element with a hyphen), a capitalised JSX
+# component, a doctype or a comment. Opening tags must not be glued to a word,
+# so Java/TS generics such as Map<String, List<Integer>> and comparisons such
+# as a<b && c>d are left alone; closing tags may follow text (Hi</p>), since a
+# generic never starts with "</".
+_TAG_NAMES = r"(?i:" + "|".join(_HTML_ELEMENTS.split()) + r"|[a-z][a-z0-9]*-[a-z0-9-]+)\b"
+_JSX_NAME = r"[A-Z][A-Za-z0-9.]*"
+_ANY_TAG = re.compile(
+    r"</(?:" + _TAG_NAMES + "|" + _JSX_NAME + r")\s*>"
+    r"|(?<![\w<])<(?:!--.*?--|(?i:!DOCTYPE)[^<>\n]*"
+    r"|" + _TAG_NAMES + r"(?:\s[^<>\n]{0,300})?/?"
+    r"|" + _JSX_NAME + r"(?:\s[^<>\n]{0,300})?/?)>",
+    re.DOTALL,
+)
 
 
-def code_wrap_html(text: str) -> str:
-    """Turns raw HTML tags outside code into inline code, so a question about
-    `<!DOCTYPE html>` shows the tag literally instead of the page rendering
-    (or dropping) it. Text already in code spans or fences is untouched."""
+def _tags_outside_code(text: str) -> bool:
+    parts = _CODE_SEGMENTS.split(text)
+    return any(_ANY_TAG.search(parts[i]) for i in range(0, len(parts), 2))
+
+
+def _code_span(text: str) -> str:
+    """`text` as one inline code span, fenced with enough backticks."""
+    if "\n" in text:
+        return f"```\n{text}\n```"
+    run = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * (run + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def code_wrap_html(text: str, whole: bool = False) -> str:
+    """Shows raw HTML/JSX tags literally instead of letting the page render
+    (or drop) them. whole=True (answer options): if the text holds a tag
+    outside code, the whole text becomes ONE code span, so an option such as
+    <b>hi</b> stays exactly what a program printed. Otherwise (prose) each
+    tag becomes inline code. Text already in code spans or fences is untouched."""
     if not isinstance(text, str) or "<" not in text:
         return text
+    if whole:
+        stripped = text.strip()
+        if not _tags_outside_code(stripped):
+            return text
+        # Mixed code and markup in one option: show it all as one literal span.
+        return _code_span(stripped.replace("`", ""))
     parts = _CODE_SEGMENTS.split(text)
     for i in range(0, len(parts), 2):  # even indexes are outside code
-        parts[i] = _ANY_TAG.sub(lambda m: "`" + m.group(0) + "`" if "`" not in m.group(0) else m.group(0), parts[i])
+        parts[i] = _ANY_TAG.sub(lambda m: _code_span(m.group(0)), parts[i])
     return "".join(parts)
+
+
+def prompt_shows_code(prompt: str) -> bool:
+    """True when the prompt carries code a learner can read (a fenced block
+    or an inline code span with content)."""
+    return bool(_HAS_CODE.search(prompt or ""))
 
 
 def has_raw_html(text: str) -> bool:
@@ -119,16 +172,33 @@ def _option_plain(option: str) -> str:
     fenced = re.fullmatch(r"```[a-zA-Z0-9]*\s*\n?(.*?)\n?```", text, re.DOTALL)
     if fenced:
         return fenced.group(1)
-    if len(text) >= 2 and text.startswith("`") and text.endswith("`"):
-        return text.strip("`")
+    span = re.fullmatch(r"(`+)(.*?)\1", text, re.DOTALL)
+    if span:
+        inner = span.group(2)
+        # CommonMark: one leading and trailing space pad a span around backticks.
+        if len(inner) >= 2 and inner.startswith(" ") and inner.endswith(" ") and inner.strip():
+            inner = inner[1:-1]
+        return inner
     return text
+
+
+def _option_key(option: str) -> str:
+    """How a learner reads an option: Markdown markers (code backticks,
+    bold/italic) and spacing don't make two options different. Case and
+    punctuation do - in code they are the whole difference (True vs true,
+    rs.getLong(0) vs rs.getLong("0"), :focus vs ::focus)."""
+    text = _option_plain(option)
+    text = re.sub(r"`+|\*\*|__", "", text)
+    return " ".join(text.split())
 
 
 def option_as_output(option: str) -> str:
     return _option_plain(option)
 
 
-def check_shape(draft: DraftQuestion, require_rationale: bool, code_in_prompt_ok: bool = False) -> list[str]:
+def check_shape(
+    draft: DraftQuestion, require_rationale: bool, code_in_prompt_ok: bool = False, will_execute: bool = True
+) -> list[str]:
     """Plan 6.4 #1. Returns failure reasons; empty means it passed.
     code_in_prompt_ok (seed imports): a code question may show its code in the
     prompt instead of the `code` field; it then isn't executed."""
@@ -136,7 +206,8 @@ def check_shape(draft: DraftQuestion, require_rationale: bool, code_in_prompt_ok
     prompt = (draft.prompt or "").strip()
     if not prompt:
         problems.append("prompt is empty")
-    elif len(prompt) > MAX_PROMPT_CHARS:
+    elif len(strip_code(prompt).strip()) > MAX_PROMPT_CHARS:
+        # The question's prose; a code block shown with it has its own limit.
         problems.append(f"prompt is longer than {MAX_PROMPT_CHARS} characters")
     if has_raw_html(prompt):
         problems.append("prompt contains raw HTML")
@@ -150,9 +221,7 @@ def check_shape(draft: DraftQuestion, require_rationale: bool, code_in_prompt_ok
         problems.append("an option is empty")
     if any(len(o) > MAX_OPTION_CHARS for o in stripped):
         problems.append(f"an option is longer than {MAX_OPTION_CHARS} characters")
-    # Exact text (whitespace collapsed): in code, punctuation is the whole
-    # difference - rs.getLong(0) vs rs.getLong("0"), :focus vs ::focus.
-    if len({" ".join(o.split()) for o in stripped}) != 4:
+    if len({_option_key(o) for o in stripped}) != 4:
         problems.append("options are not distinct")
     if any(pattern.search(o) for o in stripped for pattern in _BANNED_OPTION_PATTERNS):
         problems.append("uses all/none of the above or a combined option")
@@ -184,13 +253,17 @@ def check_shape(draft: DraftQuestion, require_rationale: bool, code_in_prompt_ok
     if draft.source_fact is not None and len(draft.source_fact) > MAX_SOURCE_FACT_CHARS:
         problems.append("source_fact is too long")
     if draft.kind in CODE_KINDS and code_in_prompt_ok and not (draft.code or "").strip():
-        pass  # code shown in the prompt; checked by the deferred cross-check
+        # Seed import with the code shown in the prompt: there must really be
+        # code there, or the question can't be answered.
+        if not prompt_shows_code(prompt):
+            problems.append("code questions need code (none in the code field or the question)")
     elif draft.kind in CODE_KINDS:
         if not (draft.code or "").strip():
             problems.append("code questions need code")
         elif len(draft.code) > MAX_CODE_CHARS:
             problems.append("code is too long")
-        if draft.kind == "code_output" and not (draft.expected_output or "").strip():
+        if will_execute and draft.kind == "code_output" and not (draft.expected_output or "").strip():
+            # Compared with the real run; code that isn't run has nothing to compare.
             problems.append("code_output questions need expected_output")
     if draft.expected_output is not None and len(draft.expected_output) > MAX_EXPECTED_OUTPUT_CHARS:
         problems.append("expected_output is too long")

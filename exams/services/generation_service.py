@@ -345,8 +345,19 @@ class GenerationService:
         lessons = {l.id: l for l in await self._courses.list_lessons(course.id)}
         for _ in range(SEED_RECHECKS_PER_RUN):
             pending = await self._questions.unchecked_seed_questions(course.id, SEED_RECHECK_BATCH)
+            orphans = [q for q in pending if q.lesson_id not in lessons]
+            if orphans:
+                # Can never be checked against its lesson: take it out of draws
+                # and mark it, so the course isn't picked again every run.
+                for q in orphans:
+                    await self._questions.update(q.id, {"checks": {**(q.checks or {}), "checker": "unverifiable"}})
+                await self._questions.set_status([q.id for q in orphans], "quarantined", ("live",))
+                await self._save(job)
+                logger.warning("%d imported questions of %s have no lesson any more; quarantined", len(orphans), course.slug)
             pending = [q for q in pending if q.lesson_id in lessons]
             if not pending:
+                if orphans:
+                    continue
                 return
             candidates = [candidate_from_record(q, lessons[q.lesson_id]) for q in pending]
             await self._pipeline.check_existing(candidates, drafter, {"job_id": job.id, "course_id": course.id})

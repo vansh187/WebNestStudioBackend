@@ -419,3 +419,13 @@ def test_raw_html_is_turned_into_inline_code():
     assert code_wrap_html("a < b and b > c") == "a < b and b > c"
     assert code_wrap_html('<img src=x onerror="alert(1)">') == '`<img src=x onerror="alert(1)">`'
     assert not has_raw_html(code_wrap_html('<script>alert(1)</script> and <a href="javascript:x">'))
+
+
+def test_generics_and_comparisons_are_left_alone_by_tag_wrapping():
+    from exams.domain.validation import code_wrap_html
+
+    for text in ("Which compiles: Map<String, List<Integer>> m?", "if a<b && c>d then", "x < y and y > z", "List<T> items"):
+        assert code_wrap_html(text) == text
+    assert code_wrap_html('<p class="note">Hi</p>') == '`<p class="note">`Hi`</p>`'
+    assert code_wrap_html("Render <App /> then </Route>") == "Render `<App />` then `</Route>`"
+    assert code_wrap_html("<b>hi</b>", whole=True) == "`<b>hi</b>`"

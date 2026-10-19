@@ -174,12 +174,17 @@ class Settings(BaseSettings):
     # Deliberately much shorter than the submit grace, so it can't be used to
     # keep answering after time is up.
     exam_save_grace_seconds: int = 5
-    # Pool of live questions per course, shared across modules by lesson count.
-    # A course's exam appears once every module has its share; learners get
-    # 30 drawn from ALL live questions, so this only gates readiness and when
-    # the AI stops generating. 45 (decided 2026-10-20) makes every course
-    # ready from the imported banks; the plan's original figure was 90.
-    exam_pool_target: int = 45
+    # Two targets per course, each split across modules by lesson count:
+    # - exam_ready_target: a course's exam first appears once every module has
+    #   its share of this many live questions (45 = the imported banks suffice).
+    # - exam_pool_target: the background AI keeps growing the pool to this size.
+    #   It is what keeps retakes fresh - a learner is never re-shown questions
+    #   while unseen ones exist, so pool / exam_question_count is roughly how many
+    #   attempts get a new paper - and gives head-room for quarantined questions.
+    # Both are raised to at least exam_question_count automatically, so no
+    # setting can leave an exam permanently hidden.
+    exam_ready_target: int = 45
+    exam_pool_target: int = 90
     exam_pool_min_per_module: int = 3
     exam_gen_batch_size: int = 5
     # LLM calls per UTC day across all courses (drafting + cross-checks + embeddings).

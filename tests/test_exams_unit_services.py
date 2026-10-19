@@ -608,3 +608,21 @@ def test_full_courses_with_unchecked_imports_still_get_their_cross_check():
     assert run(w.maintenance.courses_needing_fill()) == []
     next(iter(w.questions.rows.values())).checks = {"checker": "deferred"}
     assert [c.slug for c in run(w.maintenance.courses_needing_fill())] == ["java-core"]
+
+
+def test_pool_and_ready_targets_are_separate_and_clamped():
+    w = World(questions_per_module=(8, 4), exam_pool_target=30, exam_ready_target=12)
+    assert run(w.pool.is_visible(w.course.__class__(**{**vars(w.course), "exam_ready_at": None})))  # 12 live >= ready share
+    assert run(w.pool.state(w.course.id)).gaps(), "generation keeps going toward the pool target"
+    low = World(exam_pool_target=2, exam_ready_target=1)  # question count is 6
+    assert low.pool.pool_size() == 6 and low.pool.ready_size() == 6
+    odd = World(exam_pool_target=20, exam_ready_target=50)
+    assert odd.pool.ready_size() == 20, "readiness never asks for more than the pool target"
+
+
+def test_production_defaults_keep_retakes_fresh():
+    from core.config import Settings
+
+    defaults = Settings(_env_file=None, supabase_url="postgresql://u:p@localhost/x", jwt_secret_key="x")
+    assert defaults.exam_pool_target == 90 and defaults.exam_ready_target == 45
+    assert defaults.exam_pool_target >= 3 * defaults.exam_question_count, "three attempts without a repeat"

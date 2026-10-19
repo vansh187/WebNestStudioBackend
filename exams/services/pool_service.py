@@ -41,11 +41,22 @@ class PoolService:
         self._clock = clock
         self._settings = settings
 
-    async def state(self, course_id: uuid.UUID) -> PoolState:
+    def pool_size(self) -> int:
+        """Generation target, never below one full exam."""
+        return max(int(self._settings.exam_pool_target), self._settings.exam_question_count)
+
+    def ready_size(self) -> int:
+        """Live questions a course needs before its exam first appears: at
+        least one full exam, at most the pool target."""
+        ready = getattr(self._settings, "exam_ready_target", None) or self._settings.exam_pool_target
+        return min(max(int(ready), self._settings.exam_question_count), self.pool_size())
+
+    async def state(self, course_id: uuid.UUID, size: int | None = None) -> PoolState:
+        """Module targets for `size` live questions (default: the generation target)."""
         modules = [m for m in await self._courses.list_exam_modules(course_id) if m.published_lessons > 0]
         targets = module_targets(
             {m.id: m.published_lessons for m in modules},
-            self._settings.exam_pool_target,
+            size if size is not None else self.pool_size(),
             self._settings.exam_pool_min_per_module,
         )
         live = await self._questions.live_counts(course_id)
@@ -57,7 +68,7 @@ class PoolService:
         draw (a quarantined question doesn't hide a launched exam)."""
         if not course.exam_enabled:
             return False
-        state = await self.state(course.id)
+        state = await self.state(course.id, self.ready_size())
         if state.total_live < self._settings.exam_question_count:
             return False
         if course.exam_ready_at is not None:
