@@ -97,6 +97,18 @@ async def weekly_report(database: Database, settings: Settings) -> None:
 
 
 def register_exam_jobs(scheduler: AsyncIOScheduler, database: Database, settings: Settings) -> None:
+    for name in ("exam_pool_target", "exam_ready_target"):
+        value = getattr(settings, name)
+        if value < settings.exam_question_count:
+            logger.warning(
+                "%s (%d) is below exam_question_count (%d); using %d so exams can still appear",
+                name.upper(), value, settings.exam_question_count, settings.exam_question_count,
+            )  # fmt: skip
+    if settings.exam_pool_target < 2 * settings.exam_question_count:
+        logger.warning(
+            "EXAM_POOL_TARGET (%d) is under twice EXAM_QUESTION_COUNT (%d): a retake will repeat questions from the "
+            "learner's previous attempt", settings.exam_pool_target, settings.exam_question_count,
+        )  # fmt: skip
     common = {"args": [database, settings], "replace_existing": True, "max_instances": 1, "coalesce": True}
     scheduler.add_job(
         expire_overdue_attempts, trigger=IntervalTrigger(minutes=5), id="exam_expire_attempts",

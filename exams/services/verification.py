@@ -92,6 +92,10 @@ class Candidate:
     embedding: list[float] | None = None
     code_language: str | None = None
     question_id: uuid.UUID | None = None
+    # How a code question's code is verified, decided once in _local_checks:
+    # "run" (executed and compared), "code_in_prompt" or "not_runnable" (seed
+    # imports only: not executed; the deferred cross-check answers it).
+    code_plan: str = "run"
 
     def fail(self, check: str, reason: str, storable: bool = True) -> None:
         self.status = "rejected" if storable and self.lesson is not None and self._storable() else "invalid"
@@ -302,7 +306,7 @@ class VerificationPipeline:
         # a batch can't contain two copies of one question.
         accepted: list[PoolEntry] = []
         for c in candidates:
-            self._local_checks(c, course, lesson_by_ref, contexts, pool + accepted, avoid_sets, mode)
+            self._local_checks(c, course, lesson_by_ref, contexts, pool + accepted, avoid_sets, mode, language)
             if c.status == "pending":
                 accepted.append(self._entry(c))
 
@@ -311,8 +315,8 @@ class VerificationPipeline:
         # isn't executed, and the deferred cross-check still reads and answers it.
         for c in candidates:
             if c.status == "pending" and c.draft.kind in CODE_KINDS:
-                if mode == "import" and not (c.draft.code or "").strip():
-                    c.checks["executed"] = {"ran": False, "reason": "code_in_prompt"}
+                if c.code_plan != "run":
+                    c.checks["executed"] = {"ran": False, "reason": c.code_plan}
                     continue
                 await self._code_check(c, language, log_context)
 
@@ -343,13 +347,43 @@ class VerificationPipeline:
             embedding=tuple(c.embedding) if c.embedding else None,
         )
 
-    def _local_checks(self, c, course, lesson_by_ref, contexts, pool, avoid_sets, mode) -> None:
-        d = c.draft
-        # Raw tags (questions about HTML/CSS/React) become inline code, so they
-        # are shown literally and can never render as markup.
+    def _prepare_text(self, d: DraftQuestion) -> None:
+        """Raw HTML/JSX tags (questions about HTML, CSS, React) are shown
+        literally in every field a person reads, never rendered as markup.
+        An option is wrapped as one span, so a printed output stays intact."""
         d.prompt = code_wrap_html(d.prompt)
         if isinstance(d.options, list):
-            d.options = [code_wrap_html(o) if isinstance(o, str) else o for o in d.options]
+            d.options = [code_wrap_html(o, whole=True) if isinstance(o, str) else o for o in d.options]
+        d.explanation = code_wrap_html(d.explanation)
+        if isinstance(d.why_others_wrong, list):
+            d.why_others_wrong = [code_wrap_html(r) if isinstance(r, str) else r for r in d.why_others_wrong]
+
+    def _plan_code(self, c: Candidate, mode: str, language: str | None) -> None:
+        """The one decision about a code question's code (where it is shown
+        and whether it is executed)."""
+        d = c.draft
+        if d.kind not in CODE_KINDS:
+            return
+        code = (d.code or "").strip()
+        if not code:
+            # Only a seed import may carry its code inside the prompt
+            # (check_shape then requires that code really is there).
+            c.code_plan = "code_in_prompt" if mode == "import" else "run"
+            return
+        # Learners only ever see the prompt: make sure the code is in it.
+        if " ".join(code.split()) not in " ".join((d.prompt or "").split()):
+            fence = {"javascript": "js"}.get(language or "", language or "")
+            block = "```" + fence + "\n" + d.code.rstrip() + "\n```"
+            d.prompt = (d.prompt or "").rstrip() + "\n\n" + block
+        runnable = language is not None and self._runner.supports(language)
+        # A seed import is treated the same wherever its code was put: when it
+        # can't run here, the deferred cross-check verifies it instead.
+        c.code_plan = "run" if runnable or mode != "import" else "not_runnable"
+
+    def _local_checks(self, c, course, lesson_by_ref, contexts, pool, avoid_sets, mode, language=None) -> None:
+        d = c.draft
+        self._prepare_text(d)
+        self._plan_code(c, mode, language)
         c.lesson = lesson_by_ref.get(d.lesson_ref or "")
         if c.lesson is None:
             c.fail("lesson", "unknown_lesson", storable=False)
@@ -365,7 +399,12 @@ class VerificationPipeline:
             c.fail("lesson", "course_mismatch", storable=False)
             return
 
-        problems = check_shape(d, require_rationale=(mode == "ai"), code_in_prompt_ok=(mode == "import"))
+        problems = check_shape(
+            d,
+            require_rationale=(mode == "ai"),
+            code_in_prompt_ok=(c.code_plan == "code_in_prompt"),
+            will_execute=(c.code_plan == "run"),
+        )
         c.prompt_norm = normalize_text(d.prompt)
         if c._storable():
             c.prompt_hash = prompt_hash(c.prompt_norm, d.options[d.correct_index])

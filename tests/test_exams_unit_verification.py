@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import random
+import uuid
 from dataclasses import dataclass
 
 os.environ.setdefault("SUPABASE_URL", "postgresql://user:pass@localhost:5432/test")
@@ -571,3 +572,74 @@ def test_seed_import_accepts_code_shown_in_the_prompt():
     assert c.checks["checker"] == "deferred" and e.runner.runs == 0
     # Outside imports the code field is still required.
     assert e.verify([draft(2, lesson_ref=e.lesson.key, kind="code_output", prompt=q.prompt, options=q.options)], mode="manual")[0].check == "shape"
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes (second round)
+# --------------------------------------------------------------------------- #
+def test_code_output_with_a_tag_in_its_output_still_matches():
+    e = Env(slug="python")
+    e.runner.output = "<b>hi</b>"
+    q = draft(1, lesson_ref=e.lesson.key, kind="code_output", code="print('<b>hi</b>')", expected_output="<b>hi</b>",
+              options=["<b>hi</b>", "<i>hi</i>", "hi", "<b>ho</b>"])  # fmt: skip
+    KNOWN_RIGHT.add("`<b>hi</b>`")
+    c = e.verify([q])[0]
+    assert c.status == "live", c.reason
+    assert "`<b>hi</b>`" in c.draft.options, "shown as one literal span, not split into fragments"
+
+
+def test_options_that_read_the_same_are_not_distinct_but_case_matters(env):
+    same = env.verify([mk(env, 1, options=["`foo()`", "foo()", "bar()", "baz()"])])[0]
+    assert same.check == "shape" and "distinct" in same.reason
+    cased = env.verify([mk(env, 2, options=["Right True", "Right true", "Right TRUE", "Right tRUE"])])[0]
+    assert "distinct" not in (cased.reason or ""), "in code, case is a real difference"
+
+
+def test_imported_code_question_without_any_code_is_rejected():
+    e = Env(slug="python")
+    q = draft(1, lesson_ref=e.lesson.key, kind="code_output", why_others_wrong=[], source_fact=None,
+              prompt="What does this print?", options=["1", "2", "3", "4"])  # fmt: skip
+    c = e.verify([q], mode="import")[0]
+    assert c.check == "shape" and "code" in c.reason
+
+
+def test_imported_code_in_the_code_field_on_a_course_that_cant_run_it_is_deferred_and_shown():
+    e = Env(slug="spring-boot")
+    q = draft(1, lesson_ref=e.lesson.key, kind="code_output", why_others_wrong=[], source_fact=None,
+              prompt="What does this print?", code="System.out.println(2 * 3);", options=["6", "5", "9", "23"])  # fmt: skip
+    c = e.verify([q], mode="import")[0]
+    assert c.status == "live" and c.checks["executed"] == {"ran": False, "reason": "not_runnable"}
+    assert "System.out.println(2 * 3);" in c.draft.prompt, "learners only see the prompt, so the code is added to it"
+    # the same question with the code in the prompt behaves the same way
+    q2 = draft(2, lesson_ref=e.lesson.key, kind="code_output", why_others_wrong=[], source_fact=None,
+               prompt="What does this print?\n\n```java\nSystem.out.println(2 * 4);\n```", options=["8", "6", "9", "24"])  # fmt: skip
+    assert e.verify([q2], mode="import")[0].status == "live"
+
+
+def test_code_only_in_the_code_field_is_shown_to_learners(env):
+    e = Env(slug="python")
+    q = draft(1, lesson_ref=e.lesson.key, kind="code_output", code="print(42)", expected_output="42",
+              prompt="What does this print?", options=["42", "41", "43", "40"])  # fmt: skip
+    c = e.verify([q])[0]
+    assert c.status == "live" and "```python\nprint(42)\n```" in c.draft.prompt
+
+
+def test_explanations_and_rationales_get_their_tags_wrapped(env):
+    q = mk(env, prompt="Which must come first in an HTML file " + " ".join(f"h{i}" for i in range(6)),
+           explanation="<!DOCTYPE html> must be the first line", why_others_wrong=["<html> comes after", "no", "<img onerror=x>"])
+    c = env.verify([q])[0]
+    assert c.draft.explanation.startswith("`<!DOCTYPE html>`")
+    # (answer balancing may reorder the rationales)
+    assert "`<html>` comes after" in c.draft.why_others_wrong and "`<img onerror=x>`" in c.draft.why_others_wrong
+
+
+def test_imported_questions_whose_lesson_is_gone_are_quarantined_once():
+    e = job_env()
+    e.llm = DraftingLlm(drafts_for(e, 5))
+    e.pipeline._llm = e.generation._llm = e.llm
+    q = e.questions.add(e.course, e.module, e.lesson, 900, source="seed", checks={"checker": "deferred"})
+    q.lesson_id = uuid.uuid4()  # its lesson no longer exists in the course
+    run_job(e)
+    assert e.questions.rows[q.id].status == "quarantined"
+    assert e.questions.rows[q.id].checks["checker"] == "unverifiable"
+    assert run(e.questions.unchecked_seed_questions(e.course.id, 5)) == [], "never picked up again"

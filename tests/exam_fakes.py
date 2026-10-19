@@ -39,7 +39,7 @@ T0 = datetime(2026, 10, 18, 10, 0, tzinfo=timezone.utc)
 def settings(**overrides):
     values = dict(
         exam_question_count=6, exam_duration_minutes=60, exam_pass_percent=70, exam_retake_hours=24,
-        exam_submit_grace_seconds=30, exam_save_grace_seconds=5, exam_pool_target=12, exam_pool_min_per_module=3,
+        exam_submit_grace_seconds=30, exam_save_grace_seconds=5, exam_pool_target=12, exam_ready_target=12, exam_pool_min_per_module=3,
         exam_gen_batch_size=5, exam_gen_daily_call_limit=300, exam_checker_min_confidence=0.8,
         exam_duplicate_jaccard=0.8, exam_duplicate_cosine=0.9, exam_duplicate_cosine_same_lesson=0.85,
         exam_code_run_daily_limit=150, exam_max_per_concept=2, exam_max_serves=0, exam_reports_to_quarantine=2,
