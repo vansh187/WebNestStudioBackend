@@ -601,3 +601,10 @@ def test_stats_need_30_answers_before_acting(w):
                                                 f.T0, 0, 30, False, [], [{"question_id": str(q.id), "correct": False}])  # fmt: skip
     run(w.maintenance.question_stats())
     assert q.status == "live" and w.questions.stats[q.id]["answered"] == 29
+
+
+def test_full_courses_with_unchecked_imports_still_get_their_cross_check():
+    w = World(questions_per_module=(8, 4))  # pool full
+    assert run(w.maintenance.courses_needing_fill()) == []
+    next(iter(w.questions.rows.values())).checks = {"checker": "deferred"}
+    assert [c.slug for c in run(w.maintenance.courses_needing_fill())] == ["java-core"]

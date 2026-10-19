@@ -559,3 +559,15 @@ def test_over_served_questions_are_retired_when_configured():
     q.times_served = 3
     run_job(e)
     assert e.questions.rows[q.id].status == "retired"
+
+
+def test_seed_import_accepts_code_shown_in_the_prompt():
+    e = Env(slug="spring-boot")  # a course whose code can't even be executed
+    q = draft(1, lesson_ref=e.lesson.key, kind="code_output", why_others_wrong=[], source_fact=None,
+              prompt="What does this print?\n\n```java\nint x = 3;\nSystem.out.println(x * 2);\n```",
+              options=["6", "5", "9", "32"])  # fmt: skip
+    c = e.verify([q], mode="import")[0]
+    assert c.status == "live" and c.checks["executed"] == {"ran": False, "reason": "code_in_prompt"}
+    assert c.checks["checker"] == "deferred" and e.runner.runs == 0
+    # Outside imports the code field is still required.
+    assert e.verify([draft(2, lesson_ref=e.lesson.key, kind="code_output", prompt=q.prompt, options=q.options)], mode="manual")[0].check == "shape"

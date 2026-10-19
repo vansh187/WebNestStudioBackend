@@ -33,6 +33,7 @@ from exams.domain.validation import (
     KINDS,
     DraftQuestion,
     check_shape,
+    code_wrap_html,
     context_passages,
     is_grounded,
     normalize_text,
@@ -305,9 +306,14 @@ class VerificationPipeline:
             if c.status == "pending":
                 accepted.append(self._entry(c))
 
-        # 7: code really runs.
+        # 7: code really runs. A seed import may show the code inside the prompt
+        # instead (authors' own snippets, often not standalone programs): it
+        # isn't executed, and the deferred cross-check still reads and answers it.
         for c in candidates:
             if c.status == "pending" and c.draft.kind in CODE_KINDS:
+                if mode == "import" and not (c.draft.code or "").strip():
+                    c.checks["executed"] = {"ran": False, "reason": "code_in_prompt"}
+                    continue
                 await self._code_check(c, language, log_context)
 
         # 8: meaning (embeddings), compared with the pool and earlier drafts.
@@ -339,6 +345,11 @@ class VerificationPipeline:
 
     def _local_checks(self, c, course, lesson_by_ref, contexts, pool, avoid_sets, mode) -> None:
         d = c.draft
+        # Raw tags (questions about HTML/CSS/React) become inline code, so they
+        # are shown literally and can never render as markup.
+        d.prompt = code_wrap_html(d.prompt)
+        if isinstance(d.options, list):
+            d.options = [code_wrap_html(o) if isinstance(o, str) else o for o in d.options]
         c.lesson = lesson_by_ref.get(d.lesson_ref or "")
         if c.lesson is None:
             c.fail("lesson", "unknown_lesson", storable=False)
@@ -354,7 +365,7 @@ class VerificationPipeline:
             c.fail("lesson", "course_mismatch", storable=False)
             return
 
-        problems = check_shape(d, require_rationale=(mode == "ai"))
+        problems = check_shape(d, require_rationale=(mode == "ai"), code_in_prompt_ok=(mode == "import"))
         c.prompt_norm = normalize_text(d.prompt)
         if c._storable():
             c.prompt_hash = prompt_hash(c.prompt_norm, d.options[d.correct_index])

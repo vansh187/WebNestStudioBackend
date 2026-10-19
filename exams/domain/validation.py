@@ -90,6 +90,22 @@ def strip_code(text: str) -> str:
     return _INLINE_CODE.sub(" ", _CODE_FENCE.sub(" ", text or ""))
 
 
+_ANY_TAG = re.compile(r"</?[A-Za-z!][^<>\n]{0,300}>")
+_CODE_SEGMENTS = re.compile(r"(```.*?(?:```|$)|`[^`\n]*`)", re.DOTALL)
+
+
+def code_wrap_html(text: str) -> str:
+    """Turns raw HTML tags outside code into inline code, so a question about
+    `<!DOCTYPE html>` shows the tag literally instead of the page rendering
+    (or dropping) it. Text already in code spans or fences is untouched."""
+    if not isinstance(text, str) or "<" not in text:
+        return text
+    parts = _CODE_SEGMENTS.split(text)
+    for i in range(0, len(parts), 2):  # even indexes are outside code
+        parts[i] = _ANY_TAG.sub(lambda m: "`" + m.group(0) + "`" if "`" not in m.group(0) else m.group(0), parts[i])
+    return "".join(parts)
+
+
 def has_raw_html(text: str) -> bool:
     """Raw HTML outside code spans/fences (Markdown only; `List<String>` in
     backticks is fine)."""
@@ -112,8 +128,10 @@ def option_as_output(option: str) -> str:
     return _option_plain(option)
 
 
-def check_shape(draft: DraftQuestion, require_rationale: bool) -> list[str]:
-    """Plan 6.4 #1. Returns failure reasons; empty means it passed."""
+def check_shape(draft: DraftQuestion, require_rationale: bool, code_in_prompt_ok: bool = False) -> list[str]:
+    """Plan 6.4 #1. Returns failure reasons; empty means it passed.
+    code_in_prompt_ok (seed imports): a code question may show its code in the
+    prompt instead of the `code` field; it then isn't executed."""
     problems: list[str] = []
     prompt = (draft.prompt or "").strip()
     if not prompt:
@@ -132,7 +150,9 @@ def check_shape(draft: DraftQuestion, require_rationale: bool) -> list[str]:
         problems.append("an option is empty")
     if any(len(o) > MAX_OPTION_CHARS for o in stripped):
         problems.append(f"an option is longer than {MAX_OPTION_CHARS} characters")
-    if len({normalize_text(o) or o.lower() for o in stripped}) != 4:
+    # Exact text (whitespace collapsed): in code, punctuation is the whole
+    # difference - rs.getLong(0) vs rs.getLong("0"), :focus vs ::focus.
+    if len({" ".join(o.split()) for o in stripped}) != 4:
         problems.append("options are not distinct")
     if any(pattern.search(o) for o in stripped for pattern in _BANNED_OPTION_PATTERNS):
         problems.append("uses all/none of the above or a combined option")
@@ -163,7 +183,9 @@ def check_shape(draft: DraftQuestion, require_rationale: bool) -> list[str]:
             problems.append("why_others_wrong must give 3 reasons")
     if draft.source_fact is not None and len(draft.source_fact) > MAX_SOURCE_FACT_CHARS:
         problems.append("source_fact is too long")
-    if draft.kind in CODE_KINDS:
+    if draft.kind in CODE_KINDS and code_in_prompt_ok and not (draft.code or "").strip():
+        pass  # code shown in the prompt; checked by the deferred cross-check
+    elif draft.kind in CODE_KINDS:
         if not (draft.code or "").strip():
             problems.append("code questions need code")
         elif len(draft.code) > MAX_CODE_CHARS:
