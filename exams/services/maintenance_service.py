@@ -163,7 +163,9 @@ class MaintenanceService:
                 continue
             if latest is not None and latest.status == "running":
                 continue
-            if not (await self._pool.state(course.id)).full:
+            # Not full yet, or holding imported questions still waiting for
+            # their independent cross-check (a full pool still gets them checked).
+            if not (await self._pool.state(course.id)).full or await self._questions.unchecked_seed_questions(course.id, 1):
                 due.append(course)
         return due
 

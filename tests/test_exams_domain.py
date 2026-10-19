@@ -277,7 +277,7 @@ def test_a_good_question_passes_the_shape_check():
     "overrides,fragment",
     [
         ({"options": ["a", "b", "c"]}, "exactly 4"),
-        ({"options": ["Same", "same", "Other", "Third"]}, "distinct"),
+        ({"options": ["Same", "  Same ", "Other", "Third"]}, "distinct"),
         ({"options": ["One", "Two", "None of the above", "Four"]}, "all/none"),
         ({"options": ["Yes", "No", "Both A and B", "Maybe"]}, "combined"),
         ({"correct_index": 4}, "correct_index"),
@@ -400,3 +400,22 @@ def test_item_statistics_flag_a_question_strong_learners_miss():
     stats = item_statistics(graded)
     assert stats["bad"]["discrimination"] < 0 < stats["good"]["discrimination"]
     assert stats["bad"]["answered"] == 40
+
+
+def test_options_differing_only_in_punctuation_are_distinct():
+    for options in (['rs.getLong(0)', 'rs.getLong(-1)', 'rs.getLong("0")', 'rs.getLong(1)'],
+                    ['.row:focus', '.row:hover', '.row::focus', '.row:focus-within'],
+                    ['a == b', 'a === b', 'a = b', 'a != b']):  # fmt: skip
+        assert check_shape(good_draft(options=options), require_rationale=False) == []
+    assert any("distinct" in p for p in check_shape(good_draft(options=["Same", "Same ", "x y", "z w"]), False))
+
+
+def test_raw_html_is_turned_into_inline_code():
+    from exams.domain.validation import code_wrap_html
+
+    assert code_wrap_html('What must be first? <!DOCTYPE html>') == 'What must be first? `<!DOCTYPE html>`'
+    assert code_wrap_html('<p class="note" style="color: red">Hi</p> is styled') == '`<p class="note" style="color: red">`Hi`</p>` is styled'
+    assert code_wrap_html("Already `<div>` and\n```html\n<div></div>\n```") == "Already `<div>` and\n```html\n<div></div>\n```"
+    assert code_wrap_html("a < b and b > c") == "a < b and b > c"
+    assert code_wrap_html('<img src=x onerror="alert(1)">') == '`<img src=x onerror="alert(1)">`'
+    assert not has_raw_html(code_wrap_html('<script>alert(1)</script> and <a href="javascript:x">'))
