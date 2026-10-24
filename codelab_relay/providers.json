@@ -1,0 +1,50 @@
+[
+  {
+    "id": "razorpay",
+    "name": "Razorpay",
+    "enabled": true,
+    "hosts": ["api.razorpay.com"],
+    "path_prefixes": ["/v1/", "/v2/"],
+    "test_mode": { "rule": "key_prefix", "allowed_prefixes": ["rzp_test_"] },
+    "forward_request_headers": ["authorization", "content-type", "accept"],
+    "forward_response_headers": [],
+    "test_key_hint": "Use a test key that starts with rzp_test_",
+    "docs_url": "https://razorpay.com/docs/api/"
+  },
+  {
+    "id": "stripe",
+    "name": "Stripe",
+    "enabled": true,
+    "hosts": ["api.stripe.com"],
+    "path_prefixes": ["/v1/"],
+    "test_mode": { "rule": "key_prefix", "allowed_prefixes": ["sk_test_", "rk_test_"] },
+    "forward_request_headers": ["authorization", "content-type", "accept", "idempotency-key", "stripe-version"],
+    "forward_response_headers": ["request-id"],
+    "test_key_hint": "Use a secret key that starts with sk_test_",
+    "docs_url": "https://docs.stripe.com/api"
+  },
+  {
+    "id": "paypal",
+    "name": "PayPal (sandbox)",
+    "enabled": true,
+    "hosts": ["api-m.sandbox.paypal.com"],
+    "path_prefixes": ["/v1/", "/v2/"],
+    "test_mode": { "rule": "sandbox_host" },
+    "forward_request_headers": ["authorization", "content-type", "accept", "paypal-request-id", "prefer"],
+    "forward_response_headers": ["paypal-debug-id"],
+    "test_key_hint": "Use your PayPal sandbox app's client id and secret",
+    "docs_url": "https://developer.paypal.com/api/rest/"
+  },
+  {
+    "id": "cashfree",
+    "name": "Cashfree (sandbox)",
+    "enabled": false,
+    "hosts": ["sandbox.cashfree.com"],
+    "path_prefixes": ["/pg/"],
+    "test_mode": { "rule": "sandbox_host" },
+    "forward_request_headers": ["content-type", "accept", "x-client-id", "x-client-secret", "x-api-version", "x-idempotency-key"],
+    "forward_response_headers": ["x-request-id"],
+    "test_key_hint": "Use your Cashfree sandbox app id and secret",
+    "docs_url": "https://www.cashfree.com/docs/api-reference"
+  }
+]

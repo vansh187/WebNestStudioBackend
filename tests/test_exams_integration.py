@@ -81,7 +81,13 @@ def test_exam_view_anonymous_disabled_unknown_and_bad_token(world):
 
 def test_exam_stays_hidden_until_every_module_has_its_share(world):
     h, _, java, _ = world
-    run(h.execute("update exam_questions set status = 'quarantined' where module_id = :m and prompt like '%q0 %'", m=java["modules"][2]["id"]))
+    # Readiness uses EXAM_READY_TARGET (45): module 2 (2 of 9 lessons) needs 10
+    # of its 20 live questions, so leave it 9.
+    run(h.execute(
+        "update exam_questions set status = 'quarantined' where id in "
+        "(select id from exam_questions where module_id = :m order by prompt limit 11)",
+        m=java["modules"][2]["id"],
+    ))  # fmt: skip
     run(h.execute("update courses set exam_ready_at = null"))
     with h.client() as client:
         assert client.get("/api/learning/courses/java-core/exam").json()["enabled"] is False
