@@ -3,7 +3,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -27,6 +26,12 @@ from api.messaging_router import router as messaging_router
 from api.newsletter_router import router as newsletter_router
 from api.sitemap_router import router as sitemap_router
 from api.users_router import router as users_router
+from codelab_relay import models as relay_models  # noqa: F401 - registers the relay quota tables for create_all
+from codelab_relay.cors import RelayAwareCORSMiddleware
+from codelab_relay.dependencies import close_relay_resources, relay_cors_options
+from codelab_relay.jobs import register_relay_jobs
+from codelab_relay.router import register_relay_error_handlers
+from codelab_relay.router import router as relay_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
@@ -89,8 +94,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.critical("Could not register the course exam jobs", exc_info=True)
 
+    try:
+        register_relay_jobs(container.scheduler, container.database)
+    except Exception:
+        logger.critical("Could not register the CodeLab relay cleanup job", exc_info=True)
+
     yield
 
+    await close_relay_resources()
     try:
         container.scheduler.shutdown(wait=False)
     except Exception:
@@ -117,16 +128,22 @@ class WebNestStudioApp:
         self._configure_middleware()
         self._register_routers()
         register_error_handlers(self.instance)
+        register_relay_error_handlers(self.instance)
 
     def _configure_middleware(self) -> None:
         # Added before CORS so CORS wraps it and its 413 still reaches the browser.
         self.instance.add_middleware(GitHubBodyLimitMiddleware)
+        # /api/codelab/relay/* gets the relay's strict policy (explicit
+        # origins and headers, no credentials); every other route keeps this one.
         self.instance.add_middleware(
-            CORSMiddleware,
-            allow_origins=container.settings.cors_origin_list,
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            RelayAwareCORSMiddleware,
+            relay_options=relay_cors_options(),
+            default_options=dict(
+                allow_origins=container.settings.cors_origin_list,
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            ),
         )
 
     def _register_routers(self) -> None:
@@ -152,6 +169,7 @@ class WebNestStudioApp:
             exam_public_router,
             exam_admin_router,
             github_router,
+            relay_router,
             messaging_router,
             users_router,
         ):
