@@ -1,0 +1,28 @@
+{
+  "postgres": {
+    "default_port": 5432,
+    "ports": [5432, 6543],
+    "hosts": [
+      { "pattern": "*.pooler.supabase.com", "tls_verify": false, "label": "Supabase (pooler)" },
+      { "pattern": "db.*.supabase.co", "tls_verify": false, "label": "Supabase (direct, IPv6)" },
+      { "pattern": "*.*.aws.neon.tech", "tls_verify": true, "label": "Neon" },
+      { "pattern": "*.*.azure.neon.tech", "tls_verify": true, "label": "Neon" }
+    ]
+  },
+  "mysql": {
+    "default_port": 3306,
+    "ports": [3306, 4000],
+    "hosts": [
+      { "pattern": "*.aivencloud.com", "tls_verify": false, "label": "Aiven" },
+      { "pattern": "*.*.prod.aws.tidbcloud.com", "tls_verify": true, "label": "TiDB Cloud" },
+      { "pattern": "*.connect.psdb.cloud", "tls_verify": true, "label": "PlanetScale" }
+    ]
+  },
+  "mongodb": {
+    "default_port": 27017,
+    "ports": [27017],
+    "hosts": [
+      { "pattern": "*.*.mongodb.net", "tls_verify": true, "label": "MongoDB Atlas" }
+    ]
+  }
+}

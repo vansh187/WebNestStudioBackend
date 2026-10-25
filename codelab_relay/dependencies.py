@@ -14,7 +14,7 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.dependencies import container, get_auth_service, get_db_session
-from core.exceptions import UnauthorizedError
+from core.playground_requests import webnest_user_id
 from database.session import Database
 from codelab_relay.constants import RELAY_METHODS
 from codelab_relay.errors import LoginRequired, MethodNotAllowed, RelayDisabled, RelayError
@@ -137,30 +137,16 @@ def check_relay_open(request: Request) -> None:
 
 async def get_relay_user(request: Request, auth_service: AuthService = Depends(get_auth_service),
                          session: AsyncSession = Depends(get_db_session)) -> RelayUser:
-    """The WebNest login from X-WebNest-Authorization, checked by the same
-    AuthService.get_current_user that get_current_user uses, with login's own
-    verification rule. The standard Authorization header belongs to the
-    payment provider."""
+    """The WebNest login from X-WebNest-Authorization (shared with the database
+    proxy). The standard Authorization header belongs to the payment provider."""
     try:
-        scheme, _, token = request.headers.get("x-webnest-authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not token.strip():
-            raise LoginRequired()
-        user = await auth_service.get_current_user(token.strip())
-        # Same rule as AuthService.login: verification is only required while
-        # email is switched on (otherwise accounts are never verified).
-        if not user.is_active or (container.settings.email_enabled and not user.is_verified):
-            raise LoginRequired()
-        relay_user = RelayUser(id=user.id)
-        # Hand the connection back now: nothing later in the request uses this
-        # session, and holding it through a 20 s upstream call would starve the pool.
-        await session.close()
-        return relay_user
+        user_id = await webnest_user_id(request, auth_service, session, container.settings.email_enabled,
+                                        RelayError, LoginRequired, lambda: RelayDisabled(temporary=True))
+        return RelayUser(id=user_id)
     except RelayError:
         raise
-    except (UnauthorizedError, ValueError) as exc:
-        raise LoginRequired() from exc
     except Exception as exc:
-        logger.exception("relay login check failed")
+        logger.error("relay login check failed type=%s", type(exc).__name__)
         raise RelayDisabled(temporary=True) from exc
 
 
