@@ -27,8 +27,13 @@ from api.messaging_router import router as messaging_router
 from api.newsletter_router import router as newsletter_router
 from api.sitemap_router import router as sitemap_router
 from api.users_router import router as users_router
+from codelab_db.constants import DB_PATH
+from codelab_db.dependencies import close_db_resources, db_cors_options
+from codelab_db.router import register_db_error_handlers
+from codelab_db.services.redaction import install_credential_log_filter
+from codelab_db.router import router as db_router
 from codelab_relay import models as relay_models  # noqa: F401 - registers the relay quota tables for create_all
-from codelab_relay.cors import RelayAwareCORSMiddleware
+from codelab_relay.constants import RELAY_PATH
 from codelab_relay.dependencies import close_relay_resources, relay_cors_options
 from codelab_relay.jobs import register_relay_jobs
 from codelab_relay.router import register_relay_error_handlers
@@ -36,6 +41,7 @@ from codelab_relay.router import router as relay_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
 from core.logging_config import LoggingConfigurator
+from core.path_scoped_cors import PathScopedCORSMiddleware
 from core.request_limits import GitHubBodyLimitMiddleware
 from exams import models as exam_models  # noqa: F401 - registers the exam tables for create_all
 from exams.jobs import register_exam_jobs
@@ -47,6 +53,7 @@ from services.blog_scheduler import register_blog_jobs
 from services.codelab_scheduler import register_codelab_jobs
 
 LoggingConfigurator().configure()
+install_credential_log_filter()   # on the handlers just configured
 
 logger = logging.getLogger("webnest.startup")
 
@@ -103,6 +110,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await close_relay_resources()
+    close_db_resources()
     try:
         container.scheduler.shutdown(wait=False)
     except Exception:
@@ -130,15 +138,17 @@ class WebNestStudioApp:
         self._register_routers()
         register_error_handlers(self.instance)
         register_relay_error_handlers(self.instance)
+        register_db_error_handlers(self.instance)
 
     def _configure_middleware(self) -> None:
         # Added before CORS so CORS wraps it and its 413 still reaches the browser.
         self.instance.add_middleware(GitHubBodyLimitMiddleware)
-        # /api/codelab/relay/* gets the relay's strict policy (explicit
-        # origins and headers, no credentials); every other route keeps this one.
+        # /api/codelab/relay/* and /api/codelab/db/* get their own strict
+        # policies (explicit origins and headers, no credentials, their error
+        # headers exposed); every other route keeps this one.
         self.instance.add_middleware(
-            RelayAwareCORSMiddleware,
-            relay_options=relay_cors_options(),
+            PathScopedCORSMiddleware,
+            scoped=((RELAY_PATH, relay_cors_options()), (DB_PATH, db_cors_options())),
             default_options=dict(
                 allow_origins=container.settings.cors_origin_list,
                 allow_credentials=True,
@@ -172,6 +182,7 @@ class WebNestStudioApp:
             exam_admin_router,
             github_router,
             relay_router,
+            db_router,
             messaging_router,
             users_router,
         ):

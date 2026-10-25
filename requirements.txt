@@ -19,3 +19,7 @@ apscheduler==3.10.4
 tzdata==2024.2
 reportlab==4.2.5
 pillow==12.3.0
+psycopg[binary]==3.3.6
+PyMySQL==1.2.3
+pymongo==4.19.0
+dnspython==2.8.0

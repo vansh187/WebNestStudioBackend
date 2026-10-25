@@ -4,11 +4,11 @@ the browser (sections 3.6 and 3.8)."""
 import logging
 
 from fastapi import Request
-from starlette.requests import ClientDisconnect
 
 from codelab_relay.errors import BadTarget, PayloadTooLarge, RelayError, UpstreamUnavailable
 from codelab_relay.protocols import Provider, UpstreamResponse
 from codelab_relay.services.header_filter import SECURITY_HEADERS, HeaderFilter
+from core.playground_requests import read_capped_body
 
 logger = logging.getLogger("webnest.codelab_relay")
 
@@ -22,24 +22,11 @@ class BodyReader:
 
     async def read(self, request: Request) -> bytes:
         try:
-            declared = request.headers.get("content-length")
-            if declared is not None and declared.isdigit() and int(declared) > self._max_bytes:
-                raise PayloadTooLarge(self._max_bytes)
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > self._max_bytes:
-                    raise PayloadTooLarge(self._max_bytes)
-                chunks.append(chunk)
-            return b"".join(chunks)
+            return await read_capped_body(request, self._max_bytes, RelayError, PayloadTooLarge, BadTarget)
         except RelayError:
             raise
-        except ClientDisconnect as exc:
-            logger.info("client went away while sending a relay body")
-            raise BadTarget() from exc
         except Exception as exc:
-            logger.exception("could not read a relay request body")
+            logger.error("could not read a relay request body type=%s", type(exc).__name__)
             raise BadTarget() from exc
 
 

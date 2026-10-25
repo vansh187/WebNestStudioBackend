@@ -1160,10 +1160,12 @@ def test_log_filter_is_installed_on_the_relay_and_httpx_loggers():
 
 
 def test_prefix_methods_and_host_grammar_come_from_one_place():
-    from codelab_relay import constants, cors
+    from codelab_relay import constants
     from codelab_relay.router import router
+    from core.path_scoped_cors import is_under
 
-    assert router.prefix == constants.RELAY_PATH and cors.is_relay_path(constants.RELAY_PATH + "/x")
+    assert router.prefix == constants.RELAY_PATH and is_under(constants.RELAY_PATH + "/x", constants.RELAY_PATH)
+    assert not is_under(constants.RELAY_PATH + "x", constants.RELAY_PATH)
     assert relay_dependencies.relay_cors_options()["allow_methods"] == [*constants.RELAY_METHODS, "OPTIONS"]
     for source in relay_sources():
         text = source.read_text(encoding="utf-8")
