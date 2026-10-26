@@ -25,6 +25,7 @@ class CourseListResponse(BaseModel):
 
 class CourseLessonRef(BaseModel):
     id: uuid.UUID
+    key: str | None = None  # the site's lesson key, so clients can match their own ids
     title: str
     order: int
     status: str  # per-user: not_started | in_progress | completed
@@ -129,6 +130,26 @@ class LessonProgressUpdateResponse(BaseModel):
     course_slug: str = ""
     course_completion_percent: int = 0
     next_lesson: LessonLink | None = None
+
+
+class MyLessonProgressItem(BaseModel):
+    """One lesson the user has started or completed (LESSON_PROGRESS_SYNC_BACKEND.md section 2)."""
+
+    key: str | None  # null for a lesson created before keys existed; clients skip it
+    lesson_id: uuid.UUID
+    course_slug: str
+    # not_started appears only in `since` responses: an explicit un-mark.
+    status: Literal["not_started", "in_progress", "completed"]
+    completed_percent: int = Field(ge=0, le=100)
+    updated_at: datetime
+
+
+class MyProgressResponse(BaseModel):
+    lessons: list[MyLessonProgressItem]
+    server_time: datetime  # send back as ?since= to fetch only later changes
+    # True when the row cap cut the list (newest kept). Don't use server_time
+    # from such a response as a sync point; fetch in full again next time.
+    truncated: bool = False
 
 
 class LessonBookmarkRequest(BaseModel):

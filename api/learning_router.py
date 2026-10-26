@@ -1,9 +1,12 @@
+import logging
 import uuid
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from core.dependencies import get_current_user, get_learning_service, get_optional_current_user, require_admin
+from core.exceptions import DatabaseError, DomainError
 from database.models import User
 from schemas.learning_schemas import (
     AdminCourseResponse,
@@ -19,6 +22,7 @@ from schemas.learning_schemas import (
     LessonNoteResponse,
     LessonProgressUpdateRequest,
     LessonProgressUpdateResponse,
+    MyProgressResponse,
     QuizDetailResponse,
     QuizSubmitRequest,
     QuizSubmitResponse,
@@ -26,6 +30,8 @@ from schemas.learning_schemas import (
 from exams.routing import ExamContractRoute
 from exams.schemas import BulkProgressRequest, BulkProgressResponse
 from services.learning_service import LearningService
+
+logger = logging.getLogger("webnest.learning")
 
 router = APIRouter(prefix="/api/learning", tags=["learning"])
 # POST /progress/bulk follows the course-exams error contract (contract section 2).
@@ -90,6 +96,30 @@ async def bulk_progress(
         current_user, [(item.lesson_id, item.status, item.completed_percent) for item in payload.lessons]
     )
     return BulkProgressResponse(accepted=accepted, unknown=unknown)
+
+
+@progress_router.get("/progress", response_model=MyProgressResponse)
+async def my_progress(
+    response: Response,
+    course_slug: str | None = Query(default=None, min_length=1, max_length=200, description="Only this course"),
+    since: datetime | None = Query(
+        default=None, description="Only rows changed at or after this time (ISO 8601; no zone means UTC)"
+    ),
+    current_user: User = Depends(get_current_user),
+    learning: LearningService = Depends(get_learning_service),
+) -> MyProgressResponse:
+    """Every lesson the user has started or completed, by site key - the read
+    side of POST /progress/bulk (LESSON_PROGRESS_SYNC_BACKEND.md section 2).
+    401 without a valid token, 404 for an unknown course_slug, 422 for an
+    invalid since, 503 when the database can't be read."""
+    try:
+        response.headers["Cache-Control"] = "no-store"
+        return await learning.list_my_progress(current_user, course_slug, since)
+    except DomainError:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error listing progress type=%s", type(exc).__name__)
+        raise DatabaseError("Could not load your progress right now. Please try again shortly.") from exc
 
 
 @router.put("/lessons/{lesson_id}/bookmark", response_model=LessonBookmarkResponse)
