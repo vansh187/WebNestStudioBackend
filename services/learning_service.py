@@ -1,10 +1,12 @@
+import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.exceptions import BadRequestError, NotFoundError
+from core.exceptions import BadRequestError, DatabaseError, DomainError, NotFoundError
 from database.codelab_persistence import CodelabPersistence
 from database.learning_persistence import LearningPersistence
 from database.models import Course, Lesson, User
@@ -34,12 +36,36 @@ from schemas.learning_schemas import (
     LessonProgressUpdateRequest,
     LessonProgressUpdateResponse,
     LessonProgressView,
+    MyLessonProgressItem,
+    MyProgressResponse,
     QuizDetailResponse,
     QuizFeedbackItem,
     QuizQuestionView,
     QuizSubmitRequest,
     QuizSubmitResponse,
 )
+
+logger = logging.getLogger("webnest.learning")
+
+PROGRESS_UNAVAILABLE = "Could not load your progress right now. Please try again shortly."
+# How far before `since` a refresh re-reads (late commits, clock differences).
+SINCE_OVERLAP = timedelta(minutes=10)
+
+
+def _overlapped(since: datetime | None) -> datetime | None:
+    """`since` as UTC, moved back by SINCE_OVERLAP. A time without a zone is
+    read as UTC; one too early to move back means "everything" (a full fetch)."""
+    try:
+        if since is None:
+            return None
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        return since - SINCE_OVERLAP
+    except OverflowError:
+        return None
+    except Exception as exc:
+        logger.error("Could not read the since time type=%s", type(exc).__name__)
+        raise DatabaseError(PROGRESS_UNAVAILABLE) from exc
 
 
 def _normalise_answer(value: object) -> object:
@@ -168,6 +194,7 @@ class LearningService:
             lesson_refs = [
                 CourseLessonRef(
                     id=l.id,
+                    key=l.key,
                     title=l.title,
                     order=l.display_order,
                     status=(progress_map[l.id].status if l.id in progress_map else "not_started"),
@@ -416,6 +443,56 @@ class LearningService:
         for course_id in courses:
             await self._learning.recompute_course_progress(user.id, course_id)
         return accepted, list(dict.fromkeys(unknown))
+
+    async def list_my_progress(
+        self, user: User, course_slug: str | None = None, since: datetime | None = None
+    ) -> MyProgressResponse:
+        """Every lesson the user has started or completed, by site key
+        (LESSON_PROGRESS_SYNC_BACKEND.md section 2).
+
+        A `since` refresh re-reads SINCE_OVERLAP before the given time. Writers
+        stamp updated_at with their own clock just before committing, so a
+        change can commit after a reader's query yet carry a time earlier than
+        the server_time that reader was given, and app instances' clocks can
+        differ slightly. Re-reading the overlap covers both; a repeated entry
+        is harmless because clients merge idempotently."""
+        try:
+            server_time = datetime.now(timezone.utc)
+            course_id = None
+            if course_slug is not None:
+                slug = course_slug.strip()
+                course_id = await self._learning.published_course_id(slug) if slug else None
+                if course_id is None:
+                    raise NotFoundError("Course not found")
+            rows, truncated = await self._learning.list_user_progress(user.id, course_id, _overlapped(since))
+            return MyProgressResponse(lessons=self._progress_items(rows), server_time=server_time, truncated=truncated)
+        except DomainError:
+            raise
+        except Exception as exc:
+            logger.error("Progress listing failed user=%s type=%s", getattr(user, "id", "?"), type(exc).__name__)
+            raise DatabaseError(PROGRESS_UNAVAILABLE) from exc
+
+    def _progress_items(self, rows: list[tuple]) -> list[MyLessonProgressItem]:
+        """One item per row. A row that can't meet the contract (unexpected
+        data) is logged and left out instead of failing the whole response."""
+        try:
+            items = []
+            for row in rows:
+                try:
+                    key, lesson_id, course_slug, status, percent, updated_at = row
+                    if updated_at is not None and updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    # The stored value, as every other progress endpoint reports it.
+                    items.append(MyLessonProgressItem(
+                        key=key or None, lesson_id=lesson_id, course_slug=course_slug or "", status=status,
+                        completed_percent=max(0, min(100, int(percent or 0))), updated_at=updated_at,
+                    ))  # fmt: skip
+                except (PydanticValidationError, TypeError, ValueError, AttributeError):
+                    logger.warning("Skipping a progress row that does not fit the contract")
+            return items
+        except Exception as exc:
+            logger.error("Progress rows could not be read type=%s", type(exc).__name__)
+            raise DatabaseError(PROGRESS_UNAVAILABLE) from exc
 
     async def set_bookmark(
         self, user: User, lesson_id: str | uuid.UUID, bookmarked: bool, course_slug: str | None = None

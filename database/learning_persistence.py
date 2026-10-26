@@ -2,13 +2,13 @@ import logging
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import DateTime, case, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
 
-from core.exceptions import ConflictError, DatabaseError
+from core.exceptions import ConflictError, DatabaseError, DomainError
 from database.base_persistence import BasePersistence
 from database.models import (
     CodelabProblemProgress,
@@ -27,6 +27,13 @@ from database.models import (
 
 UPSERT_CONFLICT_MESSAGE = "This course conflicts with existing data (duplicate slug, exam code or module/lesson key)"
 
+# GET /api/learning/progress returns at most this many lessons (one row per
+# published lesson per user; 558 lessons exist today).
+MAX_USER_PROGRESS_ROWS = 5000
+# What a progress row with a NULL updated_at counts as: long ago, so it is in
+# every full fetch but never re-sent by a `since` refresh.
+UNKNOWN_CHANGE_TIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 
 logger = logging.getLogger("webnest.learning")
 
@@ -38,6 +45,24 @@ def _as_uuid(value) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def _course_lookup(identifier: str | uuid.UUID, include_unpublished: bool = False) -> list:
+    """The one rule for finding a course by slug or id (and, unless asked
+    otherwise, only a published one). get_course and published_course_id both
+    use it, so the two can never disagree about which slugs exist."""
+    try:
+        as_uuid = _as_uuid(identifier)
+        match = Course.slug == str(identifier)
+        if as_uuid is not None:
+            match = or_(match, Course.id == as_uuid)
+        conditions = [match]
+        if not include_unpublished:
+            conditions.append(Course.status == "published")
+        return conditions
+    except Exception as exc:
+        logger.error("Course lookup could not be built type=%s", type(exc).__name__)
+        raise DatabaseError("Could not read data from the database right now. Please try again shortly.") from exc
 
 
 class LearningPersistence(BasePersistence):
@@ -61,17 +86,11 @@ class LearningPersistence(BasePersistence):
     async def get_course(
         self, identifier: str | uuid.UUID, include_unpublished: bool = False
     ) -> Course | None:
-        as_uuid = _as_uuid(identifier)
-        match = Course.slug == str(identifier)
-        if as_uuid is not None:
-            match = or_(match, Course.id == as_uuid)
         stmt = (
             select(Course)
-            .where(match)
+            .where(*_course_lookup(identifier, include_unpublished))
             .options(selectinload(Course.modules).selectinload(CourseModule.lessons))
         )
-        if not include_unpublished:
-            stmt = stmt.where(Course.status == "published")
         result = await self._execute(stmt.limit(1))
         return result.scalars().first()
 
@@ -207,6 +226,77 @@ class LearningPersistence(BasePersistence):
             )
         )
         return {row.lesson_id: row for row in result.scalars().all()}
+
+    async def published_course_id(self, identifier: str | uuid.UUID) -> uuid.UUID | None:
+        """The id of the published course with this slug (or id), found by the
+        same rule as get_course but without loading its modules and lessons."""
+        try:
+            result = await self._execute(select(Course.id).where(*_course_lookup(identifier)).limit(1))
+            return result.scalars().first()
+        except DomainError:
+            raise
+        except Exception as exc:
+            logger.error("Course lookup failed type=%s", type(exc).__name__)
+            raise DatabaseError("Could not read data from the database right now. Please try again shortly.") from exc
+
+    async def list_user_progress(
+        self,
+        user_id: uuid.UUID,
+        course_id: uuid.UUID | None = None,
+        since: datetime | None = None,
+        limit: int = MAX_USER_PROGRESS_ROWS,
+    ) -> tuple[list[tuple], bool]:
+        """((key, lesson_id, course_slug, status, completed_percent, changed_at)
+        rows, truncated) for published lessons of published courses. One
+        query; the (user_id, lesson_id) unique index makes it an index scan on
+        this user's rows.
+
+        Without `since`: lessons started or completed (a full picture).
+        With `since`: everything changed at or after it, including lessons
+        explicitly un-marked to not_started, so a client applying changes can
+        clear them.
+
+        A NULL updated_at (rows written before the column had a default) is
+        read as 1970-01-01: part of every full fetch, never re-sent by a
+        `since` refresh. One extra row is fetched to tell whether the cap cut
+        the result; newest rows are kept."""
+        try:
+            changed_at = func.coalesce(UserLessonProgress.updated_at, literal(UNKNOWN_CHANGE_TIME, DateTime(timezone=True)))
+            statuses = ("in_progress", "completed") if since is None else ("not_started", "in_progress", "completed")
+            stmt = (
+                select(
+                    Lesson.key,
+                    UserLessonProgress.lesson_id,
+                    Course.slug,
+                    UserLessonProgress.status,
+                    UserLessonProgress.completed_percent,
+                    changed_at.label("changed_at"),
+                )
+                .join(Lesson, Lesson.id == UserLessonProgress.lesson_id)
+                .join(Course, Course.id == Lesson.course_id)
+                .where(
+                    UserLessonProgress.user_id == user_id,
+                    UserLessonProgress.status.in_(statuses),
+                    Lesson.status == "published",
+                    Course.status == "published",
+                )
+            )
+            if course_id is not None:
+                stmt = stmt.where(Lesson.course_id == course_id)
+            if since is not None:
+                stmt = stmt.where(changed_at >= since)
+            cap = max(1, int(limit))
+            stmt = stmt.order_by(changed_at.desc(), UserLessonProgress.lesson_id).limit(cap + 1)
+            rows = [tuple(row) for row in (await self._execute(stmt)).all()]
+            truncated = len(rows) > cap
+            if truncated:
+                logger.warning("Progress listing hit the cap user=%s cap=%s", user_id, cap)
+            return rows[:cap], truncated
+        except DomainError:
+            raise
+        except Exception as exc:
+            logger.error("User progress listing failed type=%s", type(exc).__name__)
+            raise DatabaseError("Could not read data from the database right now. Please try again shortly.") from exc
 
     async def lesson_user_state(
         self, user_id: uuid.UUID, lesson_id: uuid.UUID
