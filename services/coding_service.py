@@ -4,10 +4,11 @@ import logging
 import secrets
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,7 +16,14 @@ from core.config import Settings
 from core.exceptions import GenerationUnavailableError, NotFoundError, PayloadTooLargeError, RateLimitedError, ValidationError
 from database.base_persistence import BasePersistence
 from database.models import CodingExecution, CodingProject, CodingShare, User
-from schemas.coding_schemas import CodingFile, CompileResult, ExecuteRequest, ExecuteResponse
+from schemas.coding_schemas import (
+    CodingFile,
+    CompileResult,
+    ExecuteRequest,
+    ExecuteResponse,
+    check_file_tree,
+    clean_file_path,
+)
 
 logger = logging.getLogger("webnest.coding")
 
@@ -107,7 +115,23 @@ LANGUAGES = [
     },
 ]
 
-LANGUAGE_BY_ID = {language["id"]: language for language in LANGUAGES}
+# Languages a project or share may be saved in that run in the learner's browser, not on
+# the compiler: CodeLab's FastAPI + SQLite workspace runs in Pyodide. They are not listed
+# by GET /api/compiler/languages.
+BROWSER_LANGUAGES = [
+    {
+        "id": "backend",
+        "label": "FastAPI",
+        "monacoId": "python",
+        "fileExtension": "py",
+    },
+]
+
+# Every language a project may use, with where it runs: "compiler" or "browser".
+LANGUAGE_BY_ID = {
+    **{language["id"]: {**language, "runner": "compiler"} for language in LANGUAGES},
+    **{language["id"]: {**language, "runner": "browser"} for language in BROWSER_LANGUAGES},
+}
 
 
 class SlidingWindowLimiter:
@@ -142,6 +166,15 @@ class SlidingWindowLimiter:
                 self._next_sweep = now + self._SWEEP_INTERVAL_SECONDS
             return allowed
 
+    async def release(self, key: str) -> None:
+        """Give back the newest slot consume took, for a request that was then rejected."""
+        async with self._lock:
+            events = self._events.get(key)
+            if events:
+                events.pop()
+            if not events:
+                self._events.pop(key, None)
+
     def _sweep(self, now: float) -> None:
         expiry = now - self._window_seconds
         stale = [key for key, events in self._events.items() if not events or events[-1] <= expiry]
@@ -162,8 +195,9 @@ class CodingService(BasePersistence):
         return LANGUAGES
 
     async def execute(self, payload: ExecuteRequest, user: User | None, client_ip: str | None) -> ExecuteResponse:
-        files = self._normalize_files(payload.language, payload.files, payload.source)
-        self._get_language(payload.language)
+        language = self._get_language(payload.language, executable=True)
+        files = self._normalize_files(language, payload.files, payload.source)
+        self._reject_folders(files)
         self._validate_total_size(files, self._settings.compiler_source_limit_bytes)
         await self._check_execute_rate_limit(user, client_ip)
 
@@ -225,9 +259,9 @@ class CodingService(BasePersistence):
     async def create_project(
         self, user_id: uuid.UUID, title: str, language: str, files: list[CodingFile] | None, source: str | None, stdin: str, description: str
     ) -> CodingProject:
-        normalized_files = self._normalize_files(language, files, source)
-        self._get_language(language)
-        self._validate_total_size(normalized_files, self._settings.coding_project_source_limit_bytes)
+        language_entry = self._get_language(language)
+        normalized_files = self._normalize_files(language_entry, self._as_coding_files(files), source)
+        self._check_project_files(language_entry, normalized_files)
         result = await self._execute(select(func.count(CodingProject.id)).where(CodingProject.owner_user_id == user_id))
         if (result.scalar_one() or 0) >= self._settings.coding_project_limit_per_user:
             raise ValidationError(f"Project limit reached. You can save up to {self._settings.coding_project_limit_per_user} projects.")
@@ -253,14 +287,19 @@ class CodingService(BasePersistence):
 
     async def update_project(self, user_id: uuid.UUID, project_id: uuid.UUID, updates: dict) -> CodingProject:
         project = await self.get_project(user_id, project_id)
-        if "language" in updates and updates["language"] is not None:
-            self._get_language(updates["language"])
-            project.language = updates["language"]
-        if "files" in updates and updates["files"] is not None:
-            # The router passes updates straight from model_dump(), so files arrive
-            # as plain dicts; coerce them back to CodingFile before validating.
-            files = [item if isinstance(item, CodingFile) else CodingFile.model_validate(item) for item in updates["files"]]
-            self._validate_total_size(files, self._settings.coding_project_source_limit_bytes)
+        # Every check runs before the row changes, so a rejected update leaves it untouched.
+        new_language = updates.get("language")
+        if new_language is not None:
+            language = self._get_language(new_language)
+            self._check_language_change(project.language, language)
+        else:
+            language = LANGUAGE_BY_ID.get(project.language)
+        files = self._as_coding_files(updates.get("files"))
+        if files is not None:
+            self._check_project_files(language, files, self._saved_names(project))
+        if new_language is not None:
+            project.language = language["id"]
+        if files is not None:
             project.files = [file.model_dump() for file in files]
         if "title" in updates and updates["title"] is not None:
             project.title = updates["title"].strip()
@@ -288,14 +327,24 @@ class CodingService(BasePersistence):
         stdin: str,
         stdout: str,
     ) -> CodingShare:
+        language_entry = self._get_language(language)
+        files = self._as_coding_files(files)
+        # The slot is taken before any database work and given back if the request is
+        # rejected, so rejected attempts cost nothing.
         if not await self._share_limiter.consume(str(user.id), SHARES_PER_HOUR, 3600):
             raise RateLimitedError("Too many share links created. Try again in an hour.")
-        normalized_files = self._normalize_files(language, files, source)
-        self._get_language(language)
-        self._validate_total_size(normalized_files, self._settings.coding_project_source_limit_bytes)
-        project = await self._get_owned_project(user.id, project_id) if project_id else None
-        if project_id and project is None:
-            raise NotFoundError("Project not found.")
+        try:
+            project = await self._get_owned_project(user.id, project_id) if project_id else None
+            if project_id and project is None:
+                raise NotFoundError("Project not found.")
+            if project is not None:
+                # The share becomes the project's public link, so it must be the same kind.
+                self._check_language_change(project.language, language_entry)
+            normalized_files = self._normalize_files(language_entry, files, source)
+            self._check_project_files(language_entry, normalized_files, self._saved_names(project) if project else None)
+        except Exception:
+            await self._share_limiter.release(str(user.id))
+            raise
 
         share = CodingShare(
             share_id=await self._new_share_id(),
@@ -341,8 +390,9 @@ class CodingService(BasePersistence):
         if version and version.strip().isdigit():
             version_index = version.strip()
 
-        # JDoodle's execute API runs a single script; send the entry-point file.
-        entry = next((f for f in files if f.name.startswith("main.")), files[0])
+        # JDoodle's execute API runs a single script; send the entry-point file, main.* in
+        # any case (Java's is Main.java), else the first file.
+        entry = next((f for f in files if f.name.lower().startswith("main.")), files[0])
         url = self._settings.jdoodle_base_url.rstrip("/") + "/execute"
         payload = {
             "clientId": self._settings.jdoodle_client_id,
@@ -494,16 +544,78 @@ class CodingService(BasePersistence):
                 return share_id
         return secrets.token_urlsafe(18).rstrip("_-")[:24]
 
-    def _normalize_files(self, language_id: str, files: list[CodingFile] | None, source: str | None) -> list[CodingFile]:
+    def _normalize_files(self, language: dict, files: list[CodingFile] | None, source: str | None) -> list[CodingFile]:
         if files is not None:
             return files
-        language = self._get_language(language_id)
         return [CodingFile(name=f"main.{language['fileExtension']}", content=source or "")]
 
-    def _get_language(self, language_id: str) -> dict:
+    @staticmethod
+    def _as_coding_files(files: list | None) -> list[CodingFile] | None:
+        """Files as CodingFile models: the router passes models, other callers may pass
+        dicts such as model_dump() output."""
+        if files is None:
+            return None
+        try:
+            return [file if isinstance(file, CodingFile) else CodingFile.model_validate(file) for file in files]
+        except PydanticValidationError as exc:
+            raise ValidationError(f"Invalid file: {exc.errors()[0]['msg']}") from exc
+
+    def _check_project_files(self, language: dict | None, files: list[CodingFile], kept_names: Counter[str] | None = None) -> None:
+        """The one check of a file list being saved (request schemas cap its length).
+        Names in `kept_names`, already saved on the project, are exempt from the name rules
+        so a project saved under an older rule can still be edited and shared."""
+        kept_names = kept_names or Counter()
+        for file in files:
+            if file.name in kept_names:
+                continue
+            try:
+                clean_file_path(file.name)
+            except ValueError as exc:
+                raise ValidationError(f"Invalid file name {file.name}: {exc}") from exc
+        # Only browser workspaces have folders; an unknown stored language counts as compiler.
+        if language is None or language["runner"] != "browser":
+            self._reject_folders(files)
+        try:
+            check_file_tree(files, kept_names)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        self._validate_total_size(files, self._settings.coding_project_source_limit_bytes)
+
+    @staticmethod
+    def _reject_folders(files: list[CodingFile]) -> None:
+        # The compiler runs one file (_call_jdoodle); a file in a folder would never run.
+        for file in files:
+            if "/" in file.name:
+                raise ValidationError(f"{file.name}: the compiler runs single files, so files cannot be in folders.")
+
+    @staticmethod
+    def _saved_names(project: CodingProject) -> Counter[str]:
+        """How many times each file name is saved on the project."""
+        return Counter(file["name"] for file in project.files or [] if isinstance(file, dict) and isinstance(file.get("name"), str))
+
+    @staticmethod
+    def _check_language_change(current_id: str, language: dict) -> None:
+        """A browser workspace's files (folders, schema.sql, a frontend) mean nothing to the
+        compiler, and a compiler project has no FastAPI app, so neither converts."""
+        if language["id"] == current_id:
+            return
+        current = LANGUAGE_BY_ID.get(current_id)
+        if language["runner"] == "browser":
+            browser = language
+        elif current is not None and current["runner"] == "browser":
+            browser = current
+        else:
+            return
+        raise ValidationError(f"{browser['label']} projects cannot be switched to or from another language.")
+
+    def _get_language(self, language_id: str, *, executable: bool = False) -> dict:
+        """The language entry for `language_id`. `executable`: it must run on the compiler,
+        not only in the browser."""
         language = LANGUAGE_BY_ID.get(language_id)
         if language is None:
             raise ValidationError("Unknown language.")
+        if executable and language["runner"] != "compiler":
+            raise ValidationError(f"{language['label']} projects run in your browser and cannot be executed by the compiler.")
         return language
 
     def _validate_total_size(self, files: list[CodingFile], limit_bytes: int) -> None:
