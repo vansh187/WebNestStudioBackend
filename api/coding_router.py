@@ -87,11 +87,11 @@ async def update_project(
     current_user: User = Depends(get_current_user),
     coding_service: CodingService = Depends(get_coding_service),
 ) -> ProjectResponse:
-    project = await coding_service.update_project(
-        current_user.id,
-        project_id,
-        payload.model_dump(exclude_unset=True),
-    )
+    # Files go to the service as CodingFile models, not dumped to dicts.
+    updates = payload.model_dump(exclude_unset=True, exclude={"files"})
+    if payload.files is not None:
+        updates["files"] = payload.files
+    project = await coding_service.update_project(current_user.id, project_id, updates)
     return ProjectResponse.model_validate(project)
 
 
