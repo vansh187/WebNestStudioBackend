@@ -109,11 +109,18 @@ class Settings(BaseSettings):
     chatbot_max_transcript_messages: int = 20
     chatbot_plan_max_weeks: int = 20
 
-    # CodeLab AI coding assistant: a streaming proxy to Groq, off by default.
+    # CodeLab AI coding assistant: a streaming proxy, off by default. Claude Haiku when its
+    # key is set, with Groq as the fallback; with no Claude key it runs on Groq alone.
+    # ASSISTANT_PROVIDER=groq uses Groq only, whatever keys are set.
     # Its key belongs to its own Groq organization (Groq limits per organization),
     # so it can't use up the quota of the features above. Never reuse GROQ_API_KEY.
     assistant_enabled: bool = False
-    assistant_provider: str = "groq"
+    assistant_provider: str = "anthropic"
+    assistant_anthropic_model: str = "claude-haiku-5-5"
+    assistant_anthropic_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("ASSISTANT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "assistant_anthropic_api_key"),
+    )
     assistant_model: str = "openai/gpt-oss-120b"
     assistant_groq_api_key: str = Field(
         default="",
@@ -141,6 +148,10 @@ class Settings(BaseSettings):
     assistant_price_paise: int = 29900
     assistant_pass_days: int = 30
     assistant_pass_tokens: int = 2_000_000
+    # Per user, on top of the pass, so one member can't spend it all in a burst. The week is
+    # the last 7 UTC days, so it frees up day by day. Both count the fallback provider too.
+    assistant_pass_daily_tokens: int = 150_000
+    assistant_pass_weekly_tokens: int = 700_000
     assistant_razorpay_key_id: str = Field(
         default="", validation_alias=AliasChoices("ASSISTANT_RAZORPAY_KEY_ID", "RAZORPAY_KEY_ID", "assistant_razorpay_key_id")
     )

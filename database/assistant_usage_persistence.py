@@ -7,7 +7,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Literal, Protocol, cast
 
 from sqlalchemy import ColumnElement, CursorResult, Executable, case, delete, func, select, update
@@ -20,6 +20,7 @@ from database.models import AssistantCallLog, AssistantUsage
 
 # Shorter than the pool's own 30-second wait, so a full pool fails fast too.
 DB_TIMEOUT_SECONDS = 10.0
+WEEK_DAYS = 7
 PURGE_BATCH_SIZE = 5000
 _READ_ERROR = "Could not read assistant usage right now. Please try again shortly."
 _WRITE_ERROR = "Could not save assistant usage right now. Please try again shortly."
@@ -50,11 +51,16 @@ class DailyLimits:
     user_calls: int
     user_tokens: int
     global_tokens: int
+    # The user's tokens over the last 7 UTC days, or None for no such limit.
+    user_weekly_tokens: int | None = None
+
+
+Denial = Literal["global_tokens", "user_calls", "user_tokens", "user_weekly_tokens"]
 
 
 @dataclass(frozen=True)
 class CallReservation:
-    denied: Literal["global_tokens", "user_calls", "user_tokens"] | None
+    denied: Denial | None
     calls_today: int
 
 
@@ -149,16 +155,23 @@ class SqlAssistantUsageStore:
             func.coalesce(func.sum(case((AssistantUsage.user_id == key.user_id, AssistantUsage.calls), else_=0)), 0),
             func.coalesce(func.sum(case((AssistantUsage.user_id == key.user_id, row_tokens), else_=0)), 0),
         ).where(AssistantUsage.day == key.day)
+        week = select(func.coalesce(func.sum(row_tokens), 0)).where(
+            AssistantUsage.user_id == key.user_id,
+            AssistantUsage.day > key.day - timedelta(days=WEEK_DAYS),
+            AssistantUsage.day <= key.day,
+        )
         async with self._session(_WRITE_ERROR) as session:
             await session.execute(upsert)
             tokens_today, calls_today, user_tokens_today = (await session.execute(totals)).one()
-            denied: Literal["global_tokens", "user_calls", "user_tokens"] | None = None
+            denied: Denial | None = None
             if int(tokens_today) >= limits.global_tokens:
                 denied = "global_tokens"
             elif int(calls_today) > limits.user_calls:
                 denied = "user_calls"
             elif int(user_tokens_today) >= limits.user_tokens:
                 denied = "user_tokens"
+            elif limits.user_weekly_tokens is not None and int((await session.execute(week)).scalar_one()) >= limits.user_weekly_tokens:
+                denied = "user_weekly_tokens"
             if denied is not None:
                 await session.rollback()
                 return CallReservation(denied=denied, calls_today=int(calls_today) - 1)

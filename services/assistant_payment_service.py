@@ -2,6 +2,7 @@
 be trusted, so only a signature checked here, or a payment fetched from Razorpay, grants
 anything. Never logs secrets, signatures or webhook bodies, which can hold customer details."""
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -16,14 +17,16 @@ from core.config import Settings
 from core.exceptions import (
     BadRequestError,
     ConflictError,
+    DomainError,
     ExternalServiceError,
     NotFoundError,
     PaymentRequiredError,
     RateLimitedError,
 )
-from database.assistant_payment_persistence import AccessState, AssistantPaymentStore, NewOrder, WebhookEvent
+from database.assistant_payment_persistence import AccessState, AssistantPaymentStore, NewOrder, SavedOrder, WebhookEvent
 from schemas.assistant_schemas import AccessResponse, MembershipResponse, OrderResponse, VerifyRequest
-from services.razorpay_client import RazorpayClient, RazorpayError
+from services.assistant_llm import assistant_can_answer
+from services.razorpay_client import RazorpayClient, RazorpayError, RazorpayPayment
 
 logger = logging.getLogger("webnest.assistant.payments")
 
@@ -33,7 +36,9 @@ ORDERS_PER_MINUTE = 5
 _ORDER_WINDOW_SECONDS = 60.0
 _MAX_TRACKED_USERS = 10_000
 _RECONCILE_WINDOW = timedelta(hours=24)
-_RECONCILE_MAX_ORDERS = 200
+_RECONCILE_MAX_ORDERS = 500
+_RECONCILE_ORDERS_PER_USER = 5
+_RECONCILE_CONCURRENCY = 5
 _LOG_ID_CHARS = 64
 _UNAVAILABLE = "Payments are not available right now. Please try again later."
 
@@ -86,6 +91,10 @@ def _same(expected: str, given: str) -> bool:
     return hmac.compare_digest(expected.encode("utf-8"), given.encode("utf-8", "replace"))
 
 
+def _matches(payment: RazorpayPayment, order: SavedOrder) -> bool:
+    return payment.order_id == order.order_id and payment.amount == order.amount_paise and payment.currency == order.currency
+
+
 def _safe_id(value: str) -> str:
     """An id for the logs, from a header nothing has vouched for yet."""
     return repr(value[:_LOG_ID_CHARS])
@@ -130,7 +139,7 @@ def parse_webhook(event_id: str, body: Any) -> WebhookEvent:
         event_id=event_id,
         event_type=event_type,
         order_id=_as_str(payment.get("order_id")),
-        payment_id=_as_str(payment.get("id")),
+        payment_id=_as_str(payment.get("id")) or _as_str(_entity(payload, "refund").get("payment_id")),
         amount=amount,
         currency=_as_str(payment.get("currency")),
         full_refund=payment.get("refund_status") == "full" or (amount is not None and refunded is not None and refunded >= amount > 0),
@@ -147,6 +156,14 @@ class AssistantPaymentService:
     @property
     def paywall_enabled(self) -> bool:
         return self._settings.assistant_paywall_enabled
+
+    @property
+    def daily_tokens(self) -> int:
+        return self._settings.assistant_pass_daily_tokens
+
+    @property
+    def weekly_tokens(self) -> int:
+        return self._settings.assistant_pass_weekly_tokens
 
     def access_response(self, state: AccessState | None) -> AccessResponse:
         now = datetime.now(timezone.utc)
@@ -171,20 +188,30 @@ class AssistantPaymentService:
         access = await self.get_access(user_id)
         return MembershipResponse(is_prime=access.is_prime, member_label=access.member_label, expires_at=access.expires_at if access.is_prime else None)
 
-    async def ensure_access(self, user_id: uuid.UUID) -> None:
-        """The real lock. It runs before the AI provider is contacted, and a database
-        failure here refuses the call rather than giving it away."""
-        if not (await self.get_access(user_id)).active:
+    async def reserve_pass(self, user_id: uuid.UUID, tokens: int) -> None:
+        """The real lock. It runs before the AI provider is contacted and counts the most this
+        call can spend, and a database failure here refuses the call rather than giving it away."""
+        if not await self._store.reserve_tokens(user_id, tokens):
             raise PaymentRequiredError("Unlock WebNest AI to continue.")
 
-    async def add_tokens(self, user_id: uuid.UUID, tokens: int) -> AccessResponse | None:
-        """The access after this call's tokens, or None if the user has no pass to charge."""
-        state = await self._store.add_tokens(user_id, tokens)
+    async def settle_pass(self, user_id: uuid.UUID, reserved: int, tokens: int) -> AccessResponse | None:
+        """Replaces a call's reservation with what it spent, and returns the access after it."""
+        state = await self._store.add_tokens(user_id, tokens - reserved)
         return None if state is None else self.access_response(state)
+
+    async def release_pass(self, user_id: uuid.UUID, reserved: int) -> None:
+        """Gives back a reservation for a call that never opened a reply."""
+        try:
+            await self._store.add_tokens(user_id, -reserved)
+        except Exception as exc:
+            logger.error("Could not give back reserved pass tokens: user=%s %s", user_id, type(exc).__name__)
 
     async def create_order(self, user_id: uuid.UUID) -> OrderResponse:
         key_id = self._settings.assistant_razorpay_key_id
         if not self.paywall_enabled or not key_id or not self._settings.assistant_razorpay_key_secret:
+            raise ExternalServiceError(_UNAVAILABLE)
+        # Nobody should pay for 30 days of an assistant that can't answer.
+        if not assistant_can_answer(self._settings):
             raise ExternalServiceError(_UNAVAILABLE)
         if not self._limiter.begin_order(user_id):
             raise RateLimitedError("Your payment is already being started. Please wait a moment.")
@@ -238,6 +265,10 @@ class AssistantPaymentService:
             logger.warning("Razorpay checkout signature mismatch: order=%s payment=%s user=%s", order.order_id, payload.razorpay_payment_id, user_id)
             raise BadRequestError("This payment could not be verified.")
         logger.info("Razorpay checkout signature verified: order=%s payment=%s user=%s", order.order_id, payload.razorpay_payment_id, user_id)
+        if not await self._is_captured(order, payload.razorpay_payment_id):
+            # Not a failure: the panel keeps reading usage, and the webhook or the
+            # reconciliation job grants it once the money has really been captured.
+            return await self.get_access(user_id)
         granted = await self._store.grant(order.order_id, payload.razorpay_payment_id)
         logger.info(
             "Razorpay checkout verify finished: order=%s payment=%s user=%s access=%s",
@@ -247,6 +278,22 @@ class AssistantPaymentService:
             "granted" if granted else "already_granted",
         )
         return await self.get_access(user_id)
+
+    async def _is_captured(self, order: SavedOrder, payment_id: str) -> bool:
+        """A valid signature only proves the payment was authorized, which can still lapse
+        without any money arriving. So access waits for Razorpay to say it was captured."""
+        try:
+            payment = await self._razorpay.get_payment(payment_id)
+        except RazorpayError:
+            logger.warning("Razorpay checkout verify could not read the payment: order=%s payment=%s", order.order_id, payment_id)
+            return False
+        if not _matches(payment, order):
+            logger.error("Razorpay payment does not match its order: order=%s payment=%s", order.order_id, payment_id)
+            return False
+        if payment.status != "captured":
+            logger.info("Razorpay payment not captured yet: order=%s payment=%s status=%s", order.order_id, payment_id, payment.status)
+            return False
+        return True
 
     def _webhook_signature_ok(self, raw_body: bytes, signature: str) -> bool:
         # The previous secret still counts during a rotation, for events already being retried.
@@ -272,7 +319,7 @@ class AssistantPaymentService:
             return
         event = parse_webhook(event_id, body)
         outcome = await self._store.apply_webhook(event)
-        level = logging.ERROR if outcome in ("mismatch", "malformed") else logging.WARNING if outcome == "unknown_order" else logging.INFO
+        level = logging.ERROR if outcome in ("mismatch", "malformed", "no_account") else logging.WARNING if outcome in ("unknown_order", "refund_other_payment") else logging.INFO
         logger.log(
             level,
             "Razorpay webhook: event=%s type=%s order=%s payment=%s outcome=%s",
@@ -287,13 +334,19 @@ class AssistantPaymentService:
         """Recovers a user if the webhook was down: asks Razorpay about recent unpaid orders
         and grants through the same function for any captured payment. One order's failure
         doesn't stop the rest, since the next run tries again."""
-        granted = 0
         since = datetime.now(timezone.utc) - _RECONCILE_WINDOW
-        for order in await self._store.open_orders(since, _RECONCILE_MAX_ORDERS):
-            try:
-                payments = await self._razorpay.order_payments(order.order_id)
-            except RazorpayError:
-                continue
+        orders = await self._store.open_orders(since, _RECONCILE_MAX_ORDERS, _RECONCILE_ORDERS_PER_USER)
+        slots = asyncio.Semaphore(_RECONCILE_CONCURRENCY)
+
+        async def check(order: SavedOrder) -> int:
+            async with slots:
+                return await self._reconcile_order(order)
+
+        return sum(await asyncio.gather(*(check(order) for order in orders)))
+
+    async def _reconcile_order(self, order: SavedOrder) -> int:
+        try:
+            payments = await self._razorpay.order_payments(order.order_id)
             for payment in payments:
                 if payment.status != "captured" or not payment.payment_id:
                     continue
@@ -301,7 +354,9 @@ class AssistantPaymentService:
                     logger.error("Razorpay payment does not match its order: order=%s payment=%s", order.order_id, payment.payment_id)
                     continue
                 if await self._store.grant(order.order_id, payment.payment_id):
-                    granted += 1
                     logger.info("Prime access granted by reconciliation: order=%s payment=%s", order.order_id, payment.payment_id)
-                break
-        return granted
+                    return 1
+                return 0
+        except (RazorpayError, DomainError) as exc:
+            logger.warning("Razorpay reconciliation skipped an order: order=%s %s", order.order_id, type(exc).__name__)
+        return 0

@@ -3,6 +3,7 @@ limit, so no connection is held during a call to Razorpay. Verify, the webhook a
 reconciliation job all grant through _grant, so a payment only ever counts once."""
 
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -18,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.exceptions import DatabaseError
 from database.models import AssistantAccess, AssistantPayment, AssistantWebhookEvent
 
+logger = logging.getLogger("webnest.assistant.payments")
+
 DB_TIMEOUT_SECONDS = 10.0
 # Razorpay treats a webhook as failed after 5 seconds, and sends it again.
 WEBHOOK_TIMEOUT_SECONDS = 4.0
@@ -25,8 +28,20 @@ _ERROR = "Could not reach the payment records right now. Please try again shortl
 
 GRANT_EVENTS = frozenset({"payment.captured", "order.paid"})
 WebhookOutcome = Literal[
-    "duplicate", "granted", "already_granted", "unknown_order", "mismatch", "malformed", "failed_recorded", "refunded", "partial_refund", "ignored"
+    "duplicate",
+    "granted",
+    "already_granted",
+    "no_account",
+    "unknown_order",
+    "mismatch",
+    "malformed",
+    "failed_recorded",
+    "refunded",
+    "partial_refund",
+    "refund_other_payment",
+    "ignored",
 ]
+_GrantResult = Literal["granted", "already_granted", "no_account"]
 
 
 @dataclass(frozen=True)
@@ -77,11 +92,13 @@ class AssistantPaymentStore(Protocol):
 
     async def grant(self, order_id: str, payment_id: str) -> bool: ...
 
+    async def reserve_tokens(self, user_id: uuid.UUID, tokens: int) -> bool: ...
+
     async def add_tokens(self, user_id: uuid.UUID, tokens: int) -> AccessState | None: ...
 
     async def apply_webhook(self, event: WebhookEvent) -> WebhookOutcome: ...
 
-    async def open_orders(self, since: datetime, limit: int) -> list[SavedOrder]: ...
+    async def open_orders(self, since: datetime, limit: int, per_user: int) -> list[SavedOrder]: ...
 
 
 def _access_state(row: AssistantAccess | None) -> AccessState | None:
@@ -135,16 +152,36 @@ class SqlAssistantPaymentStore:
     async def grant(self, order_id: str, payment_id: str) -> bool:
         """True when this call gave the access, False when it was already handled."""
         async with self._session() as session:
-            granted = await self._grant(session, order_id, payment_id)
+            result = await self._grant(session, order_id, payment_id)
             await session.commit()
-            return granted
+            return result == "granted"
+
+    async def reserve_tokens(self, user_id: uuid.UUID, tokens: int) -> bool:
+        """Counts a call's most before it starts, if the pass is usable. Checking and counting
+        in one statement means parallel calls, even on different servers, each see the ones
+        before them, so a pass can only ever run over by its last call."""
+        statement = (
+            update(AssistantAccess)
+            .where(
+                AssistantAccess.user_id == user_id,
+                AssistantAccess.expires_at > func.now(),
+                AssistantAccess.tokens_used < AssistantAccess.tokens_limit,
+            )
+            .values(tokens_used=AssistantAccess.tokens_used + tokens, updated_at=func.now())
+            .returning(AssistantAccess.user_id)
+        )
+        async with self._session() as session:
+            row = (await session.execute(statement)).one_or_none()
+            await session.commit()
+            return row is not None
 
     async def add_tokens(self, user_id: uuid.UUID, tokens: int) -> AccessState | None:
-        """One atomic update, so parallel calls can't lose each other's counts."""
+        """One atomic update, so parallel calls can't lose each other's counts. `tokens` is
+        negative when a call gives back part of what it reserved."""
         statement = (
             update(AssistantAccess)
             .where(AssistantAccess.user_id == user_id)
-            .values(tokens_used=AssistantAccess.tokens_used + tokens, updated_at=func.now())
+            .values(tokens_used=func.greatest(AssistantAccess.tokens_used + tokens, 0), updated_at=func.now())
             .returning(AssistantAccess.expires_at, AssistantAccess.tokens_limit, AssistantAccess.tokens_used)
         )
         async with self._session() as session:
@@ -168,10 +205,19 @@ class SqlAssistantPaymentStore:
             await session.commit()
             return outcome
 
-    async def open_orders(self, since: datetime, limit: int) -> list[SavedOrder]:
+    async def open_orders(self, since: datetime, limit: int, per_user: int) -> list[SavedOrder]:
+        """Recent unpaid orders, newest first, with a cap per user so one user's abandoned
+        orders can't push another user's paid order out of the check."""
+        newest_first = func.row_number().over(partition_by=AssistantPayment.user_id, order_by=AssistantPayment.created_at.desc())
+        ranked = (
+            select(AssistantPayment.id, newest_first.label("position"))
+            .where(AssistantPayment.status.in_(("created", "failed")), AssistantPayment.created_at >= since)
+            .subquery()
+        )
         statement = (
             select(AssistantPayment)
-            .where(AssistantPayment.status.in_(("created", "failed")), AssistantPayment.created_at >= since)
+            .join(ranked, AssistantPayment.id == ranked.c.id)
+            .where(ranked.c.position <= per_user)
             .order_by(AssistantPayment.created_at.desc())
             .limit(limit)
         )
@@ -194,23 +240,28 @@ class SqlAssistantPaymentStore:
                 return "malformed"
             if event.amount != order.amount_paise or event.currency != order.currency:
                 return "mismatch"
-            return "granted" if await self._grant(session, event.order_id, event.payment_id) else "already_granted"
+            return await self._grant(session, event.order_id, event.payment_id)
         if event.event_type == "payment.failed":
             if order.status == "created":
                 order.status = "failed"
             return "failed_recorded"
         if not event.full_refund:
             return "partial_refund"
+        # An order can see a second, late payment that Razorpay refunds by itself. Refunding
+        # that one must not touch the pass the first payment bought.
+        if order.status == "paid" and event.payment_id != order.razorpay_payment_id:
+            return "refund_other_payment"
         await self._refund(session, order)
         return "refunded"
 
     async def _refund(self, session: AsyncSession, order: AssistantPayment) -> None:
-        """Takes back what this payment gave. An order not yet paid is only marked, which
-        stops a late capture event from granting it."""
-        if order.status == "paid" and order.user_id is not None:
+        """Takes back what this payment gave, if that is still in effect. Paid before the
+        current run of passes began means it had lapsed, so the newer pass isn't touched. An
+        order not yet paid is only marked, which stops a late capture event from granting it."""
+        if order.status == "paid" and order.user_id is not None and order.paid_at is not None:
             await session.execute(
                 update(AssistantAccess)
-                .where(AssistantAccess.user_id == order.user_id)
+                .where(AssistantAccess.user_id == order.user_id, AssistantAccess.period_started_at <= order.paid_at)
                 .values(
                     expires_at=AssistantAccess.expires_at - timedelta(days=order.pass_days),
                     tokens_limit=func.greatest(AssistantAccess.tokens_limit - order.pass_tokens, 0),
@@ -219,7 +270,7 @@ class SqlAssistantPaymentStore:
             )
         order.status = "refunded"
 
-    async def _grant(self, session: AsyncSession, order_id: str, payment_id: str) -> bool:
+    async def _grant(self, session: AsyncSession, order_id: str, payment_id: str) -> _GrantResult:
         """The update's row lock makes verify and the webhook take turns. Whichever comes
         second matches no row and grants nothing. Days and tokens come from the order, so
         a later settings change doesn't alter what was already bought."""
@@ -232,13 +283,14 @@ class SqlAssistantPaymentStore:
             )
         ).one_or_none()
         if paid is None:
-            return False
-        if paid.user_id is None:  # the account was deleted before the payment arrived
-            return True
+            return "already_granted"
+        if paid.user_id is None:
+            logger.error("Money taken for a deleted account, refund it by hand: order=%s payment=%s", order_id, payment_id)
+            return "no_account"
         days = timedelta(days=paid.pass_days)
         still_running = AssistantAccess.expires_at > func.now()
         upsert = insert(AssistantAccess).values(
-            user_id=paid.user_id, expires_at=func.now() + days, tokens_limit=paid.pass_tokens, tokens_used=0
+            user_id=paid.user_id, expires_at=func.now() + days, tokens_limit=paid.pass_tokens, tokens_used=0, period_started_at=func.now()
         )
         await session.execute(
             upsert.on_conflict_do_update(
@@ -249,9 +301,10 @@ class SqlAssistantPaymentStore:
                         else_=paid.pass_tokens,
                     ),
                     "tokens_used": 0,
+                    "period_started_at": case((still_running, AssistantAccess.period_started_at), else_=func.now()),
                     "expires_at": func.greatest(AssistantAccess.expires_at, func.now(), type_=DateTime(timezone=True)) + days,
                     "updated_at": func.now(),
                 },
             )
         )
-        return True
+        return "granted"

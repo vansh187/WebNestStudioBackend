@@ -87,6 +87,7 @@ class FakeStore:
         self.calls = calls
         self.tokens = tokens
         self.user_tokens = user_tokens
+        self.week_tokens = 0
         self.recorded: list[tuple[int, int]] = []
         self.reservations: list[TokenCounts] = []
         self.released = 0
@@ -103,6 +104,8 @@ class FakeStore:
             return CallReservation(denied="user_calls", calls_today=self.calls)
         if self.user_tokens + reserved.total >= limits.user_tokens:
             return CallReservation(denied="user_tokens", calls_today=self.calls)
+        if limits.user_weekly_tokens is not None and self.week_tokens + reserved.total >= limits.user_weekly_tokens:
+            return CallReservation(denied="user_weekly_tokens", calls_today=self.calls)
         self.calls += 1
         self.reservations.append(reserved)
         return CallReservation(denied=None, calls_today=self.calls)

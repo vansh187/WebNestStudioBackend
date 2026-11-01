@@ -139,6 +139,8 @@ async def lifespan(app: FastAPI):
     try:
         if container.assistant_provider is not None:
             await container.assistant_provider.aclose()
+        if container.assistant_fallback_provider is not None:
+            await container.assistant_fallback_provider.aclose()
     except Exception:
         logger.warning("Error while closing the AI assistant HTTP client", exc_info=True)
     try:

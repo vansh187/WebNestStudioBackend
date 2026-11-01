@@ -24,7 +24,7 @@ from api.assistant_router import router as assistant_router
 from core.config import Settings
 from core.dependencies import get_assistant_payment_service, get_assistant_service
 from core.error_handlers import register_error_handlers
-from core.exceptions import ExternalServiceError, RateLimitedError
+from core.exceptions import DatabaseError, ExternalServiceError, RateLimitedError
 from database.assistant_payment_persistence import AccessState, NewOrder, SavedOrder, WebhookEvent, WebhookOutcome
 from services.assistant_llm import FinishedEvent, ProviderStreamError, StreamOpened, TextDelta, UsageEvent
 from services.assistant_payment_jobs import register_payment_jobs, reconcile_payments
@@ -42,10 +42,16 @@ EARLIER = datetime.now(timezone.utc) - timedelta(days=1)
 
 def settings(**changes: Any) -> SimpleNamespace:
     values = {
+        "assistant_enabled": True,
+        "assistant_provider": "groq",
+        "assistant_groq_api_key": "placeholder",
+        "assistant_anthropic_api_key": "",
         "assistant_paywall_enabled": True,
         "assistant_price_paise": 29900,
         "assistant_pass_days": 30,
         "assistant_pass_tokens": 2_000_000,
+        "assistant_pass_daily_tokens": 150_000,
+        "assistant_pass_weekly_tokens": 700_000,
         "assistant_razorpay_key_id": "rzp_test_key",
         "assistant_razorpay_key_secret": KEY_SECRET,
         "assistant_razorpay_webhook_secret": WEBHOOK_SECRET,
@@ -59,6 +65,7 @@ class FakeRazorpay:
         self.orders: list[dict[str, Any]] = []
         self.fail = False
         self.payments: dict[str, list[RazorpayPayment]] = {}
+        self.one_payment = RazorpayPayment("pay_1", "captured", 29900, "INR", "order_1")
 
     async def create_order(self, amount: int, currency: str, receipt: str, notes: dict[str, str]) -> str:
         if self.fail:
@@ -70,6 +77,11 @@ class FakeRazorpay:
         if self.fail:
             raise RazorpayError("down")
         return self.payments.get(order_id, [])
+
+    async def get_payment(self, payment_id: str) -> RazorpayPayment:
+        if self.fail:
+            raise RazorpayError("down")
+        return self.one_payment
 
     async def aclose(self) -> None:
         pass
@@ -84,6 +96,8 @@ class FakePaymentStore:
         self.events: list[WebhookEvent] = []
         self.charged: list[int] = []
         self.fail_charge = False
+        self.reserved = 0
+        self.released: list[int] = []
 
     async def get_access(self, user_id: uuid.UUID) -> AccessState | None:
         return self.access.get(user_id)
@@ -108,10 +122,21 @@ class FakePaymentStore:
         self.access[order.user_id] = AccessState(datetime.now(timezone.utc) + timedelta(days=order.pass_days), order.pass_tokens, 0)
         return True
 
+    async def reserve_tokens(self, user_id: uuid.UUID, tokens: int) -> bool:
+        state = self.access.get(user_id)
+        if state is None or state.expires_at <= datetime.now(timezone.utc) or state.tokens_used >= state.tokens_limit:
+            return False
+        self.reserved = tokens
+        self.access[user_id] = AccessState(state.expires_at, state.tokens_limit, state.tokens_used + tokens)
+        return True
+
     async def add_tokens(self, user_id: uuid.UUID, tokens: int) -> AccessState | None:
         if self.fail_charge:
             raise RuntimeError("database down")
-        self.charged.append(tokens)
+        # What the call really spent: its change on top of what it reserved.
+        if tokens + self.reserved == 0:
+            self.released.append(self.reserved)
+        self.charged.append(tokens + self.reserved)
         state = self.access.get(user_id)
         if state is None:
             return None
@@ -122,7 +147,7 @@ class FakePaymentStore:
         self.events.append(event)
         return "ignored"
 
-    async def open_orders(self, since: datetime, limit: int) -> list[SavedOrder]:
+    async def open_orders(self, since: datetime, limit: int, per_user: int) -> list[SavedOrder]:
         return [self._saved(order) for order in self.orders.values() if self.statuses[order.order_id] in ("created", "failed")]
 
 
@@ -300,9 +325,9 @@ def test_a_razorpay_failure_is_503_with_our_own_message() -> None:
 # ---- verify -----------------------------------------------------------------------------
 
 
-def verify_client(store: FakePaymentStore, user: uuid.UUID = USER) -> TestClient:
+def verify_client(store: FakePaymentStore, user: uuid.UUID = USER, razorpay: FakeRazorpay | None = None) -> TestClient:
     asyncio.run(store.save_order(NewOrder(USER, "order_1", 29900, "INR", 30, 2_000_000)))
-    return client_for(payment_service(store), user=user)
+    return client_for(payment_service(store, razorpay), user=user)
 
 
 def verify_body(order_id: str = "order_1", payment_id: str = "pay_1", signature: str | None = None) -> dict[str, str]:
@@ -383,6 +408,56 @@ def test_a_bad_verify_body_gives_400_without_echoing_it(raw: bytes) -> None:
     response = verify_client(FakePaymentStore()).post("/api/assistant/payments/verify", content=raw)
     assert response.status_code == 400
     assert response.json() == {"detail": "This payment could not be verified."}
+
+
+@pytest.mark.parametrize(
+    "payment",
+    [
+        RazorpayPayment("pay_1", "authorized", 29900, "INR", "order_1"),
+        RazorpayPayment("pay_1", "failed", 29900, "INR", "order_1"),
+        RazorpayPayment("pay_1", "captured", 29900, "INR", "order_other"),
+        RazorpayPayment("pay_1", "captured", 1, "INR", "order_1"),
+        RazorpayPayment("pay_1", "captured", 29900, "USD", "order_1"),
+        RazorpayPayment("pay_1", "captured", 29900, "INR", None),
+    ],
+    ids=["only_authorized", "failed", "another_order", "wrong_amount", "wrong_currency", "no_order"],
+)
+def test_a_valid_signature_alone_grants_nothing_until_the_money_is_captured(payment: RazorpayPayment) -> None:
+    store = FakePaymentStore()
+    razorpay = FakeRazorpay()
+    razorpay.one_payment = payment
+    response = verify_client(store, razorpay=razorpay).post("/api/assistant/payments/verify", json=verify_body())
+    assert response.status_code == 200, "the panel keeps reading usage"
+    assert response.json()["access"]["active"] is False
+    assert store.grants == []
+
+
+def test_razorpay_being_down_during_verify_grants_nothing_and_is_not_an_error() -> None:
+    store = FakePaymentStore()
+    razorpay = FakeRazorpay()
+    razorpay.fail = True
+    assert verify_client(store, razorpay=razorpay).post("/api/assistant/payments/verify", json=verify_body()).status_code == 200
+    assert store.grants == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"assistant_enabled": False},
+        {"assistant_groq_api_key": ""},
+        {"assistant_provider": "other"},
+    ],
+    ids=["assistant_off", "no_provider_key", "unknown_provider"],
+)
+def test_nobody_can_pay_while_the_assistant_can_not_answer(changes: dict[str, Any]) -> None:
+    razorpay = FakeRazorpay()
+    assert client_for(payment_service(razorpay=razorpay, **changes)).post("/api/assistant/payments/order").status_code == 503
+    assert razorpay.orders == []
+
+
+def test_claude_alone_is_enough_to_sell_a_pass() -> None:
+    service = payment_service(assistant_provider="anthropic", assistant_groq_api_key="", assistant_anthropic_api_key="key")
+    assert client_for(service).post("/api/assistant/payments/order").status_code == 200
 
 
 # ---- the webhook's signature ------------------------------------------------------------
@@ -514,6 +589,13 @@ def test_the_webhook_secret_is_read_from_each_accepted_name(name: str, monkeypat
 # ---- reading Razorpay's event shapes ----------------------------------------------------
 
 
+def test_a_refund_reads_its_payment_id_from_either_entity() -> None:
+    from_payment = {"event": "refund.processed", "payload": {"payment": {"entity": {"id": "pay_a", "order_id": "o"}}, "refund": {"entity": {"payment_id": "pay_b"}}}}
+    assert parse_webhook("e", from_payment).payment_id == "pay_a"
+    from_refund = {"event": "refund.processed", "payload": {"payment": {"entity": {"order_id": "o"}}, "refund": {"entity": {"payment_id": "pay_b"}}}}
+    assert parse_webhook("e", from_refund).payment_id == "pay_b"
+
+
 def test_payment_captured_is_read_from_the_payment_entity() -> None:
     event = parse_webhook("e", captured_body())
     assert (event.order_id, event.payment_id, event.amount, event.currency) == ("order_1", "pay_1", 29900, "INR")
@@ -632,6 +714,48 @@ def test_paying_users_are_not_stopped_by_the_free_daily_limits() -> None:
     assert client_for(payments, assistant).post("/api/assistant/chat", json=BODY).status_code == 200
 
 
+def test_the_daily_cap_stops_a_paying_user_at_150000() -> None:
+    usage_store = FakeStore(user_tokens=150_000)
+    provider = FakeProvider()
+    assistant, payments = paid_service(FakePaymentStore(AccessState(LATER, 2_000_000, 0)), provider, usage_store)
+    response = client_for(payments, assistant).post("/api/assistant/chat", json=BODY)
+    assert response.status_code == 429
+    assert response.json() == {"detail": "You have used your AI assistant allowance for today."}
+    assert int(response.headers["retry-after"]) > 0
+    assert provider.requests == []
+
+
+def test_the_weekly_cap_stops_a_paying_user_at_700000() -> None:
+    usage_store = FakeStore()
+    usage_store.week_tokens = 700_000
+    provider = FakeProvider()
+    assistant, payments = paid_service(FakePaymentStore(AccessState(LATER, 2_000_000, 0)), provider, usage_store)
+    response = client_for(payments, assistant).post("/api/assistant/chat", json=BODY)
+    assert response.status_code == 429
+    assert response.json() == {"detail": "You have used your AI assistant allowance for this week. It frees up day by day."}
+    assert int(response.headers["retry-after"]) > 0
+    assert provider.requests == []
+
+
+def test_the_caps_can_be_changed_by_settings() -> None:
+    usage_store = FakeStore(user_tokens=150_000)
+    assistant, payments = paid_service(FakePaymentStore(AccessState(LATER, 2_000_000, 0)), usage_store=usage_store, assistant_pass_daily_tokens=500_000)
+    assert client_for(payments, assistant).post("/api/assistant/chat", json=BODY).status_code == 200
+
+
+def test_the_default_caps_are_150000_a_day_and_700000_a_week() -> None:
+    from core.config import Settings
+
+    defaults = Settings(_env_file=None)
+    assert (defaults.assistant_pass_tokens, defaults.assistant_pass_weekly_tokens, defaults.assistant_pass_daily_tokens) == (2_000_000, 700_000, 150_000)
+
+
+def test_a_cap_blocks_chat_but_not_the_badge() -> None:
+    usage_store = FakeStore(user_tokens=150_000)
+    assistant, payments = paid_service(FakePaymentStore(AccessState(LATER, 2_000_000, 0)), usage_store=usage_store)
+    assert client_for(payments, assistant).get("/api/assistant/membership").json()["is_prime"] is True
+
+
 def test_the_global_daily_cap_still_stops_paying_users() -> None:
     usage_store = FakeStore(tokens=10**9)
     assistant, payments = paid_service(FakePaymentStore(AccessState(LATER, 2_000_000, 0)), usage_store=usage_store)
@@ -708,6 +832,103 @@ def test_a_client_leaving_during_the_charge_does_not_lose_the_count() -> None:
     asyncio.run(main())
 
 
+def test_a_refused_call_gives_its_reservation_back() -> None:
+    from services.assistant_llm import ProviderRateLimitedError
+
+    store = FakePaymentStore(AccessState(LATER, 1000, 100))
+    assistant, payments = paid_service(store, FakeProvider([ProviderRateLimitedError(5)]))
+    assert client_for(payments, assistant).post("/api/assistant/chat", json=BODY).status_code == 429
+    assert store.access[USER].tokens_used == 100
+
+
+def test_a_call_stopped_by_a_daily_cap_gives_its_reservation_back() -> None:
+    store = FakePaymentStore(AccessState(LATER, 2_000_000, 100))
+    assistant, payments = paid_service(store, usage_store=FakeStore(user_tokens=150_000))
+    assert client_for(payments, assistant).post("/api/assistant/chat", json=BODY).status_code == 429
+    assert store.access[USER].tokens_used == 100
+
+
+def test_a_cancelled_call_gives_its_reservation_back() -> None:
+    async def main() -> None:
+        from schemas.assistant_schemas import ChatRequest
+
+        store = FakePaymentStore(AccessState(LATER, 2_000_000, 100))
+        assistant, _ = paid_service(store, FakeProvider([], hang=True))
+        opening = asyncio.create_task(assistant.open_chat(USER, ChatRequest.model_validate(BODY)))
+        await asyncio.sleep(0.01)
+        assert store.access[USER].tokens_used > 100, "reserved while it waits"
+        opening.cancel()
+        await asyncio.gather(opening, return_exceptions=True)
+        await asyncio.sleep(0.01)
+        assert store.access[USER].tokens_used == 100
+
+    asyncio.run(main())
+
+
+def test_a_stuck_database_giving_back_does_not_hold_up_the_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from schemas.assistant_schemas import ChatRequest
+    from services import assistant_service
+    from services.assistant_llm import ProviderRateLimitedError
+    from services.assistant_service import AssistantRateLimitedError
+
+    monkeypatch.setattr(assistant_service, "_REFUSAL_WAIT_SECONDS", 0.02)
+
+    class StuckStore(FakePaymentStore):
+        def __init__(self, access: AccessState) -> None:
+            super().__init__(access)
+            self.gate: asyncio.Event | None = None
+
+        async def add_tokens(self, user_id: uuid.UUID, tokens: int) -> AccessState | None:
+            assert self.gate is not None
+            await self.gate.wait()
+            return await super().add_tokens(user_id, tokens)
+
+    async def main() -> None:
+        store = StuckStore(AccessState(LATER, 2_000_000, 100))
+        store.gate = asyncio.Event()
+        assistant, _ = paid_service(store, FakeProvider([ProviderRateLimitedError(5)]))
+        with pytest.raises(AssistantRateLimitedError):
+            await asyncio.wait_for(assistant.open_chat(USER, ChatRequest.model_validate(BODY)), 1)
+        store.gate.set()
+        await asyncio.sleep(0.01)
+        assert store.access[USER].tokens_used == 100
+
+    asyncio.run(main())
+
+
+def test_a_reply_that_failed_with_nothing_delivered_costs_the_pass_nothing() -> None:
+    store = FakePaymentStore(AccessState(LATER, 1000, 100))
+    usage_store = FakeStore()
+    assistant, payments = paid_service(store, FakeProvider([StreamOpened(), ProviderStreamError("provider_error")]), usage_store)
+    assert parse_sse(client_for(payments, assistant).post("/api/assistant/chat", json=BODY).text)[-1][0] == "error"
+    assert store.charged == [0]
+    assert store.access[USER].tokens_used == 100
+    assert usage_store.recorded[0][0] > 0, "the daily caps still count the estimate"
+
+
+def test_a_reply_with_reported_usage_is_charged_even_if_it_failed() -> None:
+    store = FakePaymentStore(AccessState(LATER, 1000, 0))
+    assistant, payments = paid_service(store, FakeProvider([StreamOpened(), UsageEvent(30, 0), ProviderStreamError("provider_error")]))
+    client_for(payments, assistant).post("/api/assistant/chat", json=BODY)
+    assert store.charged == [30]
+
+
+def test_paying_users_see_no_free_daily_limit() -> None:
+    usage_store = FakeStore(calls=120)
+    assistant, payments = paid_service(FakePaymentStore(AccessState(LATER, 2_000_000, 0)), usage_store=usage_store)
+    client = client_for(payments, assistant)
+    assert client.get("/api/assistant/usage").json()["calls_limit"] == 0
+    usage = dict(parse_sse(client.post("/api/assistant/chat", json=BODY).text))["usage"]
+    assert usage["calls_limit"] == 0
+
+
+def test_free_users_still_see_their_daily_limit() -> None:
+    assistant, payments = paid_service(FakePaymentStore(), assistant_paywall_enabled=False)
+    client = client_for(payments, assistant)
+    assert client.get("/api/assistant/usage").json()["calls_limit"] == 40
+    assert dict(parse_sse(client.post("/api/assistant/chat", json=BODY).text))["usage"]["calls_limit"] == 40
+
+
 def test_a_failed_charge_does_not_break_the_reply() -> None:
     store = FakePaymentStore(AccessState(LATER, 1000, 0))
     store.fail_charge = True
@@ -751,6 +972,40 @@ def test_reconciliation_survives_razorpay_being_down() -> None:
     razorpay.fail = True
     assert asyncio.run(service.reconcile()) == 0
     assert store.grants == []
+
+
+def test_a_database_error_on_one_order_does_not_stop_the_rest() -> None:
+    class FlakyStore(FakePaymentStore):
+        async def grant(self, order_id: str, payment_id: str) -> bool:
+            if order_id == "order_bad":
+                raise DatabaseError("timed out")
+            return await super().grant(order_id, payment_id)
+
+    store = FlakyStore()
+    razorpay = FakeRazorpay()
+    for order_id, payment_id in (("order_bad", "pay_bad"), ("order_good", "pay_good")):
+        asyncio.run(store.save_order(NewOrder(USER, order_id, 29900, "INR", 30, 2_000_000)))
+        razorpay.payments[order_id] = [RazorpayPayment(payment_id, "captured", 29900, "INR")]
+    assert asyncio.run(payment_service(store, razorpay).reconcile()) == 1
+    assert store.grants == [("order_good", "pay_good")]
+
+
+def test_reconciliation_checks_orders_a_few_at_a_time() -> None:
+    running = {"now": 0, "peak": 0}
+
+    class Counting(FakeRazorpay):
+        async def order_payments(self, order_id: str) -> list[RazorpayPayment]:
+            running["now"] += 1
+            running["peak"] = max(running["peak"], running["now"])
+            await asyncio.sleep(0.001)
+            running["now"] -= 1
+            return []
+
+    store = FakePaymentStore()
+    for index in range(30):
+        asyncio.run(store.save_order(NewOrder(USER, f"order_{index}", 29900, "INR", 30, 2_000_000)))
+    assert asyncio.run(payment_service(store, Counting()).reconcile()) == 0
+    assert 1 < running["peak"] <= 5
 
 
 def test_the_reconciliation_job_logs_a_failure_and_goes_no_further(caplog: pytest.LogCaptureFixture) -> None:
@@ -825,6 +1080,17 @@ def test_every_bad_answer_becomes_razorpay_error(handler: Any) -> None:
         assert "secret detail" not in str(raised.value)
 
     asyncio.run(main())
+
+
+def test_the_client_reads_one_payment_with_its_order() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"id": "pay_1", "status": "captured", "amount": 29900, "currency": "INR", "order_id": "order_1", "email": "x@example.com"})
+
+    assert asyncio.run(razorpay_client(handler).get_payment("pay_1")) == RazorpayPayment("pay_1", "captured", 29900, "INR", "order_1")
+    assert str(seen[0].url) == "https://api.razorpay.com/v1/payments/pay_1"
 
 
 def test_a_dropped_connection_becomes_razorpay_error() -> None:

@@ -286,6 +286,73 @@ def test_a_call_log_row_stores_every_number() -> None:
     scenario(body)
 
 
+def weekly(limit: int) -> DailyLimits:
+    return DailyLimits(user_calls=10**9, user_tokens=10**12, global_tokens=10**12, user_weekly_tokens=limit)
+
+
+def test_the_weekly_limit_counts_the_last_seven_days_across_models() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        today = date(2026, 11, 14)
+        for days_ago, model in ((6, "a"), (3, "b"), (0, "a")):
+            await db.store.reserve_call(key_for(user_id, model=model, day=today - timedelta(days=days_ago)), weekly(10**9), TokenCounts(300, 0))
+        denied = await db.store.reserve_call(key_for(user_id, day=today), weekly(1000), TokenCounts(100, 0))
+        assert denied.denied == "user_weekly_tokens"
+        allowed = await db.store.reserve_call(key_for(user_id, day=today), weekly(1001), TokenCounts(100, 0))
+        assert allowed.denied is None
+
+    scenario(body)
+
+
+def test_a_day_eight_days_ago_has_left_the_week() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        today = date(2026, 11, 14)
+        await db.store.reserve_call(key_for(user_id, day=today - timedelta(days=7)), weekly(10**9), TokenCounts(900, 0))
+        result = await db.store.reserve_call(key_for(user_id, day=today), weekly(1000), TokenCounts(50, 0))
+        assert result.denied is None
+
+    scenario(body)
+
+
+def test_a_denied_weekly_call_leaves_nothing_behind() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        result = await db.store.reserve_call(key_for(user_id), weekly(10), TokenCounts(50, 0))
+        assert result.denied == "user_weekly_tokens"
+        assert await db.row(user_id) is None
+        assert await db.other_connections() == 0
+
+    scenario(body)
+
+
+def test_another_users_tokens_dont_count_towards_the_week() -> None:
+    async def body(db: Db) -> None:
+        first, second = await db.user(), await db.user()
+        await db.store.reserve_call(key_for(first), weekly(10**9), TokenCounts(900, 0))
+        assert (await db.store.reserve_call(key_for(second), weekly(1000), TokenCounts(50, 0))).denied is None
+
+    scenario(body)
+
+
+def test_parallel_calls_can_not_pass_the_weekly_limit() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        results = await asyncio.gather(*(db.store.reserve_call(key_for(user_id), weekly(1000), TokenCounts(100, 0)) for _ in range(30)))
+        assert sum(result.denied is None for result in results) == 9
+        assert await db.other_connections() == 0
+
+    scenario(body)
+
+
+def test_no_weekly_limit_means_no_weekly_check() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        assert (await db.store.reserve_call(key_for(user_id), limits(), NO_TOKENS)).denied is None
+
+    scenario(body)
+
+
 def test_every_call_gets_its_own_row() -> None:
     async def body(db: Db) -> None:
         user_id = await db.user()
