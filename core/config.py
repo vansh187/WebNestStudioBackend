@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -107,6 +108,29 @@ class Settings(BaseSettings):
     chatbot_max_message_length: int = 1000
     chatbot_max_transcript_messages: int = 20
     chatbot_plan_max_weeks: int = 20
+
+    # CodeLab AI coding assistant: a streaming proxy to Groq, off by default.
+    # Its key belongs to its own Groq organization (Groq limits per organization),
+    # so it can't use up the quota of the features above. Never reuse GROQ_API_KEY.
+    assistant_enabled: bool = False
+    assistant_provider: str = "groq"
+    assistant_model: str = "openai/gpt-oss-120b"
+    assistant_groq_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "ASSISTANT_GROQ_API_KEY", "AI_CODE_ASSISTANT_GROQ_API_KEY", "AI_CODE_ASSISTANT", "assistant_groq_api_key"
+        ),
+    )
+    assistant_groq_base_url: str = "https://api.groq.com/openai/v1"
+    assistant_max_output_tokens: int = 2000
+    # Input budget per call: with the output above it stays under Groq's 8,000 tokens/minute.
+    assistant_max_input_tokens: int = 5000
+    assistant_user_daily_calls: int = 40
+    # 40 full-size calls would be about 280,000 tokens, more than the global cap below,
+    # so one user needs a token limit too or they could use up everyone's budget.
+    assistant_user_daily_tokens: int = 60000
+    assistant_global_daily_tokens: int = 180000
+    assistant_timeout_seconds: float = 120.0
 
     # Coding platform compiler proxy. Executed code runs on JDoodle's hosted
     # sandbox (https://www.jdoodle.com/compiler-api), never inside this API process.

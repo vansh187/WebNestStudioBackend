@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.admin_router import router as admin_router
+from api.assistant_router import router as assistant_router
 from api.auth_router import router as auth_router
 from api.chat_router import router as chat_router
 from api.client_router import router as client_router
@@ -116,6 +117,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Error while shutting down the blog generation scheduler", exc_info=True)
     try:
+        if container.assistant_provider is not None:
+            await container.assistant_provider.aclose()
+    except Exception:
+        logger.warning("Error while closing the AI assistant HTTP client", exc_info=True)
+    try:
         await container.storage_service.aclose()
     except Exception:
         logger.warning("Error while closing the storage service HTTP client", exc_info=True)
@@ -154,6 +160,8 @@ class WebNestStudioApp:
                 allow_credentials=True,
                 allow_methods=["*"],
                 allow_headers=["*"],
+                # The browser can't read a cross-origin Retry-After unless it is exposed.
+                expose_headers=["Retry-After"],
             ),
         )
 
@@ -171,6 +179,7 @@ class WebNestStudioApp:
             generation_router,
             chat_router,
             coding_router,
+            assistant_router,
             java_playground_router,
             codelab_router,
             codelab_admin_router,
