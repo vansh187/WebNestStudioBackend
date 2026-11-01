@@ -7,11 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import Settings, settings
 from core.exceptions import UnauthorizedError
 from core.security import JWTHandler, OtpGenerator, PasswordHasher
+from database.assistant_payment_persistence import SqlAssistantPaymentStore
 from database.assistant_usage_persistence import SqlAssistantUsageStore
 from database.models import User
 from database.session import Database
 from services.assistant_llm import build_assistant_provider
+from services.assistant_payment_service import AssistantPaymentService, OrderRateLimiter
 from services.assistant_service import ActiveStreamRegistry, AssistantService
+from services.razorpay_client import HttpRazorpayClient
 from services.auth_service import AuthService
 from services.blog_generation_service import BlogGenerationService
 from services.blog_scheduler import create_scheduler
@@ -57,6 +60,10 @@ class DependencyContainer:
         self.assistant_provider = build_assistant_provider(app_settings)
         self.assistant_usage_store = SqlAssistantUsageStore(self.database.session_scope)
         self.assistant_streams = ActiveStreamRegistry()
+        self.razorpay_client = HttpRazorpayClient(app_settings)
+        self.assistant_payments = AssistantPaymentService(
+            app_settings, SqlAssistantPaymentStore(self.database.session_scope), self.razorpay_client, OrderRateLimiter()
+        )
 
 
 container = DependencyContainer(settings)
@@ -159,7 +166,12 @@ def get_assistant_service() -> AssistantService:
         provider=container.assistant_provider,
         store=container.assistant_usage_store,
         registry=container.assistant_streams,
+        payments=container.assistant_payments,
     )
+
+
+def get_assistant_payment_service() -> AssistantPaymentService:
+    return container.assistant_payments
 
 
 def get_plan_pdf_service() -> PlanPdfService:

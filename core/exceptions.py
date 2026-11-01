@@ -49,6 +49,10 @@ class DatabaseError(DomainError):
     (connection drop, constraint violation not otherwise mapped, timeout, etc.)."""
 
 
+class PaymentRequiredError(DomainError):
+    """Raised when a paid feature is used without active access - maps to 402."""
+
+
 class RateLimitedError(DomainError):
     """Raised when a caller must wait before retrying (e.g. OTP resend cooldown)."""
 

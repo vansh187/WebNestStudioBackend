@@ -108,7 +108,9 @@ async def chat(
     return AssistantStreamingResponse(stream)
 
 
-@router.get("/usage", response_model=AssistantUsageResponse)
+# exclude_unset: access stays out completely with the paywall off, yet a null expires_at
+# inside access is still sent.
+@router.get("/usage", response_model=AssistantUsageResponse, response_model_exclude_unset=True)
 async def usage(
     user_id: uuid.UUID = Depends(get_assistant_user_id),
     assistant_service: AssistantService = Depends(get_assistant_service),

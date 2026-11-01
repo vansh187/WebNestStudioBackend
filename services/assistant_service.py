@@ -6,10 +6,11 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from typing import Any
 
 from core.config import Settings
@@ -22,7 +23,7 @@ from database.assistant_usage_persistence import (
     TokenCounts,
     UsageKey,
 )
-from schemas.assistant_schemas import AssistantMode, AssistantUsageResponse, ChatRequest
+from schemas.assistant_schemas import AccessResponse, AssistantMode, AssistantUsageResponse, ChatRequest
 from services.assistant_llm import (
     AssistantProvider,
     FinishedEvent,
@@ -39,6 +40,7 @@ from services.assistant_llm import (
     ToolCallEvent,
     UsageEvent,
 )
+from services.assistant_payment_service import AssistantPaymentService
 from services.assistant_prompt_optimizer import CHARS_PER_TOKEN, optimize_conversation
 from services.assistant_prompts import prefix_chars, system_prompt, tool_names, tools_for
 
@@ -56,6 +58,9 @@ _REFUSAL_WAIT_SECONDS = 1.0
 # Refused calls are refunded, so no daily limit stops a loop of them: this bounds their rows.
 _UNOPENED_LOG_WINDOW_SECONDS = 60.0
 _UNOPENED_LOG_MAX_TRACKED = 10_000
+# Paying users are limited by their pass's tokens, not by the free daily limits.
+_NO_DAILY_LIMIT = 10**15
+_PROVIDER_NAMES = {"groq": "Groq", "anthropic": "Anthropic"}
 _UNAVAILABLE_MESSAGE = "The AI assistant is not available right now. Please try again later."
 _STREAM_ERROR_MESSAGES: dict[StreamErrorCode, str] = {
     "provider_error": "The AI service stopped responding. Please try again.",
@@ -160,6 +165,7 @@ class AssistantChatStream:
         started_at: float,
         ping_interval: float,
         max_seconds: float,
+        charge: Callable[[int], Awaitable[AccessResponse | None]] | None = None,
     ) -> None:
         self._key = key
         self._reserved = reserved
@@ -176,6 +182,8 @@ class AssistantChatStream:
         self._started_at = started_at
         self._ping_interval = ping_interval
         self._max_seconds = max_seconds
+        self._charge = charge
+        self._charge_task: asyncio.Task[AccessResponse | None] | None = None
         self._usage: UsageEvent | None = None
         self._output_chars = 0
         self._first_output_ms: int | None = None
@@ -229,15 +237,19 @@ class AssistantChatStream:
             actual = self._tokens()
             self._outcome = "completed"
             self._release_slot()
-            yield _sse(
-                "usage",
-                {
-                    "input_tokens": actual.input_tokens,
-                    "output_tokens": actual.output_tokens,
-                    "calls_used_today": self._calls_used_today,
-                    "calls_limit": self._calls_limit,
-                },
-            )
+            usage: dict[str, Any] = {
+                "input_tokens": actual.input_tokens,
+                "output_tokens": actual.output_tokens,
+                "calls_used_today": self._calls_used_today,
+                "calls_limit": self._calls_limit,
+            }
+            charging = self._start_charge(actual)
+            if charging is not None:
+                # Shielded: the client leaving here must not lose the count.
+                access = await asyncio.shield(charging)
+                if access is not None:
+                    usage["access"] = access.model_dump(mode="json")
+            yield _sse("usage", usage)
             yield _sse("done", {"finish_reason": finish})
         except Exception as exc:
             # Headers are long gone, so the contract's error event is the only way to report it.
@@ -266,7 +278,9 @@ class AssistantChatStream:
         actual = self._tokens()
         # Separate writes, so neither can cost the other its record, and side by side, so
         # a stuck database delays this by one time limit rather than two.
+        charging = self._start_charge(actual)
         await asyncio.gather(
+            *([charging] if charging is not None else []),
             self._settle(actual),
             write_call_log(
                 self._store,
@@ -297,6 +311,21 @@ class AssistantChatStream:
             self._sizes.request_chars,
             self._sizes.sent_chars,
         )
+
+    def _start_charge(self, actual: TokenCounts) -> asyncio.Task[AccessResponse | None] | None:
+        """Counts this call against the user's pass, once, however the reply ended."""
+        if self._charge is None:
+            return None
+        if self._charge_task is None:
+            self._charge_task = asyncio.create_task(self._charge_pass(self._charge, actual))
+        return self._charge_task
+
+    async def _charge_pass(self, charge: Callable[[int], Awaitable[AccessResponse | None]], actual: TokenCounts) -> AccessResponse | None:
+        try:
+            return await charge(actual.total)
+        except Exception as exc:
+            logger.error("Could not count assistant tokens against the pass: user=%s %s", self._key.user_id, type(exc).__name__)
+            return None
 
     async def _settle(self, actual: TokenCounts) -> None:
         try:
@@ -369,7 +398,9 @@ class AssistantService:
         registry: ActiveStreamRegistry,
         ping_interval: float = PING_INTERVAL_SECONDS,
         max_stream_seconds: float = MAX_STREAM_SECONDS,
+        payments: AssistantPaymentService | None = None,
     ) -> None:
+        self._payments = payments
         self._settings = settings
         self._provider = provider
         self._store = store
@@ -384,11 +415,22 @@ class AssistantService:
         if not self.is_enabled():
             raise GenerationUnavailableError("The AI assistant is switched off.")
 
+    def _paywall(self) -> AssistantPaymentService | None:
+        return self._payments if self._payments is not None and self._payments.paywall_enabled else None
+
     async def get_usage(self, user_id: uuid.UUID) -> AssistantUsageResponse:
+        calls_used_today = await self._store.calls_today(user_id, _utc_today())
+        calls_limit = self._settings.assistant_user_daily_calls
+        paywall = self._paywall()
+        if paywall is None:
+            return AssistantUsageResponse(enabled=self.is_enabled(), calls_used_today=calls_used_today, calls_limit=calls_limit)
+        provider = self._provider.name if self._provider is not None else None
         return AssistantUsageResponse(
             enabled=self.is_enabled(),
-            calls_used_today=await self._store.calls_today(user_id, _utc_today()),
-            calls_limit=self._settings.assistant_user_daily_calls,
+            calls_used_today=calls_used_today,
+            calls_limit=calls_limit,
+            provider_name=_PROVIDER_NAMES.get(provider, provider) if provider is not None else None,
+            access=await paywall.get_access(user_id),
         )
 
     def build_request(self, payload: ChatRequest) -> BuiltRequest:
@@ -435,6 +477,9 @@ class AssistantService:
 
     async def _open_reserved(self, user_id: uuid.UUID, payload: ChatRequest, provider: AssistantProvider) -> AssistantChatStream:
         started_at = time.perf_counter()
+        paywall = self._paywall()
+        if paywall is not None:
+            await paywall.ensure_access(user_id)
         key = UsageKey(user_id=user_id, day=_utc_today(), provider=provider.name, model=provider.model)
         # Built first: nothing here can fail after a call has been counted.
         built = self.build_request(payload)
@@ -442,8 +487,8 @@ class AssistantService:
         # The most this call can spend, so it counts towards the caps while in flight.
         reserved = TokenCounts(built.estimated_tokens, request.max_output_tokens)
         limits = DailyLimits(
-            user_calls=self._settings.assistant_user_daily_calls,
-            user_tokens=self._settings.assistant_user_daily_tokens,
+            user_calls=_NO_DAILY_LIMIT if paywall is not None else self._settings.assistant_user_daily_calls,
+            user_tokens=_NO_DAILY_LIMIT if paywall is not None else self._settings.assistant_user_daily_tokens,
             global_tokens=self._settings.assistant_global_daily_tokens,
         )
         reservation = await self._store.reserve_call(key, limits, reserved)
@@ -496,6 +541,7 @@ class AssistantService:
             started_at=started_at,
             ping_interval=self._ping_interval,
             max_seconds=self._max_stream_seconds,
+            charge=partial(paywall.add_tokens, user_id) if paywall is not None else None,
         )
 
     def _unopened_entry(
