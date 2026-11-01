@@ -35,8 +35,10 @@ class AssistantStreamingResponse(StreamingResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            with anyio.move_on_after(self._chat.max_seconds):
+            with anyio.move_on_after(self._chat.max_seconds) as limit:
                 await super().__call__(scope, receive, send)
+            if limit.cancelled_caught:
+                self._chat.mark_timed_out()
         finally:
             # A disconnect cancels this task; usage must still be recorded.
             with anyio.CancelScope(shield=True):

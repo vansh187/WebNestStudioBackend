@@ -131,6 +131,8 @@ class Settings(BaseSettings):
     assistant_user_daily_tokens: int = 60000
     assistant_global_daily_tokens: int = 180000
     assistant_timeout_seconds: float = 120.0
+    # How long assistant_call_log rows are kept. 0 keeps them forever.
+    assistant_call_log_retention_days: int = 90
 
     # Coding platform compiler proxy. Executed code runs on JDoodle's hosted
     # sandbox (https://www.jdoodle.com/compiler-api), never inside this API process.

@@ -3,10 +3,12 @@ there). Uses EXAMS_TEST_DATABASE_URL - a throwaway database, never the productio
 one in .env - and is skipped when it is not set."""
 
 import asyncio
+import dataclasses
 import os
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 os.environ.setdefault("SUPABASE_URL", "postgresql://user:pass@localhost:5432/test")
 os.environ.setdefault("JWT_SECRET_KEY", "test-secret")
@@ -17,13 +19,22 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from core.exceptions import DatabaseError
-from database.assistant_usage_persistence import DailyLimits, SqlAssistantUsageStore, TokenCounts, UsageKey
-from database.models import AssistantUsage, User
+from database.assistant_usage_persistence import (
+    CallLogEntry,
+    DailyLimits,
+    PromptSizes,
+    SqlAssistantUsageStore,
+    TokenCounts,
+    UsageKey,
+)
+from database.models import AssistantCallLog, AssistantUsage, User
 from database.session import Base
 
 TEST_DB_URL = os.environ.get("EXAMS_TEST_DATABASE_URL", "")
 DAY = date(2026, 10, 31)
-TABLES = [User.__table__, AssistantUsage.__table__]
+TABLES = [User.__table__, AssistantUsage.__table__, AssistantCallLog.__table__]
+MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
+CALL_LOG_MIGRATIONS = [MIGRATIONS / "015_assistant_call_log.sql", MIGRATIONS / "016_assistant_call_log_turn_chars.sql"]
 NO_TOKENS = TokenCounts()
 
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="EXAMS_TEST_DATABASE_URL is not set")
@@ -222,6 +233,182 @@ def test_a_stuck_database_times_out_and_hands_its_connection_back() -> None:
         assert await db.other_connections() == 0
         row = await db.row(user_id)
         assert row is not None and (row.calls, row.input_tokens) == (1, 0), "the timed-out writes left nothing behind"
+
+    scenario(body)
+
+
+def entry_for(user_id: uuid.UUID, outcome: str = "completed") -> CallLogEntry:
+    return CallLogEntry(
+        key=key_for(user_id),
+        mode="agent",
+        outcome=outcome,
+        tokens=TokenCounts(100, 20),
+        cached_tokens=30,
+        exact_usage=True,
+        sizes=PromptSizes(
+            request_chars=9000,
+            sent_chars=800,
+            system_chars=600,
+            tools_chars=1700,
+            file_chars=300,
+            context_chars=100,
+            user_chars=50,
+            tool_result_chars=200,
+            history_chars=150,
+            turn_assistant_chars=75,
+        ),
+        first_output_ms=120,
+        duration_ms=900,
+    )
+
+
+async def log_rows(db: Db) -> list[AssistantCallLog]:
+    async with db.sessions() as session:
+        return list((await session.execute(select(AssistantCallLog))).scalars())
+
+
+def test_a_call_log_row_stores_every_number() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        await db.store.log_call(entry_for(user_id))
+        row = (await log_rows(db))[0]
+        assert row.id is not None
+        assert row.user_id == user_id
+        assert (row.provider, row.model, row.mode, row.outcome, row.exact_usage) == ("groq", "m", "agent", "completed", True)
+        assert (row.input_tokens, row.output_tokens, row.cached_tokens) == (100, 20, 30)
+        assert (row.request_chars, row.sent_chars, row.system_chars, row.tools_chars) == (9000, 800, 600, 1700)
+        assert (row.file_chars, row.context_chars, row.user_chars, row.tool_result_chars, row.history_chars) == (300, 100, 50, 200, 150)
+        assert row.turn_assistant_chars == 75
+        assert (row.first_output_ms, row.duration_ms) == (120, 900)
+        assert row.created_at is not None
+        assert await db.other_connections() == 0
+
+    scenario(body)
+
+
+def test_every_call_gets_its_own_row() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        await asyncio.gather(*(db.store.log_call(entry_for(user_id)) for _ in range(10)))
+        assert len(await log_rows(db)) == 10
+        assert await db.other_connections() == 0
+
+    scenario(body)
+
+
+def test_a_deleted_accounts_rows_stay_with_no_link_to_the_person() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        await db.store.log_call(entry_for(user_id))
+        async with db.engine.begin() as connection:
+            await connection.execute(text("delete from users where id = :u"), {"u": user_id})
+        rows = await log_rows(db)
+        assert [(row.user_id, row.input_tokens) for row in rows] == [(None, 100)]
+
+    scenario(body)
+
+
+def test_the_purge_removes_only_rows_older_than_the_cutoff() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        await db.store.log_call(entry_for(user_id, "old"))
+        await db.store.log_call(entry_for(user_id, "new"))
+        async with db.engine.begin() as connection:
+            await connection.execute(text("update assistant_call_log set created_at = now() - interval '100 days' where outcome = 'old'"))
+        removed = await db.store.purge_call_log(datetime.now(timezone.utc) - timedelta(days=90))
+        assert removed == 1
+        assert [row.outcome for row in await log_rows(db)] == ["new"]
+        assert await db.store.purge_call_log(datetime.now(timezone.utc) - timedelta(days=90)) == 0
+        assert await db.other_connections() == 0
+
+    scenario(body)
+
+
+def test_the_purge_clears_a_backlog_in_batches() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        for _ in range(7):
+            await db.store.log_call(entry_for(user_id, "old"))
+        await db.store.log_call(entry_for(user_id, "new"))
+        async with db.engine.begin() as connection:
+            await connection.execute(text("update assistant_call_log set created_at = now() - interval '100 days' where outcome = 'old'"))
+        assert await db.store.purge_call_log(datetime.now(timezone.utc) - timedelta(days=90), batch_size=2) == 7
+        assert [row.outcome for row in await log_rows(db)] == ["new"]
+        assert await db.other_connections() == 0
+
+    scenario(body)
+
+
+def test_a_failed_call_log_write_is_a_clean_error_and_frees_its_connection() -> None:
+    async def body(db: Db) -> None:
+        with pytest.raises(DatabaseError):
+            # Beyond the integer column's range, so the database refuses the row.
+            await db.store.log_call(dataclasses.replace(entry_for(await db.user()), duration_ms=2**40))
+        assert await db.other_connections() == 0
+        assert await log_rows(db) == []
+
+    scenario(body)
+
+
+def test_a_stuck_call_log_write_times_out_and_frees_its_connection() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        impatient = SqlAssistantUsageStore(db.sessions, timeout_seconds=0.3)
+        async with db.sessions() as blocker:
+            await blocker.execute(text("lock table assistant_call_log in access exclusive mode"))
+            with pytest.raises(DatabaseError):
+                await impatient.log_call(entry_for(user_id))
+            with pytest.raises(DatabaseError):
+                await impatient.purge_call_log(datetime.now(timezone.utc))
+            await blocker.rollback()
+        assert await db.other_connections() == 0
+        assert await log_rows(db) == []
+
+    scenario(body)
+
+
+def test_the_migration_builds_the_same_table_as_the_model_and_can_rerun() -> None:
+    async def columns(db: Db) -> list[tuple[str, str, str]]:
+        async with db.engine.connect() as connection:
+            rows = await connection.execute(
+                text(
+                    "select column_name, data_type, is_nullable from information_schema.columns "
+                    "where table_name = 'assistant_call_log' order by column_name"
+                )
+            )
+            return [tuple(row) for row in rows]
+
+    async def indexes(db: Db) -> list[str]:
+        async with db.engine.connect() as connection:
+            rows = await connection.execute(
+                text("select indexname || ': ' || split_part(indexdef, ' USING ', 2) from pg_indexes where tablename = 'assistant_call_log' order by 1")
+            )
+            return [row[0] for row in rows]
+
+    async def run_migration(db: Db) -> None:
+        async with db.engine.connect() as connection:
+            autocommit = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            raw = await autocommit.get_raw_connection()
+            for migration in CALL_LOG_MIGRATIONS:
+                await raw.driver_connection.execute(migration.read_text(encoding="utf-8"))
+
+    async def body(db: Db) -> None:
+        from_model = (await columns(db), await indexes(db))
+        async with db.engine.begin() as connection:
+            await connection.execute(text("drop table assistant_call_log"))
+        await run_migration(db)
+        await run_migration(db)
+        assert (await columns(db), await indexes(db)) == from_model
+        # Startup's create_all must leave an existing table exactly as the migrations built it.
+        async with db.engine.begin() as connection:
+            await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=TABLES))
+        assert (await columns(db), await indexes(db)) == from_model
+        async with db.engine.connect() as connection:
+            secured = await connection.execute(text("select relrowsecurity from pg_class where relname = 'assistant_call_log'"))
+            assert secured.scalar_one() is True
+        # The owner bypasses row level security, so the app's own writes still work.
+        await db.store.log_call(entry_for(await db.user()))
+        assert len(await log_rows(db)) == 1
 
     scenario(body)
 

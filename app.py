@@ -50,6 +50,7 @@ from exams.router_admin import router as exam_admin_router
 from exams.router_learner import router as exam_learner_router
 from exams.router_public import router as exam_public_router
 from exams.schema_upgrade import SchemaUpgradeError, upgrade_schema
+from services.assistant_jobs import register_assistant_jobs
 from services.blog_scheduler import register_blog_jobs
 from services.codelab_scheduler import register_codelab_jobs
 
@@ -107,6 +108,13 @@ async def lifespan(app: FastAPI):
         register_relay_jobs(container.scheduler, container.database)
     except Exception:
         logger.critical("Could not register the CodeLab relay cleanup job", exc_info=True)
+
+    try:
+        register_assistant_jobs(
+            container.scheduler, container.assistant_usage_store, container.settings.assistant_call_log_retention_days
+        )
+    except Exception:
+        logger.critical("Could not register the assistant call log cleanup job", exc_info=True)
 
     yield
 

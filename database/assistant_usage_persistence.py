@@ -6,20 +6,21 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import date
-from typing import Literal, Protocol
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from typing import Any, Literal, Protocol, cast
 
-from sqlalchemy import ColumnElement, Executable, case, func, select, update
+from sqlalchemy import ColumnElement, CursorResult, Executable, case, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.exceptions import DatabaseError
-from database.models import AssistantUsage
+from database.models import AssistantCallLog, AssistantUsage
 
 # Shorter than the pool's own 30-second wait, so a full pool fails fast too.
 DB_TIMEOUT_SECONDS = 10.0
+PURGE_BATCH_SIZE = 5000
 _READ_ERROR = "Could not read assistant usage right now. Please try again shortly."
 _WRITE_ERROR = "Could not save assistant usage right now. Please try again shortly."
 
@@ -57,6 +58,37 @@ class CallReservation:
     calls_today: int
 
 
+@dataclass(frozen=True)
+class PromptSizes:
+    """Characters only, never the text itself: what arrived, what was sent and where it went."""
+
+    request_chars: int = 0
+    sent_chars: int = 0
+    system_chars: int = 0
+    tools_chars: int = 0
+    file_chars: int = 0
+    context_chars: int = 0
+    user_chars: int = 0
+    tool_result_chars: int = 0
+    history_chars: int = 0
+    turn_assistant_chars: int = 0
+
+
+@dataclass(frozen=True)
+class CallLogEntry:
+    """One row of assistant_call_log."""
+
+    key: UsageKey
+    mode: str
+    outcome: str
+    tokens: TokenCounts
+    cached_tokens: int
+    exact_usage: bool
+    sizes: PromptSizes
+    first_output_ms: int | None
+    duration_ms: int
+
+
 class AssistantUsageStore(Protocol):
     async def reserve_call(self, key: UsageKey, limits: DailyLimits, reserved: TokenCounts) -> CallReservation: ...
 
@@ -65,6 +97,10 @@ class AssistantUsageStore(Protocol):
     async def settle_tokens(self, key: UsageKey, reserved: TokenCounts, actual: TokenCounts) -> None: ...
 
     async def calls_today(self, user_id: uuid.UUID, day: date) -> int: ...
+
+    async def log_call(self, entry: CallLogEntry) -> None: ...
+
+    async def purge_call_log(self, before: datetime, batch_size: int = PURGE_BATCH_SIZE) -> int: ...
 
 
 class SqlAssistantUsageStore:
@@ -158,6 +194,39 @@ class SqlAssistantUsageStore:
         )
         async with self._session(_READ_ERROR) as session:
             return int((await session.execute(statement)).scalar_one())
+
+    async def log_call(self, entry: CallLogEntry) -> None:
+        await self._write(
+            insert(AssistantCallLog).values(
+                user_id=entry.key.user_id,
+                provider=entry.key.provider,
+                model=entry.key.model,
+                mode=entry.mode,
+                outcome=entry.outcome,
+                input_tokens=entry.tokens.input_tokens,
+                output_tokens=entry.tokens.output_tokens,
+                cached_tokens=entry.cached_tokens,
+                exact_usage=entry.exact_usage,
+                first_output_ms=entry.first_output_ms,
+                duration_ms=entry.duration_ms,
+                **asdict(entry.sizes),
+            )
+        )
+
+    async def purge_call_log(self, before: datetime, batch_size: int = PURGE_BATCH_SIZE) -> int:
+        """Deletes rows older than `before`, and returns how many went. In batches, each
+        with its own time limit, so a large backlog still shrinks if a later batch fails."""
+        doomed = select(AssistantCallLog.id).where(AssistantCallLog.created_at < before).limit(batch_size)
+        statement = delete(AssistantCallLog).where(AssistantCallLog.id.in_(doomed)).execution_options(synchronize_session=False)
+        removed = 0
+        while True:
+            async with self._session(_WRITE_ERROR) as session:
+                result = await session.execute(statement)
+                await session.commit()
+                batch = cast(CursorResult[Any], result).rowcount
+            removed += batch
+            if batch < batch_size:
+                return removed
 
     def _row(self, key: UsageKey) -> tuple[ColumnElement[bool], ...]:
         return (
