@@ -7,8 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import Settings, settings
 from core.exceptions import UnauthorizedError
 from core.security import JWTHandler, OtpGenerator, PasswordHasher
+from database.assistant_usage_persistence import SqlAssistantUsageStore
 from database.models import User
 from database.session import Database
+from services.assistant_llm import build_assistant_provider
+from services.assistant_service import ActiveStreamRegistry, AssistantService
 from services.auth_service import AuthService
 from services.blog_generation_service import BlogGenerationService
 from services.blog_scheduler import create_scheduler
@@ -51,6 +54,9 @@ class DependencyContainer:
         self.storage_service = StorageService(app_settings)
         self.plan_pdf_service = PlanPdfService(app_settings)
         self.scheduler = create_scheduler()
+        self.assistant_provider = build_assistant_provider(app_settings)
+        self.assistant_usage_store = SqlAssistantUsageStore(self.database.session_scope)
+        self.assistant_streams = ActiveStreamRegistry()
 
 
 container = DependencyContainer(settings)
@@ -145,6 +151,15 @@ def get_learning_service(session: AsyncSession = Depends(get_db_session)) -> Lea
 
 def get_github_service(session: AsyncSession = Depends(get_db_session)) -> GitHubService:
     return GitHubService(session=session, settings=container.settings)
+
+
+def get_assistant_service() -> AssistantService:
+    return AssistantService(
+        settings=container.settings,
+        provider=container.assistant_provider,
+        store=container.assistant_usage_store,
+        registry=container.assistant_streams,
+    )
 
 
 def get_plan_pdf_service() -> PlanPdfService:

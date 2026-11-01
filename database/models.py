@@ -557,6 +557,20 @@ class CodingExecution(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class AssistantUsage(Base):
+    """CodeLab AI assistant calls and tokens per user, per UTC day, per model."""
+
+    __tablename__ = "assistant_usage"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True, index=True)
+    provider: Mapped[str] = mapped_column(Text, primary_key=True)
+    model: Mapped[str] = mapped_column(Text, primary_key=True)
+    calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+
+
 class JavaPlaygroundDailyUsage(Base):
     """Site-wide Java playground run counter, one row per UTC day. Kept in the
     database (not memory) so a Render idle restart cannot reset the daily cap."""
