@@ -35,8 +35,10 @@ class AssistantStreamingResponse(StreamingResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            with anyio.move_on_after(self._chat.max_seconds):
+            with anyio.move_on_after(self._chat.max_seconds) as limit:
                 await super().__call__(scope, receive, send)
+            if limit.cancelled_caught:
+                self._chat.mark_timed_out()
         finally:
             # A disconnect cancels this task; usage must still be recorded.
             with anyio.CancelScope(shield=True):
@@ -106,7 +108,9 @@ async def chat(
     return AssistantStreamingResponse(stream)
 
 
-@router.get("/usage", response_model=AssistantUsageResponse)
+# exclude_unset: access stays out completely with the paywall off, yet a null expires_at
+# inside access is still sent.
+@router.get("/usage", response_model=AssistantUsageResponse, response_model_exclude_unset=True)
 async def usage(
     user_id: uuid.UUID = Depends(get_assistant_user_id),
     assistant_service: AssistantService = Depends(get_assistant_service),

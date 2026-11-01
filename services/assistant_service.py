@@ -6,15 +6,24 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from typing import Any
 
 from core.config import Settings
 from core.exceptions import GenerationUnavailableError, PayloadTooLargeError, RateLimitedError
-from database.assistant_usage_persistence import AssistantUsageStore, DailyLimits, TokenCounts, UsageKey
-from schemas.assistant_schemas import AssistantUsageResponse, ChatRequest
+from database.assistant_usage_persistence import (
+    AssistantUsageStore,
+    CallLogEntry,
+    DailyLimits,
+    PromptSizes,
+    TokenCounts,
+    UsageKey,
+)
+from schemas.assistant_schemas import AccessResponse, AssistantMode, AssistantUsageResponse, ChatRequest
 from services.assistant_llm import (
     AssistantProvider,
     FinishedEvent,
@@ -31,6 +40,7 @@ from services.assistant_llm import (
     ToolCallEvent,
     UsageEvent,
 )
+from services.assistant_payment_service import AssistantPaymentService
 from services.assistant_prompt_optimizer import CHARS_PER_TOKEN, optimize_conversation
 from services.assistant_prompts import prefix_chars, system_prompt, tool_names, tools_for
 
@@ -43,6 +53,14 @@ MAX_STREAM_SECONDS = 600.0
 _EXPIRY_MARGIN_SECONDS = 30.0
 _QUEUE_SIZE = 64
 _PUMP_STOP_TIMEOUT_SECONDS = 5.0
+# How long a refused call's error waits on its database writes, which then carry on alone.
+_REFUSAL_WAIT_SECONDS = 1.0
+# Refused calls are refunded, so no daily limit stops a loop of them: this bounds their rows.
+_UNOPENED_LOG_WINDOW_SECONDS = 60.0
+_UNOPENED_LOG_MAX_TRACKED = 10_000
+# Paying users are limited by their pass's tokens, not by the free daily limits.
+_NO_DAILY_LIMIT = 10**15
+_PROVIDER_NAMES = {"groq": "Groq", "anthropic": "Anthropic"}
 _UNAVAILABLE_MESSAGE = "The AI assistant is not available right now. Please try again later."
 _STREAM_ERROR_MESSAGES: dict[StreamErrorCode, str] = {
     "provider_error": "The AI service stopped responding. Please try again.",
@@ -61,8 +79,11 @@ class ActiveStreamRegistry:
     """Users with a reply streaming in this process. Used on the event loop only,
     with no await between check and set, so it needs no lock."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._users: set[uuid.UUID] = set()
+        self._clock = clock
+        self._unopened_logged: dict[uuid.UUID, float] = {}
+        self._background: set[asyncio.Task[None]] = set()
 
     def acquire(self, user_id: uuid.UUID) -> bool:
         if user_id in self._users:
@@ -72,6 +93,31 @@ class ActiveStreamRegistry:
 
     def release(self, user_id: uuid.UUID) -> None:
         self._users.discard(user_id)
+
+    def keep(self, task: asyncio.Task[None]) -> None:
+        """Holds a background task until it ends, since the loop only keeps a weak reference."""
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def allow_unopened_log(self, user_id: uuid.UUID) -> bool:
+        """One audit row per user per window for calls that never opened a reply."""
+        now = self._clock()
+        last = self._unopened_logged.get(user_id)
+        if last is not None and now - last < _UNOPENED_LOG_WINDOW_SECONDS:
+            return False
+        if len(self._unopened_logged) >= _UNOPENED_LOG_MAX_TRACKED:
+            self._unopened_logged = {
+                user: logged for user, logged in self._unopened_logged.items() if now - logged < _UNOPENED_LOG_WINDOW_SECONDS
+            }
+        self._unopened_logged[user_id] = now
+        return True
+
+
+@dataclass(frozen=True)
+class BuiltRequest:
+    request: ProviderRequest
+    estimated_tokens: int
+    sizes: PromptSizes
 
 
 def _utc_today() -> date:
@@ -87,6 +133,14 @@ def _seconds_until_next_utc_day() -> int:
 def _sse(event: str, data: dict[str, Any]) -> bytes:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8", "replace")
+
+
+async def write_call_log(store: AssistantUsageStore, entry: CallLogEntry) -> None:
+    """The audit row. A failure is logged and goes no further: it must never affect a reply."""
+    try:
+        await store.log_call(entry)
+    except Exception as exc:
+        logger.error("Could not write the assistant call log: %s", type(exc).__name__)
 
 
 class AssistantChatStream:
@@ -106,11 +160,12 @@ class AssistantChatStream:
         calls_used_today: int,
         calls_limit: int,
         estimated_input_tokens: int,
-        original_chars: int,
-        optimized_chars: int,
+        mode: AssistantMode,
+        sizes: PromptSizes,
         started_at: float,
         ping_interval: float,
         max_seconds: float,
+        charge: Callable[[int], Awaitable[AccessResponse | None]] | None = None,
     ) -> None:
         self._key = key
         self._reserved = reserved
@@ -122,11 +177,13 @@ class AssistantChatStream:
         self._calls_used_today = calls_used_today
         self._calls_limit = calls_limit
         self._estimated_input_tokens = estimated_input_tokens
-        self._original_chars = original_chars
-        self._optimized_chars = optimized_chars
+        self._mode = mode
+        self._sizes = sizes
         self._started_at = started_at
         self._ping_interval = ping_interval
         self._max_seconds = max_seconds
+        self._charge = charge
+        self._charge_task: asyncio.Task[AccessResponse | None] | None = None
         self._usage: UsageEvent | None = None
         self._output_chars = 0
         self._first_output_ms: int | None = None
@@ -180,25 +237,37 @@ class AssistantChatStream:
             actual = self._tokens()
             self._outcome = "completed"
             self._release_slot()
-            yield _sse(
-                "usage",
-                {
-                    "input_tokens": actual.input_tokens,
-                    "output_tokens": actual.output_tokens,
-                    "calls_used_today": self._calls_used_today,
-                    "calls_limit": self._calls_limit,
-                },
-            )
+            usage: dict[str, Any] = {
+                "input_tokens": actual.input_tokens,
+                "output_tokens": actual.output_tokens,
+                "calls_used_today": self._calls_used_today,
+                "calls_limit": self._calls_limit,
+            }
+            charging = self._start_charge(actual)
+            if charging is not None:
+                # Shielded: the client leaving here must not lose the count.
+                access = await asyncio.shield(charging)
+                if access is not None:
+                    usage["access"] = access.model_dump(mode="json")
+            yield _sse("usage", usage)
             yield _sse("done", {"finish_reason": finish})
         except Exception as exc:
             # Headers are long gone, so the contract's error event is the only way to report it.
             logger.error("Assistant stream failed: %s", type(exc).__name__)
             yield self._error_event("provider_error")
 
+    def mark_timed_out(self) -> None:
+        """The time limit ended this reply, as opposed to the user leaving. A reply that
+        had already finished or failed keeps its outcome."""
+        if self._outcome == "disconnected":
+            self._outcome = "timed_out"
+
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        # Before any cleanup, so a slow database can't look like a slow reply.
+        duration_ms = int((time.perf_counter() - self._started_at) * 1000)
         self._expiry.cancel()
         self._pump.cancel()
         # Waits for the connection to Groq to close, so nobody pays for tokens nobody sees.
@@ -207,10 +276,27 @@ class AssistantChatStream:
             logger.error("Assistant provider stream did not stop in time")
         self._release_slot()
         actual = self._tokens()
-        try:
-            await self._store.settle_tokens(self._key, self._reserved, actual)
-        except Exception as exc:
-            logger.error("Could not record assistant usage: %s", type(exc).__name__)
+        # Separate writes, so neither can cost the other its record, and side by side, so
+        # a stuck database delays this by one time limit rather than two.
+        charging = self._start_charge(actual)
+        await asyncio.gather(
+            *([charging] if charging is not None else []),
+            self._settle(actual),
+            write_call_log(
+                self._store,
+                CallLogEntry(
+                    key=self._key,
+                    mode=self._mode,
+                    outcome=self._outcome,
+                    tokens=actual,
+                    cached_tokens=self._usage.cached_tokens if self._usage is not None else 0,
+                    exact_usage=self._usage is not None,
+                    sizes=self._sizes,
+                    first_output_ms=self._first_output_ms,
+                    duration_ms=duration_ms,
+                ),
+            ),
+        )
         logger.info(
             "Assistant call: user=%s model=%s outcome=%s input_tokens=%d output_tokens=%d exact_usage=%s "
             "first_output_ms=%s duration_ms=%d request_chars=%d sent_chars=%d",
@@ -221,13 +307,35 @@ class AssistantChatStream:
             actual.output_tokens,
             self._usage is not None,
             self._first_output_ms,
-            int((time.perf_counter() - self._started_at) * 1000),
-            self._original_chars,
-            self._optimized_chars,
+            duration_ms,
+            self._sizes.request_chars,
+            self._sizes.sent_chars,
         )
+
+    def _start_charge(self, actual: TokenCounts) -> asyncio.Task[AccessResponse | None] | None:
+        """Counts this call against the user's pass, once, however the reply ended."""
+        if self._charge is None:
+            return None
+        if self._charge_task is None:
+            self._charge_task = asyncio.create_task(self._charge_pass(self._charge, actual))
+        return self._charge_task
+
+    async def _charge_pass(self, charge: Callable[[int], Awaitable[AccessResponse | None]], actual: TokenCounts) -> AccessResponse | None:
+        try:
+            return await charge(actual.total)
+        except Exception as exc:
+            logger.error("Could not count assistant tokens against the pass: user=%s %s", self._key.user_id, type(exc).__name__)
+            return None
+
+    async def _settle(self, actual: TokenCounts) -> None:
+        try:
+            await self._store.settle_tokens(self._key, self._reserved, actual)
+        except Exception as exc:
+            logger.error("Could not record assistant usage: %s", type(exc).__name__)
 
     def _expire(self) -> None:
         logger.error("Assistant stream hit its time limit: user=%s", self._key.user_id)
+        self.mark_timed_out()
         self._expiry_task = asyncio.create_task(self.close())
 
     def _release_slot(self) -> None:
@@ -273,6 +381,14 @@ async def _pump_provider(
         await queue.put(ProviderStreamError("provider_error"))
 
 
+def _refusal_outcome(failure: ProviderEvent | ProviderError | None) -> str:
+    if isinstance(failure, ProviderRateLimitedError):
+        return "refused_rate_limited"
+    if isinstance(failure, ProviderRequestTooLargeError):
+        return "refused_too_large"
+    return "refused_unavailable"
+
+
 class AssistantService:
     def __init__(
         self,
@@ -282,7 +398,9 @@ class AssistantService:
         registry: ActiveStreamRegistry,
         ping_interval: float = PING_INTERVAL_SECONDS,
         max_stream_seconds: float = MAX_STREAM_SECONDS,
+        payments: AssistantPaymentService | None = None,
     ) -> None:
+        self._payments = payments
         self._settings = settings
         self._provider = provider
         self._store = store
@@ -297,20 +415,32 @@ class AssistantService:
         if not self.is_enabled():
             raise GenerationUnavailableError("The AI assistant is switched off.")
 
+    def _paywall(self) -> AssistantPaymentService | None:
+        return self._payments if self._payments is not None and self._payments.paywall_enabled else None
+
     async def get_usage(self, user_id: uuid.UUID) -> AssistantUsageResponse:
+        calls_used_today = await self._store.calls_today(user_id, _utc_today())
+        calls_limit = self._settings.assistant_user_daily_calls
+        paywall = self._paywall()
+        if paywall is None:
+            return AssistantUsageResponse(enabled=self.is_enabled(), calls_used_today=calls_used_today, calls_limit=calls_limit)
+        provider = self._provider.name if self._provider is not None else None
         return AssistantUsageResponse(
             enabled=self.is_enabled(),
-            calls_used_today=await self._store.calls_today(user_id, _utc_today()),
-            calls_limit=self._settings.assistant_user_daily_calls,
+            calls_used_today=calls_used_today,
+            calls_limit=calls_limit,
+            provider_name=_PROVIDER_NAMES.get(provider, provider) if provider is not None else None,
+            access=await paywall.get_access(user_id),
         )
 
-    def build_request(self, payload: ChatRequest) -> tuple[ProviderRequest, int, int, int]:
+    def build_request(self, payload: ChatRequest) -> BuiltRequest:
         """The provider request, built only from server-side choices and the checked
-        payload, with the optimizer's estimated tokens and its before and after sizes."""
+        payload, with the estimated tokens and the sizes for the audit log."""
         language = payload.context.language
         system = system_prompt(payload.mode, language)
         tools = tools_for(payload.mode, language)
-        prefix_tokens = prefix_chars(system, tools) // CHARS_PER_TOKEN
+        prefix = prefix_chars(system, tools)
+        prefix_tokens = prefix // CHARS_PER_TOKEN
         optimized = optimize_conversation(
             payload.messages, payload.context, payload.mode, self._settings.assistant_max_input_tokens, prefix_tokens
         )
@@ -320,7 +450,14 @@ class AssistantService:
             tools=tools,
             max_output_tokens=self._settings.assistant_max_output_tokens,
         )
-        return request, optimized.estimated_tokens + prefix_tokens, optimized.original_chars, optimized.optimized_chars
+        sizes = PromptSizes(
+            request_chars=optimized.original_chars,
+            sent_chars=optimized.optimized_chars,
+            system_chars=len(system),
+            tools_chars=prefix - len(system),
+            **asdict(optimized.parts),
+        )
+        return BuiltRequest(request=request, estimated_tokens=optimized.estimated_tokens + prefix_tokens, sizes=sizes)
 
     async def open_chat(self, user_id: uuid.UUID, payload: ChatRequest) -> AssistantChatStream:
         """Checks limits and opens the provider, so its refusals become real HTTP statuses.
@@ -340,14 +477,18 @@ class AssistantService:
 
     async def _open_reserved(self, user_id: uuid.UUID, payload: ChatRequest, provider: AssistantProvider) -> AssistantChatStream:
         started_at = time.perf_counter()
+        paywall = self._paywall()
+        if paywall is not None:
+            await paywall.ensure_access(user_id)
         key = UsageKey(user_id=user_id, day=_utc_today(), provider=provider.name, model=provider.model)
         # Built first: nothing here can fail after a call has been counted.
-        request, estimated_tokens, original_chars, optimized_chars = self.build_request(payload)
+        built = self.build_request(payload)
+        request = built.request
         # The most this call can spend, so it counts towards the caps while in flight.
-        reserved = TokenCounts(estimated_tokens, request.max_output_tokens)
+        reserved = TokenCounts(built.estimated_tokens, request.max_output_tokens)
         limits = DailyLimits(
-            user_calls=self._settings.assistant_user_daily_calls,
-            user_tokens=self._settings.assistant_user_daily_tokens,
+            user_calls=_NO_DAILY_LIMIT if paywall is not None else self._settings.assistant_user_daily_calls,
+            user_tokens=_NO_DAILY_LIMIT if paywall is not None else self._settings.assistant_user_daily_tokens,
             global_tokens=self._settings.assistant_global_daily_tokens,
         )
         reservation = await self._store.reserve_call(key, limits, reserved)
@@ -370,11 +511,19 @@ class AssistantService:
             first = await queue.get()
         except BaseException:
             pump.cancel()
+            # This task is being cancelled, so the writes can't be awaited here.
+            entry = self._unopened_entry(key, payload.mode, built.sizes, "cancelled_before_reply", started_at)
+            self._registry.keep(asyncio.create_task(self._refund_and_log(key, reserved, entry)))
             raise
         if not isinstance(first, StreamOpened):
             # Normally already finished; this covers a provider that broke its contract.
             pump.cancel()
-            await self._refund(key, reserved)
+            entry = self._unopened_entry(key, payload.mode, built.sizes, _refusal_outcome(first), started_at)
+            writes = asyncio.create_task(self._refund_and_log(key, reserved, entry))
+            self._registry.keep(writes)
+            # Normally done at once. With a stuck database the user still gets their error
+            # promptly, and their slot back, while the writes finish in the background.
+            await asyncio.wait({writes}, timeout=_REFUSAL_WAIT_SECONDS)
             raise self._pre_stream_error(first)
         return AssistantChatStream(
             key=key,
@@ -386,13 +535,39 @@ class AssistantService:
             allowed_tools=tool_names(request.tools),
             calls_used_today=reservation.calls_today,
             calls_limit=self._settings.assistant_user_daily_calls,
-            estimated_input_tokens=estimated_tokens,
-            original_chars=original_chars,
-            optimized_chars=optimized_chars,
+            estimated_input_tokens=built.estimated_tokens,
+            mode=payload.mode,
+            sizes=built.sizes,
             started_at=started_at,
             ping_interval=self._ping_interval,
             max_seconds=self._max_stream_seconds,
+            charge=partial(paywall.add_tokens, user_id) if paywall is not None else None,
         )
+
+    def _unopened_entry(
+        self, key: UsageKey, mode: AssistantMode, sizes: PromptSizes, outcome: str, started_at: float
+    ) -> CallLogEntry | None:
+        """The audit row for a call that never opened a reply, or None once this user has
+        had one recently. Such a call spent no tracked tokens."""
+        if not self._registry.allow_unopened_log(key.user_id):
+            return None
+        return CallLogEntry(
+            key=key,
+            mode=mode,
+            outcome=outcome,
+            tokens=TokenCounts(),
+            cached_tokens=0,
+            exact_usage=False,
+            sizes=sizes,
+            first_output_ms=None,
+            duration_ms=int((time.perf_counter() - started_at) * 1000),
+        )
+
+    async def _refund_and_log(self, key: UsageKey, reserved: TokenCounts, entry: CallLogEntry | None) -> None:
+        if entry is None:
+            await self._refund(key, reserved)
+        else:
+            await asyncio.gather(self._refund(key, reserved), write_call_log(self._store, entry))
 
     async def _refund(self, key: UsageKey, reserved: TokenCounts) -> None:
         # A provider outage must not use up the user's daily calls.

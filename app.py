@@ -7,6 +7,8 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.admin_router import router as admin_router
+from api.assistant_payment_router import router as assistant_payment_router
+from api.assistant_payment_router import webhook_router as razorpay_webhook_router
 from api.assistant_router import router as assistant_router
 from api.auth_router import router as auth_router
 from api.chat_router import router as chat_router
@@ -50,6 +52,8 @@ from exams.router_admin import router as exam_admin_router
 from exams.router_learner import router as exam_learner_router
 from exams.router_public import router as exam_public_router
 from exams.schema_upgrade import SchemaUpgradeError, upgrade_schema
+from services.assistant_jobs import register_assistant_jobs
+from services.assistant_payment_jobs import register_payment_jobs
 from services.blog_scheduler import register_blog_jobs
 from services.codelab_scheduler import register_codelab_jobs
 
@@ -108,6 +112,22 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.critical("Could not register the CodeLab relay cleanup job", exc_info=True)
 
+    try:
+        register_assistant_jobs(
+            container.scheduler, container.assistant_usage_store, container.settings.assistant_call_log_retention_days
+        )
+    except Exception:
+        logger.critical("Could not register the assistant call log cleanup job", exc_info=True)
+
+    try:
+        register_payment_jobs(
+            container.scheduler,
+            container.assistant_payments,
+            bool(container.settings.assistant_razorpay_key_id and container.settings.assistant_razorpay_key_secret),
+        )
+    except Exception:
+        logger.critical("Could not register the Razorpay reconciliation job", exc_info=True)
+
     yield
 
     await close_relay_resources()
@@ -121,6 +141,10 @@ async def lifespan(app: FastAPI):
             await container.assistant_provider.aclose()
     except Exception:
         logger.warning("Error while closing the AI assistant HTTP client", exc_info=True)
+    try:
+        await container.razorpay_client.aclose()
+    except Exception:
+        logger.warning("Error while closing the Razorpay HTTP client", exc_info=True)
     try:
         await container.storage_service.aclose()
     except Exception:
@@ -180,6 +204,8 @@ class WebNestStudioApp:
             chat_router,
             coding_router,
             assistant_router,
+            assistant_payment_router,
+            razorpay_webhook_router,
             java_playground_router,
             codelab_router,
             codelab_admin_router,

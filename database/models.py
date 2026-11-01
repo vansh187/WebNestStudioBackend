@@ -619,6 +619,87 @@ class AssistantUsage(Base):
     output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
 
 
+class AssistantCallLog(Base):
+    """One row per model call, for audit and cost tracking. Numbers only, never message text
+    or code. A deleted account's rows stay, with no link to the person, so totals still add up.
+    Row level security comes from migration 015, not from this model: apply the migrations
+    before deploying to a new database, because create_all would build the table without it."""
+
+    __tablename__ = "assistant_call_log"
+    __table_args__ = (Index("ix_assistant_call_log_user_created", "user_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    cached_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    exact_usage: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    request_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    sent_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    system_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tools_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    file_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    context_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    user_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tool_result_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    history_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    turn_assistant_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    first_output_ms: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+
+
+class AssistantPayment(Base):
+    """One Razorpay order, one payment attempt. Days and tokens are saved on the order, so a
+    later settings change doesn't alter what was bought. Never holds card or UPI details.
+    Row level security on these three tables comes from migration 017, not from the models."""
+
+    __tablename__ = "assistant_payments"
+    __table_args__ = (
+        CheckConstraint("status IN ('created', 'failed', 'paid', 'refunded')", name="ck_assistant_payment_status"),
+        Index("ix_assistant_payments_user", "user_id"),
+        Index("ix_assistant_payments_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    razorpay_order_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    razorpay_payment_id: Mapped[str | None] = mapped_column(Text, unique=True)
+    amount_paise: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(Text, nullable=False, default="INR", server_default=text("'INR'"))
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="created", server_default=text("'created'"))
+    pass_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    pass_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AssistantAccess(Base):
+    """A user's current WebNest Prime pass."""
+
+    __tablename__ = "assistant_access"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    tokens_limit: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tokens_used: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class AssistantWebhookEvent(Base):
+    """Razorpay event ids already handled. Delivery is at-least-once, so duplicates happen."""
+
+    __tablename__ = "assistant_webhook_events"
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class JavaPlaygroundDailyUsage(Base):
     """Site-wide Java playground run counter, one row per UTC day. Kept in the
     database (not memory) so a Render idle restart cannot reset the daily cap."""

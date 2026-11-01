@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncGenerator
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,7 +26,7 @@ from core.config import Settings
 from core.dependencies import container, get_assistant_service, get_current_user, get_db_session
 from core.error_handlers import register_error_handlers
 from core.exceptions import GenerationUnavailableError
-from database.assistant_usage_persistence import CallReservation, DailyLimits, TokenCounts, UsageKey
+from database.assistant_usage_persistence import CallLogEntry, CallReservation, DailyLimits, TokenCounts, UsageKey
 from schemas.assistant_schemas import MAX_BODY_BYTES, ChatContext, ChatMessage, ChatRequest, ChatToolCall, OpenFile
 from services.assistant_llm import (
     FinishedEvent,
@@ -92,6 +92,9 @@ class FakeStore:
         self.released = 0
         self.fail_recording = False
         self.settle_gate: asyncio.Event | None = None
+        self.call_log: list[CallLogEntry] = []
+        self.fail_call_log = False
+        self.purged_before: datetime | None = None
 
     async def reserve_call(self, key: UsageKey, limits: DailyLimits, reserved: TokenCounts) -> CallReservation:
         if self.tokens + reserved.total >= limits.global_tokens:
@@ -117,6 +120,17 @@ class FakeStore:
 
     async def calls_today(self, user_id: uuid.UUID, day: date) -> int:
         return self.calls
+
+    async def log_call(self, entry: CallLogEntry) -> None:
+        if self.fail_call_log:
+            raise RuntimeError("audit table down")
+        self.call_log.append(entry)
+
+    async def purge_call_log(self, before: datetime, batch_size: int = 5000) -> int:
+        self.purged_before = before
+        if self.fail_call_log:
+            raise RuntimeError("audit table down")
+        return 3
 
 
 class FakeProvider:

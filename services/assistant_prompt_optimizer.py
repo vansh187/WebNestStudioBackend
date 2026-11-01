@@ -86,12 +86,39 @@ _TIERS: tuple[_Limits, ...] = (
 )
 
 
+@dataclass
+class SentParts:
+    """Where the sent characters went, counted as each piece is rendered. Together they
+    add up to `optimized_chars`. `history_chars` is earlier turns only; the current turn's
+    assistant text and tool-call arguments are `turn_assistant_chars`."""
+
+    file_chars: int = 0
+    context_chars: int = 0
+    user_chars: int = 0
+    tool_result_chars: int = 0
+    history_chars: int = 0
+    turn_assistant_chars: int = 0
+
+    def add_assistant(self, chars: int, turn_is_current: bool) -> None:
+        if turn_is_current:
+            self.turn_assistant_chars += chars
+        else:
+            self.history_chars += chars
+
+
 @dataclass(frozen=True)
 class OptimizedConversation:
     messages: list[ProviderMessage]
     estimated_tokens: int
     original_chars: int
     optimized_chars: int
+    parts: SentParts
+
+
+@dataclass(frozen=True)
+class _Rendered:
+    messages: list[ProviderMessage]
+    parts: SentParts
 
 
 def _strip_line_ends(text: str) -> str:
@@ -217,7 +244,18 @@ def _has_whole_read(turn: list[ChatMessage], path: str, limits: _Limits) -> bool
     )
 
 
-def _context_block(context: ChatContext, turn: list[ChatMessage], mentioned: list[str], limits: _Limits, mode: AssistantMode) -> str:
+def _cut_open_file(content: str, limits: _Limits, mode: AssistantMode) -> str:
+    note = (
+        "You have not seen this part, so don't use a path-labelled block for this file"
+        if mode == "ask"
+        else "Use read_file for all of it"
+    )
+    return cut_middle(content, limits.open_file, note)
+
+
+def _context_block(
+    context: ChatContext, turn: list[ChatMessage], mentioned: list[str], limits: _Limits, mode: AssistantMode, parts: SentParts
+) -> str:
     lines = [f"language: {context.language}"]
     if context.files:
         # The files most likely to matter first, so the cap never hides them.
@@ -237,12 +275,9 @@ def _context_block(context: ChatContext, turn: list[ChatMessage], mentioned: lis
         elif limits.open_file == 0:
             lines.append(f"open_file: {name} (content left out to save space)")
         else:
-            note = (
-                "You have not seen this part, so don't use a path-labelled block for this file"
-                if mode == "ask"
-                else "Use read_file for all of it"
-            )
-            lines.append(f"open_file: {name}\n{cut_middle(context.open_file.content, limits.open_file, note)}")
+            sent_file = _cut_open_file(context.open_file.content, limits, mode)
+            parts.file_chars += len(sent_file)
+            lines.append(f"open_file: {name}\n{sent_file}")
     if context.last_error:
         # A traceback's last lines say the most.
         error = context.last_error
@@ -269,7 +304,7 @@ def _tool_text(message: ChatMessage, limit: int, note: str) -> str:
     return f"ERROR: {text}" if message.is_error else text
 
 
-def _render_tool_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _Limits) -> list[ProviderMessage]:
+def _render_tool_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _Limits, parts: SentParts) -> list[ProviderMessage]:
     """Assistant and tool messages in the provider's tool-call format."""
     last_assistant = _last_tool_round(turn)
     rendered: list[ProviderMessage] = []
@@ -286,15 +321,18 @@ def _render_tool_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _L
                     }
                     for call in message.tool_calls
                 ]
+            parts.add_assistant(_sent_chars([entry]), turn_is_current)
             rendered.append(entry)
         elif message.role == "tool":
             limit = _tool_limit(position, last_assistant, turn_is_current, limits)
             note = _NEWEST_OUTPUT_NOTE if turn_is_current and position > last_assistant else _OLDER_OUTPUT_NOTE
-            rendered.append({"role": "tool", "tool_call_id": message.tool_call_id, "content": _tool_text(message, limit, note)})
+            result = _tool_text(message, limit, note)
+            parts.tool_result_chars += len(result)
+            rendered.append({"role": "tool", "tool_call_id": message.tool_call_id, "content": result})
     return rendered
 
 
-def _render_flat_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _Limits) -> list[ProviderMessage]:
+def _render_flat_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _Limits, parts: SentParts) -> list[ProviderMessage]:
     """Ask mode has no tools, so earlier tool activity becomes plain text. That is valid
     whether or not the provider accepts tool messages without tools. A result is untrusted,
     so it goes in a data block like the context, not in the assistant's own words."""
@@ -306,9 +344,13 @@ def _render_flat_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _L
             for call in message.tool_calls or []:
                 arguments = json.dumps(_call_arguments(call, keep_full=False), ensure_ascii=False)
                 pieces.append(f"[earlier tool call: {call.name} {arguments}]")
-            rendered.append({"role": "assistant", "content": "\n".join(pieces)})
+            text = "\n".join(pieces)
+            parts.add_assistant(len(text), turn_is_current)
+            rendered.append({"role": "assistant", "content": text})
         elif message.role == "tool":
-            rendered.append({"role": "user", "content": _data_block("tool_result", _tool_text(message, limit, _FLAT_OUTPUT_NOTE))})
+            block = _data_block("tool_result", _tool_text(message, limit, _FLAT_OUTPUT_NOTE))
+            parts.tool_result_chars += len(block)
+            rendered.append({"role": "user", "content": block})
     return rendered
 
 
@@ -319,25 +361,31 @@ def _render(
     limits: _Limits,
     mentioned: list[str],
     dropped_turns: int,
-) -> list[ProviderMessage]:
+) -> _Rendered:
     rendered: list[ProviderMessage] = []
+    parts = SentParts()
     for position, turn in enumerate(turns):
         turn_is_current = position == len(turns) - 1
         first = turn[0]
         if first.role == "user":
             text = first.content or ""
             if turn_is_current:
-                text = _current_user_text(text, turn, context, mode, limits, mentioned, dropped_turns)
+                parts.user_chars += len(text)
+                text = _current_user_text(text, turn, context, mode, limits, mentioned, dropped_turns, parts)
+                parts.context_chars += len(text) - parts.user_chars - parts.file_chars
+            else:
+                parts.history_chars += len(text)
             rendered.append({"role": "user", "content": text})
             rest = turn[1:]
         else:
             rest = turn
         render_turn = _render_tool_turn if mode == "agent" else _render_flat_turn
-        rendered.extend(render_turn(rest, turn_is_current, limits))
+        rendered.extend(render_turn(rest, turn_is_current, limits, parts))
     if rendered[-1]["role"] == "assistant" and not rendered[-1].get("tool_calls"):
         # A conversation ending on the assistant would be taken as text to continue.
         rendered.append({"role": "user", "content": _CONTINUE_TEXT})
-    return rendered
+        parts.context_chars += len(_CONTINUE_TEXT)
+    return _Rendered(rendered, parts)
 
 
 def _current_user_text(
@@ -348,14 +396,22 @@ def _current_user_text(
     limits: _Limits,
     mentioned: list[str],
     dropped_turns: int,
+    parts: SentParts,
 ) -> str:
-    pieces = [_context_block(context, turn, mentioned, limits, mode)]
+    pieces = [_context_block(context, turn, mentioned, limits, mode, parts)]
     if mode == "agent":
         pieces.append(task_hint(text, bool(context.last_error)))
     if dropped_turns:
         pieces.append("Earlier messages in this chat were left out to save space.")
     pieces.append(text)
     return "\n".join(pieces)
+
+
+def _sent_chars(rendered: list[ProviderMessage]) -> int:
+    return sum(
+        len(message.get("content") or "") + sum(len(call["function"]["arguments"]) for call in message.get("tool_calls") or [])
+        for message in rendered
+    )
 
 
 def _estimate_tokens(messages: list[ProviderMessage]) -> int:
@@ -395,13 +451,12 @@ def _tidied(messages: list[ChatMessage]) -> list[ChatMessage]:
     ]
 
 
-def _fit_to_budget(turns: list[list[ChatMessage]], context: ChatContext, mode: AssistantMode, budget: int) -> list[ProviderMessage]:
+def _fit_to_budget(turns: list[list[ChatMessage]], context: ChatContext, mode: AssistantMode, budget: int) -> _Rendered:
     mentioned = mentioned_files(turns[-1][0].content or "", context.files)
-    rendered: list[ProviderMessage] = []
     # First give up the oldest turns, with history trimmed but the current turn whole.
     for start in range(len(turns)):
         rendered = _render(turns[start:], context, mode, _TIERS[0], mentioned, start)
-        if _estimate_tokens(rendered) <= budget:
+        if _estimate_tokens(rendered.messages) <= budget:
             return rendered
 
     # The current turn alone is too big: trim its text, keeping the newest result longest.
@@ -409,7 +464,7 @@ def _fit_to_budget(turns: list[list[ChatMessage]], context: ChatContext, mode: A
     dropped = len(turns) - 1
     for limits in _TIERS[1:-1]:
         rendered = _render([current], context, mode, limits, mentioned, dropped)
-        if _estimate_tokens(rendered) <= budget:
+        if _estimate_tokens(rendered.messages) <= budget:
             return rendered
 
     # Still too big, as in a long agent task: give up its oldest tool rounds.
@@ -418,7 +473,7 @@ def _fit_to_budget(turns: list[list[ChatMessage]], context: ChatContext, mode: A
         current = remaining
         dropped += 1
         rendered = _render([current], context, mode, _TIERS[-2], mentioned, dropped)
-        if _estimate_tokens(rendered) <= budget:
+        if _estimate_tokens(rendered.messages) <= budget:
             return rendered
         remaining = _without_oldest_round(current)
 
@@ -436,14 +491,11 @@ def optimize_conversation(
     """The conversation to send: history trimmed by age, the newest user message
     tidied and given its context, and the whole fitted to `max_input_tokens`."""
     budget = max(max_input_tokens - prefix_tokens, 1)
-    rendered = _fit_to_budget(_split_turns(_tidied(_repair(messages))), context, mode, budget)
-    optimized_chars = sum(
-        len(message.get("content") or "") + sum(len(call["function"]["arguments"]) for call in message.get("tool_calls") or [])
-        for message in rendered
-    )
+    fitted = _fit_to_budget(_split_turns(_tidied(_repair(messages))), context, mode, budget)
     return OptimizedConversation(
-        messages=rendered,
-        estimated_tokens=_estimate_tokens(rendered),
+        messages=fitted.messages,
+        estimated_tokens=_estimate_tokens(fitted.messages),
         original_chars=_total_chars(messages, context),
-        optimized_chars=optimized_chars,
+        optimized_chars=_sent_chars(fitted.messages),
+        parts=fitted.parts,
     )

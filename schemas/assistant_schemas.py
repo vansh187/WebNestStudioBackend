@@ -1,6 +1,7 @@
 """Request and response models for the CodeLab AI assistant. Unknown fields such
 as model or system are ignored: the server alone chooses those."""
 
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -64,7 +65,52 @@ class ChatRequest(BaseModel):
     context: ChatContext
 
 
+class AccessResponse(BaseModel):
+    """`active`: may use the AI now. `is_prime`: inside a paid period, so shows the badge,
+    even after the tokens run out."""
+
+    active: bool
+    expires_at: datetime | None
+    price_paise: int
+    pass_days: int
+    tokens_limit: int
+    tokens_used: int
+    is_prime: bool
+    member_label: str | None
+
+
 class AssistantUsageResponse(BaseModel):
+    """`provider_name` and `access` are left out completely while the paywall is off."""
+
     enabled: bool
     calls_used_today: int
     calls_limit: int
+    provider_name: str | None = None
+    access: AccessResponse | None = None
+
+
+class MembershipResponse(BaseModel):
+    is_prime: bool
+    member_label: str | None
+    expires_at: datetime | None
+
+
+class OrderResponse(BaseModel):
+    order_id: str
+    amount: int
+    currency: str
+    key_id: str
+    name: str
+    description: str
+
+
+class VerifyRequest(BaseModel):
+    # Razorpay's ids are like order_ABC123. Anything else, such as a NUL byte Postgres
+    # would refuse, is a bad request and never reaches the database.
+    razorpay_order_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_]+$")
+    razorpay_payment_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_]+$")
+    razorpay_signature: str = Field(min_length=1, max_length=256)
+
+
+class VerifyResponse(BaseModel):
+    access: AccessResponse

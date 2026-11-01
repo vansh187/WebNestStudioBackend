@@ -131,6 +131,30 @@ class Settings(BaseSettings):
     assistant_user_daily_tokens: int = 60000
     assistant_global_daily_tokens: int = 180000
     assistant_timeout_seconds: float = 120.0
+    # How long assistant_call_log rows are kept. 0 keeps them forever.
+    assistant_call_log_retention_days: int = 90
+
+    # WebNest Prime Member: one Razorpay payment buys a pass. Off means no payment is
+    # needed, so this can deploy before payments are switched on. Only the server sets
+    # the price. Separate from codelab_relay, which serves users' own projects.
+    assistant_paywall_enabled: bool = False
+    assistant_price_paise: int = 29900
+    assistant_pass_days: int = 30
+    assistant_pass_tokens: int = 2_000_000
+    assistant_razorpay_key_id: str = Field(
+        default="", validation_alias=AliasChoices("ASSISTANT_RAZORPAY_KEY_ID", "RAZORPAY_KEY_ID", "assistant_razorpay_key_id")
+    )
+    assistant_razorpay_key_secret: str = Field(
+        default="", validation_alias=AliasChoices("ASSISTANT_RAZORPAY_KEY_SECRET", "RAZORPAY_KEY_SECRET", "assistant_razorpay_key_secret")
+    )
+    assistant_razorpay_webhook_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "ASSISTANT_RAZORPAY_WEBHOOK_SECRET", "RAZORPAY_WEBHOOK_SECRET", "RAZORPAY_WEBHOOK_KEY", "assistant_razorpay_webhook_secret"
+        ),
+    )
+    # Also accepted while rotating the secret, because retried events may still use the old one.
+    assistant_razorpay_webhook_secret_previous: str = ""
 
     # Coding platform compiler proxy. Executed code runs on JDoodle's hosted
     # sandbox (https://www.jdoodle.com/compiler-api), never inside this API process.

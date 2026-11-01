@@ -59,6 +59,7 @@ class ToolCallEvent:
 class UsageEvent:
     input_tokens: int
     output_tokens: int
+    cached_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -210,7 +211,11 @@ def _usage_from_chunk(chunk: dict[str, Any]) -> UsageEvent | None:
     usage = _as_dict(chunk.get("usage")) or _as_dict(_as_dict(chunk.get("x_groq")).get("usage"))
     if not usage:
         return None
-    return UsageEvent(input_tokens=_as_int(usage.get("prompt_tokens")), output_tokens=_as_int(usage.get("completion_tokens")))
+    return UsageEvent(
+        input_tokens=_as_int(usage.get("prompt_tokens")),
+        output_tokens=_as_int(usage.get("completion_tokens")),
+        cached_tokens=_as_int(_as_dict(usage.get("prompt_tokens_details")).get("cached_tokens")),
+    )
 
 
 class GroqAssistantProvider:
