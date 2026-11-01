@@ -26,12 +26,15 @@ class RazorpayPayment:
     status: str
     amount: int | None
     currency: str | None
+    order_id: str | None = None
 
 
 class RazorpayClient(Protocol):
     async def create_order(self, amount: int, currency: str, receipt: str, notes: dict[str, str]) -> str: ...
 
     async def order_payments(self, order_id: str) -> list[RazorpayPayment]: ...
+
+    async def get_payment(self, payment_id: str) -> RazorpayPayment: ...
 
     async def aclose(self) -> None: ...
 
@@ -54,6 +57,9 @@ class HttpRazorpayClient:
         body = await self._request("GET", f"/v1/orders/{order_id}/payments", None)
         items = body.get("items")
         return [_payment(item) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+    async def get_payment(self, payment_id: str) -> RazorpayPayment:
+        return _payment(await self._request("GET", f"/v1/payments/{payment_id}", None))
 
     async def aclose(self) -> None:
         client, self._client = self._client, None
@@ -97,4 +103,5 @@ def _payment(item: dict[str, Any]) -> RazorpayPayment:
         status=str(item.get("status") or ""),
         amount=amount if isinstance(amount, int) else None,
         currency=currency if isinstance(currency, str) else None,
+        order_id=item["order_id"] if isinstance(item.get("order_id"), str) else None,
     )

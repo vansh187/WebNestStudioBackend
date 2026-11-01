@@ -59,6 +59,9 @@ _CHANGE_WORDS = re.compile(
     re.IGNORECASE,
 )
 _VAGUE_PROMPT_CHARS = 40
+# Earlier turns kept while they fit in this many messages. The current turn always stays,
+# because an agent task's tool rounds depend on each other.
+MAX_HISTORY_MESSAGES = 10
 _BLOCK_ID_CHARS = 16
 _OLDER_OUTPUT_NOTE = "Older output; read it again if you still need it"
 _NEWEST_OUTPUT_NOTE = "Cut to save space"
@@ -451,10 +454,20 @@ def _tidied(messages: list[ChatMessage]) -> list[ChatMessage]:
     ]
 
 
+def _first_kept_turn(turns: list[list[ChatMessage]]) -> int:
+    """Whole turns only, so a tool call never loses its result."""
+    kept = len(turns[-1])
+    first = len(turns) - 1
+    while first > 0 and kept + len(turns[first - 1]) <= MAX_HISTORY_MESSAGES:
+        first -= 1
+        kept += len(turns[first])
+    return first
+
+
 def _fit_to_budget(turns: list[list[ChatMessage]], context: ChatContext, mode: AssistantMode, budget: int) -> _Rendered:
     mentioned = mentioned_files(turns[-1][0].content or "", context.files)
     # First give up the oldest turns, with history trimmed but the current turn whole.
-    for start in range(len(turns)):
+    for start in range(_first_kept_turn(turns), len(turns)):
         rendered = _render(turns[start:], context, mode, _TIERS[0], mentioned, start)
         if _estimate_tokens(rendered.messages) <= budget:
             return rendered

@@ -1,20 +1,23 @@
-"""The assistant's provider interface and its Groq implementation. Separate from
-services/llm_provider.py, so nothing here can affect the other AI features."""
+"""The assistant's provider interface, with its Claude and Groq implementations. Separate
+from services/llm_provider.py, so nothing here can affect the other AI features."""
 
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+import anthropic
 import httpx
+import httpx2
 
 from core.config import Settings
 
 logger = logging.getLogger("webnest.assistant.llm")
 
-StreamErrorCode = Literal["provider_error", "rate_limited", "invalid_tool_call"]
+StreamErrorCode = Literal["provider_error", "rate_limited", "invalid_tool_call", "refused"]
 FinishReason = Literal["stop", "tool_calls", "length"]
 
 _MAX_ERROR_BODY_BYTES = 4096
@@ -26,6 +29,11 @@ _IDLE_CONNECTION_SECONDS = 60.0
 _GPT_OSS_PREFIX = "openai/gpt-oss"
 _QWEN_PREFIX = "qwen/"
 _TOO_LARGE_CODES = frozenset({"context_length_exceeded", "request_too_large"})
+_ANTHROPIC_RETRIES = 1
+_ANTHROPIC_UNSAFE_ID = re.compile(r"[^a-zA-Z0-9_-]")
+_ANTHROPIC_LENGTH_STOPS = frozenset({"max_tokens", "model_context_window_exceeded"})
+_HISTORY_START_TEXT = "(The start of this conversation was left out.)"
+_NO_OUTPUT_TEXT = "(no output)"
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,8 @@ class UsageEvent:
     input_tokens: int
     output_tokens: int
     cached_tokens: int = 0
+    # The input is real but the output isn't known yet. A final usage event replaces it.
+    partial: bool = False
 
 
 @dataclass(frozen=True)
@@ -351,9 +361,253 @@ class GroqAssistantProvider:
         yield FinishedEvent(_finish_reason(finish, bool(calls)))
 
 
+def _anthropic_id(value: str) -> str:
+    # Claude accepts only these characters, and history can hold ids from another provider.
+    return _ANTHROPIC_UNSAFE_ID.sub("_", value)
+
+
+def _anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Input streaming stays off: tool calls are held until the reply ends anyway, and this
+    way the API validates each input against its schema before sending it."""
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        function = _as_dict(tool.get("function"))
+        converted.append({"name": function.get("name"), "description": function.get("description"), "input_schema": function.get("parameters")})
+    return converted
+
+
+def _tool_call_input(function: dict[str, Any]) -> dict[str, Any]:
+    try:
+        parsed = json.loads(function.get("arguments") or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return _as_dict(parsed)
+
+
+def _anthropic_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
+    if message["role"] == "tool":
+        tool_use_id = _anthropic_id(message.get("tool_call_id") or "")
+        return [{"type": "tool_result", "tool_use_id": tool_use_id, "content": message.get("content") or _NO_OUTPUT_TEXT}]
+    text = message.get("content") or ""
+    # Claude refuses a blank text block.
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": text}] if text.strip() else []
+    for call in message.get("tool_calls") or []:
+        function = _as_dict(call.get("function"))
+        name = _anthropic_id(str(function.get("name") or ""))
+        blocks.append({"type": "tool_use", "id": _anthropic_id(str(call.get("id") or "")), "name": name, "input": _tool_call_input(function)})
+    return blocks
+
+
+def anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Our OpenAI-style history in Claude's format: tool calls and results become content
+    blocks, and neighbouring messages of one role merge, as tool results must share a turn."""
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        role = "user" if message["role"] == "tool" else message["role"]
+        blocks = _anthropic_blocks(message)
+        if not blocks:
+            continue
+        if converted and converted[-1]["role"] == role:
+            converted[-1]["content"].extend(blocks)
+        else:
+            converted.append({"role": role, "content": blocks})
+    if not converted or converted[0]["role"] != "user":
+        converted.insert(0, {"role": "user", "content": [{"type": "text", "text": _HISTORY_START_TEXT}]})
+    return converted
+
+
+@dataclass
+class _AnthropicReply:
+    """What a streamed reply has said so far."""
+
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    output_tokens: int = 0
+    has_usage: bool = False
+    stop_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        self.parts: dict[int, _PartialToolCall] = {}
+
+    def note_usage(self, usage: Any) -> None:
+        """Every field that is billed. Input is the three kinds together: `input_tokens`
+        alone leaves out what was written to or read from the cache."""
+        if usage is None:
+            return
+        fresh = _as_int(getattr(usage, "input_tokens", None))
+        written = _as_int(getattr(usage, "cache_creation_input_tokens", None))
+        read = _as_int(getattr(usage, "cache_read_input_tokens", None))
+        if fresh or written or read:
+            self.input_tokens = fresh + written + read
+            self.cached_tokens = read
+        # Cumulative, and it includes any thinking.
+        self.output_tokens = max(self.output_tokens, _as_int(getattr(usage, "output_tokens", None)))
+        self.has_usage = True
+
+    def read(self, event: Any) -> str | None:
+        """Takes in one stream event, and returns its text if it has any to show. Only text
+        blocks are shown, so thinking could never reach the client."""
+        kind = event.type
+        if kind == "message_start":
+            self.note_usage(event.message.usage)
+        elif kind == "content_block_start":
+            block = event.content_block
+            if block.type == "tool_use":
+                self.parts[event.index] = _PartialToolCall(id=block.id, name=block.name)
+        elif kind == "content_block_delta":
+            delta = event.delta
+            if delta.type == "text_delta":
+                return delta.text or None
+            if delta.type == "input_json_delta" and event.index in self.parts:
+                self.parts[event.index].arguments += delta.partial_json
+        elif kind == "message_delta":
+            self.note_usage(event.usage)
+            self.stop_reason = event.delta.stop_reason
+        return None
+
+    def usage(self, partial: bool = False) -> UsageEvent:
+        return UsageEvent(self.input_tokens, self.output_tokens, self.cached_tokens, partial)
+
+
+def _anthropic_rejection(exc: anthropic.APIStatusError) -> ProviderError:
+    """Our own errors from the status alone. The API's message can quote the prompt, so
+    only its status and short type reach the logs. Running out of credit lands here too."""
+    logger.warning("Claude rejected an assistant call: status=%s type=%s", exc.status_code, getattr(exc, "type", None))
+    if exc.status_code == 429:
+        return ProviderRateLimitedError(_parse_retry_after(exc.response.headers.get("retry-after")))
+    if exc.status_code == 413:
+        return ProviderRequestTooLargeError("request too large")
+    # Includes 401/403: a bad server key must never look like the user's login failing.
+    return ProviderUnavailableError(f"status {exc.status_code}")
+
+
+class AnthropicAssistantProvider:
+    """Streams one Claude message through the official SDK. One shared client keeps its
+    connection alive between calls. StreamOpened waits for the stream's first event, because
+    Claude can report overload as a stream event: failing that early can still fall back."""
+
+    def __init__(self, settings: Settings, client: anthropic.AsyncAnthropic | None = None) -> None:
+        self._settings = settings
+        self._client = client
+
+    @property
+    def name(self) -> str:
+        return "anthropic"
+
+    @property
+    def model(self) -> str:
+        return self._settings.assistant_anthropic_model
+
+    def _get_client(self) -> anthropic.AsyncAnthropic:
+        if self._client is None:
+            self._client = anthropic.AsyncAnthropic(
+                api_key=self._settings.assistant_anthropic_api_key,
+                max_retries=_ANTHROPIC_RETRIES,
+                timeout=anthropic.Timeout(self._settings.assistant_timeout_seconds, connect=_CONNECT_TIMEOUT_SECONDS),
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            await client.close()
+
+    def params(self, request: ProviderRequest) -> dict[str, Any]:
+        """Thinking is off: it is billed as output, and the optimizer rewrites history, which
+        replayed thinking blocks wouldn't survive. No sampling settings, which Haiku 5.5 refuses."""
+        params: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": request.max_output_tokens,
+            "system": request.system,
+            "messages": anthropic_messages(request.messages),
+            "thinking": {"type": "disabled"},
+            "stream": True,
+        }
+        if request.tools:
+            params["tools"] = _anthropic_tools(request.tools)
+        return params
+
+    async def stream(self, request: ProviderRequest) -> AsyncGenerator[ProviderEvent, None]:
+        reply = _AnthropicReply()
+        opened = False
+        try:
+            async with await self._get_client().messages.create(**self.params(request)) as events:
+                async for event in events:
+                    if not opened and event.type == "message_start":
+                        opened = True
+                        yield StreamOpened()
+                    text = reply.read(event)
+                    if text:
+                        yield TextDelta(text)
+                    if event.type == "message_start":
+                        # At once, so a client that leaves now is charged the real input.
+                        yield reply.usage(partial=True)
+        except anthropic.APIStatusError as exc:
+            failure = _anthropic_rejection(exc)
+            if not opened:
+                raise failure from exc
+            # What it spent still counts, so the usage goes first.
+            yield reply.usage()
+            raise ProviderStreamError("rate_limited" if exc.status_code == 429 else "provider_error") from exc
+        except (anthropic.APIError, httpx2.HTTPError) as exc:
+            logger.warning("Claude connection failed: %s", type(exc).__name__)
+            if not opened:
+                raise ProviderUnavailableError("connection failed") from exc
+            yield reply.usage()
+            raise ProviderStreamError("provider_error") from exc
+        if not opened:
+            raise ProviderUnavailableError("empty stream")
+        if reply.has_usage:
+            yield reply.usage()
+        for event in self._ending(reply):
+            yield event
+
+    def _ending(self, reply: _AnthropicReply) -> list[ProviderEvent]:
+        if reply.stop_reason is None:
+            raise ProviderStreamError("provider_error")
+        if reply.stop_reason == "refusal":
+            logger.warning("Claude declined an assistant call")
+            raise ProviderStreamError("refused")
+        # Cut off by the output limit, a call's input may be partial and still parse, and the
+        # browser would run it. The finish reason tells the client instead.
+        if reply.stop_reason in _ANTHROPIC_LENGTH_STOPS:
+            return [FinishedEvent("length")]
+        calls = _complete_tool_calls(reply.parts)
+        return [*calls, FinishedEvent("tool_calls" if calls else "stop")]
+
+
+def provider_has_key(settings: Settings, name: str) -> bool:
+    if name == "anthropic":
+        return bool(settings.assistant_anthropic_api_key)
+    return bool(settings.assistant_groq_api_key)
+
+
+def assistant_can_answer(settings: Settings) -> bool:
+    """Whether the assistant is switched on with a provider that has its key."""
+    if not settings.assistant_enabled:
+        return False
+    if settings.assistant_provider == "anthropic":
+        return bool(settings.assistant_anthropic_api_key or settings.assistant_groq_api_key)
+    return settings.assistant_provider == "groq" and bool(settings.assistant_groq_api_key)
+
+
 def build_assistant_provider(settings: Settings) -> AssistantProvider | None:
-    """The configured provider, or None for a name not supported yet (the assistant then reports 503)."""
+    """The provider to try first, or None for an unknown name (the assistant then reports 503).
+    With no Claude key this stays on Groq, so deploying before the key is added changes nothing."""
+    if settings.assistant_provider == "anthropic":
+        if settings.assistant_anthropic_api_key:
+            return AnthropicAssistantProvider(settings)
+        logger.warning("No Claude API key is set, so the assistant is using Groq")
+        return GroqAssistantProvider(settings)
     if settings.assistant_provider == "groq":
         return GroqAssistantProvider(settings)
     logger.error("Unknown ASSISTANT_PROVIDER: %s", settings.assistant_provider)
+    return None
+
+
+def build_assistant_fallback(settings: Settings) -> AssistantProvider | None:
+    """Groq behind Claude, when both have keys. Nothing goes behind Groq: an outage there
+    must not start spending Claude credit when Groq-only was chosen."""
+    if settings.assistant_provider == "anthropic" and settings.assistant_anthropic_api_key and settings.assistant_groq_api_key:
+        return GroqAssistantProvider(settings)
     return None

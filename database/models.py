@@ -688,6 +688,8 @@ class AssistantAccess(Base):
     tokens_limit: Mapped[int] = mapped_column(BigInteger, nullable=False)
     tokens_used: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # When the current run of passes began: a payment made before this had already lapsed.
+    period_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class AssistantWebhookEvent(Base):

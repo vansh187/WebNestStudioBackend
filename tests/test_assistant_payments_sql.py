@@ -28,13 +28,25 @@ from database.models import AssistantAccess, AssistantPayment, AssistantWebhookE
 from database.session import Base
 from schemas.assistant_schemas import VerifyRequest
 from services.assistant_payment_service import AssistantPaymentService, OrderRateLimiter
+from services.razorpay_client import RazorpayPayment
 
 TEST_DB_URL = os.environ.get("EXAMS_TEST_DATABASE_URL", "")
 TABLES = [User.__table__, AssistantPayment.__table__, AssistantAccess.__table__, AssistantWebhookEvent.__table__]
-MIGRATION = Path(__file__).resolve().parent.parent / "migrations" / "017_assistant_payments.sql"
+MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
+PAYMENT_MIGRATIONS = [MIGRATIONS / "017_assistant_payments.sql", MIGRATIONS / "018_assistant_access_period.sql"]
 KEY_SECRET = "test-key-secret"
 WEBHOOK_SECRET = "test-webhook-secret"
 TOKENS = 2_000_000
+
+CAPTURED_PAYMENTS: dict[str, str] = {}
+
+
+class CapturingRazorpay:
+    """Says a payment was captured, on the order the test signed it for."""
+
+    async def get_payment(self, payment_id: str) -> RazorpayPayment:
+        return RazorpayPayment(payment_id, "captured", 29900, "INR", CAPTURED_PAYMENTS.get(payment_id))
+
 
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="EXAMS_TEST_DATABASE_URL is not set")
 
@@ -46,6 +58,10 @@ class Db:
         self.sessions = async_sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
         self.store = SqlAssistantPaymentStore(self.sessions)
         settings = SimpleNamespace(
+            assistant_enabled=True,
+            assistant_provider="groq",
+            assistant_groq_api_key="placeholder",
+            assistant_anthropic_api_key="",
             assistant_paywall_enabled=True,
             assistant_price_paise=29900,
             assistant_pass_days=30,
@@ -55,7 +71,7 @@ class Db:
             assistant_razorpay_webhook_secret=WEBHOOK_SECRET,
             assistant_razorpay_webhook_secret_previous="",
         )
-        self.service = AssistantPaymentService(settings, self.store, None, OrderRateLimiter())  # type: ignore[arg-type]
+        self.service = AssistantPaymentService(settings, self.store, CapturingRazorpay(), OrderRateLimiter())  # type: ignore[arg-type]
 
     async def reset(self) -> None:
         async with self.engine.begin() as connection:
@@ -123,17 +139,18 @@ def failed(order_id: str) -> dict[str, Any]:
     return {"event": "payment.failed", "payload": {"payment": {"entity": {"id": "pay_x", "order_id": order_id, "amount": 29900, "currency": "INR"}}}}
 
 
-def refund(order_id: str, status: str = "full") -> dict[str, Any]:
+def refund(order_id: str, status: str = "full", payment_id: str = "pay_1") -> dict[str, Any]:
     return {
         "event": "refund.processed",
         "payload": {
-            "refund": {"entity": {"id": "rfnd_1", "payment_id": "pay_1", "amount": 29900}},
-            "payment": {"entity": {"id": "pay_1", "order_id": order_id, "amount": 29900, "amount_refunded": 29900 if status == "full" else 100, "refund_status": status}},
+            "refund": {"entity": {"id": "rfnd_1", "payment_id": payment_id, "amount": 29900}},
+            "payment": {"entity": {"id": payment_id, "order_id": order_id, "amount": 29900, "amount_refunded": 29900 if status == "full" else 100, "refund_status": status}},
         },
     }
 
 
 def verify_request(order_id: str, payment_id: str = "pay_1") -> VerifyRequest:
+    CAPTURED_PAYMENTS[payment_id] = order_id
     signature = hmac.new(KEY_SECRET.encode(), f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
     return VerifyRequest(razorpay_order_id=order_id, razorpay_payment_id=payment_id, razorpay_signature=signature)
 
@@ -321,7 +338,7 @@ def test_a_refund_of_one_pass_leaves_the_other_pass() -> None:
         first, second = await db.order(user_id), await db.order(user_id)
         await db.store.grant(first, "pay_1")
         await db.store.grant(second, "pay_2")
-        await db.webhook("evt_1", refund(second))
+        await db.webhook("evt_1", refund(second, payment_id="pay_2"))
         state = await db.store.get_access(user_id)
         assert state is not None and state.tokens_limit == TOKENS
         assert 29.9 < days_from_now(state) < 30.1
@@ -336,10 +353,67 @@ def test_a_repeated_refund_takes_back_once() -> None:
         first, second = await db.order(user_id), await db.order(user_id)
         await db.store.grant(first, "pay_1")
         await db.store.grant(second, "pay_2")
-        await db.webhook("evt_1", refund(second))
+        await db.webhook("evt_1", refund(second, payment_id="pay_2"))
         before = await db.store.get_access(user_id)
-        await db.webhook("evt_2", refund(second))
+        await db.webhook("evt_2", refund(second, payment_id="pay_2"))
         assert await db.store.get_access(user_id) == before
+
+    scenario(body)
+
+
+def test_refunding_a_second_payment_on_an_order_leaves_the_pass_from_the_first() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        order_id = await db.order(user_id)
+        await db.webhook("evt_1", captured(order_id, "pay_first"))
+        before = await db.store.get_access(user_id)
+        await db.webhook("evt_2", refund(order_id, payment_id="pay_late"))
+        assert await db.store.get_access(user_id) == before
+        assert (await db.payment(order_id)).status == "paid"
+        assert await db.store.apply_webhook(WebhookEvent("evt_3", "refund.processed", order_id, "pay_late", full_refund=True)) == "refund_other_payment"
+
+    scenario(body)
+
+
+def test_refunding_a_lapsed_pass_leaves_the_newer_one_alone() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        old, new = await db.order(user_id), await db.order(user_id)
+        await db.store.grant(old, "pay_old")
+        await db.expire(user_id)
+        await db.store.grant(new, "pay_new")
+        before = await db.store.get_access(user_id)
+        await db.webhook("evt_1", refund(old, payment_id="pay_old"))
+        assert await db.store.get_access(user_id) == before
+        assert (await db.payment(old)).status == "refunded"
+        assert (await db.service.get_access(user_id)).active is True
+
+    scenario(body)
+
+
+def test_refunding_the_newer_pass_after_a_lapse_still_ends_it() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        old, new = await db.order(user_id), await db.order(user_id)
+        await db.store.grant(old, "pay_old")
+        await db.expire(user_id)
+        await db.store.grant(new, "pay_new")
+        await db.webhook("evt_1", refund(new, payment_id="pay_new"))
+        assert (await db.service.get_access(user_id)).active is False
+
+    scenario(body)
+
+
+def test_refunding_the_older_of_two_stacked_passes_takes_back_its_share() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        first, second = await db.order(user_id), await db.order(user_id)
+        await db.store.grant(first, "pay_1")
+        await db.store.grant(second, "pay_2")
+        await db.webhook("evt_1", refund(first, payment_id="pay_1"))
+        state = await db.store.get_access(user_id)
+        assert state is not None and state.tokens_limit == TOKENS
+        assert 29.9 < days_from_now(state) < 30.1
 
     scenario(body)
 
@@ -423,6 +497,42 @@ def test_parallel_calls_do_not_lose_token_counts() -> None:
     scenario(body)
 
 
+def test_parallel_reservations_can_only_overrun_by_the_last_call() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        await db.store.grant(await db.order(user_id), "pay_1")
+        await db.store.add_tokens(user_id, TOKENS - 1)
+        results = await asyncio.gather(*(db.store.reserve_tokens(user_id, 7000) for _ in range(30)))
+        assert results.count(True) == 1
+        state = await db.store.get_access(user_id)
+        assert state is not None and state.tokens_used == TOKENS - 1 + 7000
+        assert await db.other_connections() == 0
+
+    scenario(body)
+
+
+def test_an_expired_or_missing_pass_can_not_be_reserved() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        assert await db.store.reserve_tokens(user_id, 10) is False
+        await db.store.grant(await db.order(user_id), "pay_1")
+        assert await db.store.reserve_tokens(user_id, 10) is True
+        await db.expire(user_id)
+        assert await db.store.reserve_tokens(user_id, 10) is False
+
+    scenario(body)
+
+
+def test_giving_back_tokens_never_goes_below_zero() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        await db.store.grant(await db.order(user_id), "pay_1")
+        state = await db.store.add_tokens(user_id, -500)
+        assert state is not None and state.tokens_used == 0
+
+    scenario(body)
+
+
 def test_adding_tokens_with_no_pass_is_a_quiet_nothing() -> None:
     async def body(db: Db) -> None:
         assert await db.store.add_tokens(await db.user(), 100) is None
@@ -449,8 +559,20 @@ def test_open_orders_are_unpaid_and_recent_only() -> None:
         await db.webhook("evt_1", failed(failing))
         async with db.engine.begin() as connection:
             await connection.execute(text("update assistant_payments set created_at = now() - interval '3 days' where razorpay_order_id = :o"), {"o": old})
-        found = await db.store.open_orders(datetime.now(timezone.utc) - timedelta(hours=24), 10)
+        found = await db.store.open_orders(datetime.now(timezone.utc) - timedelta(hours=24), 10, 5)
         assert {order.order_id for order in found} == {fresh, failing}
+
+    scenario(body)
+
+
+def test_one_users_abandoned_orders_cant_crowd_out_another_users_order() -> None:
+    async def body(db: Db) -> None:
+        patient, spammer = await db.user(), await db.user()
+        paid_for = await db.order(patient)
+        spam = [await db.order(spammer) for _ in range(30)]
+        found = {order.order_id for order in await db.store.open_orders(datetime.now(timezone.utc) - timedelta(hours=24), 10, 5)}
+        assert paid_for in found
+        assert len(found & set(spam)) == 5, "the newest few of that user's"
 
     scenario(body)
 
@@ -477,6 +599,21 @@ def test_a_payment_arriving_after_the_account_is_deleted_does_not_fail() -> None
             await connection.execute(text("delete from users where id = :u"), {"u": user_id})
         await db.webhook("evt_1", captured(order_id))
         assert (await db.payment(order_id)).status == "paid"
+        assert await db.store.apply_webhook(WebhookEvent("evt_2", "payment.captured", await db.order(await db.user()), "pay_2", 29900, "INR")) == "granted"
+
+    scenario(body)
+
+
+def test_money_taken_for_a_deleted_account_is_flagged_for_a_refund(caplog: pytest.LogCaptureFixture) -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        order_id = await db.order(user_id)
+        async with db.engine.begin() as connection:
+            await connection.execute(text("delete from users where id = :u"), {"u": user_id})
+        event = WebhookEvent("evt_1", "payment.captured", order_id, "pay_1", 29900, "INR")
+        assert await db.store.apply_webhook(event) == "no_account"
+        assert "refund it by hand" in caplog.text
+        assert await db.store.grant(order_id, "pay_1") is False
 
     scenario(body)
 
@@ -521,6 +658,24 @@ def test_webhook_event_with_no_order_id_is_recorded_and_harmless() -> None:
     scenario(body)
 
 
+def test_the_period_migration_backfills_so_an_earlier_pass_can_still_be_refunded() -> None:
+    async def body(db: Db) -> None:
+        user_id = await db.user()
+        order_id = await db.order(user_id)
+        await db.store.grant(order_id, "pay_1")
+        async with db.engine.begin() as connection:
+            # As a pass bought before the column existed looks once it's added.
+            await connection.execute(text("update assistant_access set period_started_at = now() + interval '1 hour'"))
+        async with db.engine.connect() as connection:
+            autocommit = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            raw = await autocommit.get_raw_connection()
+            await raw.driver_connection.execute(PAYMENT_MIGRATIONS[1].read_text(encoding="utf-8"))
+        await db.webhook("evt_1", refund(order_id))
+        assert (await db.service.get_access(user_id)).active is False
+
+    scenario(body)
+
+
 def test_the_migration_builds_the_same_tables_as_the_models_and_can_rerun() -> None:
     names = ("assistant_payments", "assistant_access", "assistant_webhook_events")
 
@@ -549,7 +704,8 @@ def test_the_migration_builds_the_same_tables_as_the_models_and_can_rerun() -> N
         async with db.engine.connect() as connection:
             autocommit = await connection.execution_options(isolation_level="AUTOCOMMIT")
             raw = await autocommit.get_raw_connection()
-            await raw.driver_connection.execute(MIGRATION.read_text(encoding="utf-8"))
+            for migration in PAYMENT_MIGRATIONS:
+                await raw.driver_connection.execute(migration.read_text(encoding="utf-8"))
 
     async def body(db: Db) -> None:
         from_model = await shape(db)

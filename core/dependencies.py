@@ -11,7 +11,7 @@ from database.assistant_payment_persistence import SqlAssistantPaymentStore
 from database.assistant_usage_persistence import SqlAssistantUsageStore
 from database.models import User
 from database.session import Database
-from services.assistant_llm import build_assistant_provider
+from services.assistant_llm import build_assistant_fallback, build_assistant_provider
 from services.assistant_payment_service import AssistantPaymentService, OrderRateLimiter
 from services.assistant_service import ActiveStreamRegistry, AssistantService
 from services.razorpay_client import HttpRazorpayClient
@@ -58,6 +58,7 @@ class DependencyContainer:
         self.plan_pdf_service = PlanPdfService(app_settings)
         self.scheduler = create_scheduler()
         self.assistant_provider = build_assistant_provider(app_settings)
+        self.assistant_fallback_provider = build_assistant_fallback(app_settings)
         self.assistant_usage_store = SqlAssistantUsageStore(self.database.session_scope)
         self.assistant_streams = ActiveStreamRegistry()
         self.razorpay_client = HttpRazorpayClient(app_settings)
@@ -167,6 +168,7 @@ def get_assistant_service() -> AssistantService:
         store=container.assistant_usage_store,
         registry=container.assistant_streams,
         payments=container.assistant_payments,
+        fallback=container.assistant_fallback_provider,
     )
 
 
