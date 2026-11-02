@@ -645,7 +645,7 @@ def test_usage_has_no_access_field_with_the_paywall_off() -> None:
 def test_usage_before_any_payment_shows_the_full_allowance() -> None:
     assistant, payments = paid_service(FakePaymentStore())
     body = client_for(payments, assistant).get("/api/assistant/usage").json()
-    assert body["provider_name"] == "Groq"
+    assert body["provider_name"] == "WebNest AI"
     assert body["access"] == {
         "active": False,
         "expires_at": None,
@@ -690,6 +690,29 @@ def test_no_active_access_gives_402_before_any_provider_call(state: AccessState 
     assert response.json() == {"detail": "Unlock WebNest AI to continue."}
     assert provider.requests == []
     assert usage_store.reservations == []
+
+
+@pytest.mark.parametrize(("name", "model"), [("anthropic", "claude-haiku-5-5"), ("groq", "openai/gpt-oss-120b")])
+def test_clients_never_see_which_provider_or_model_answered(name: str, model: str) -> None:
+    provider = FakeProvider()
+    provider.name = name  # type: ignore[misc]
+    provider.model = model  # type: ignore[misc]
+    assistant, payments = paid_service(FakePaymentStore(AccessState(LATER, 100_000, 0)), provider)
+    assistant._settings.assistant_anthropic_api_key = "test-key"
+    client = client_for(payments, assistant)
+    seen = client.get("/api/assistant/usage").text + client.post("/api/assistant/chat", json=BODY).text
+    assert '"provider_name":"WebNest AI"' in seen
+    for secret in ("anthropic", "claude", "haiku", "groq", "gpt-oss"):
+        assert secret not in seen.lower()
+
+
+def test_the_general_space_needs_an_active_pass_too() -> None:
+    provider = FakeProvider()
+    assistant, payments = paid_service(FakePaymentStore(None), provider)
+    body = {**BODY, "context": {"language": "general", "files": []}}
+    response = client_for(payments, assistant).post("/api/assistant/chat", json=body)
+    assert response.status_code == 402
+    assert provider.requests == []
 
 
 def test_a_402_frees_the_users_stream_slot() -> None:

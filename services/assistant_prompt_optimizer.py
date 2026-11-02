@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from schemas.assistant_schemas import AssistantMode, ChatContext, ChatMessage, ChatToolCall
+from schemas.assistant_schemas import GENERAL_LANGUAGE, AssistantMode, ChatContext, ChatMessage, ChatToolCall
 
 ProviderMessage = dict[str, Any]
 
@@ -131,12 +131,17 @@ def _strip_line_ends(text: str) -> str:
     return "\n".join([*(line.rstrip(" \t") for line in lines[:-1]), lines[-1]])
 
 
-def tidy_user_text(text: str) -> str:
-    """Drops greetings, courtesy words and extra blank lines. Fenced code is untouched."""
+def _tidy_spacing(text: str) -> str:
+    """Drops trailing spaces and extra blank lines. Fenced code is untouched."""
     parts = _CODE_FENCE.split(text)
     for index in range(0, len(parts), 2):  # even parts are outside the fences
         parts[index] = _BLANK_LINES.sub("\n\n", _strip_line_ends(parts[index]))
-    tidied = "".join(parts).strip()
+    return "".join(parts).strip()
+
+
+def tidy_user_text(text: str) -> str:
+    """Also drops greetings and courtesy words, which are noise in a coding request."""
+    tidied = _tidy_spacing(text)
     without_filler = _TRAILING_FILLER.sub("", _LEADING_FILLER.sub("", tidied, count=1)).rstrip(" ,\n")
     return without_filler or tidied
 
@@ -402,7 +407,8 @@ def _current_user_text(
     parts: SentParts,
 ) -> str:
     pieces = [_context_block(context, turn, mentioned, limits, mode, parts)]
-    if mode == "agent":
+    # The hint's choices are about code, and would send a plain question towards run_project.
+    if mode == "agent" and context.language != GENERAL_LANGUAGE:
         pieces.append(task_hint(text, bool(context.last_error)))
     if dropped_turns:
         pieces.append("Earlier messages in this chat were left out to save space.")
@@ -446,10 +452,12 @@ def _without_oldest_round(turn: list[ChatMessage]) -> list[ChatMessage] | None:
     return [*turn[: rounds[0]], *turn[rounds[1] :]]
 
 
-def _tidied(messages: list[ChatMessage]) -> list[ChatMessage]:
-    """Done once here, not on each of the many attempts to fit the budget."""
+def _tidied(messages: list[ChatMessage], context: ChatContext, mode: AssistantMode) -> list[ChatMessage]:
+    """Done once here, not on each of the many attempts to fit the budget. Where any question
+    is welcome, a courtesy word can be the point of the message, as in a request to translate it."""
+    tidy = _tidy_spacing if mode == "ask" or context.language == GENERAL_LANGUAGE else tidy_user_text
     return [
-        message.model_copy(update={"content": tidy_user_text(message.content or "")}) if message.role == "user" else message
+        message.model_copy(update={"content": tidy(message.content or "")}) if message.role == "user" else message
         for message in messages
     ]
 
@@ -504,7 +512,7 @@ def optimize_conversation(
     """The conversation to send: history trimmed by age, the newest user message
     tidied and given its context, and the whole fitted to `max_input_tokens`."""
     budget = max(max_input_tokens - prefix_tokens, 1)
-    fitted = _fit_to_budget(_split_turns(_tidied(_repair(messages))), context, mode, budget)
+    fitted = _fit_to_budget(_split_turns(_tidied(_repair(messages), context, mode)), context, mode, budget)
     return OptimizedConversation(
         messages=fitted.messages,
         estimated_tokens=_estimate_tokens(fitted.messages),

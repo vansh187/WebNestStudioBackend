@@ -3,6 +3,7 @@ against a fake HTTP transport, so its real parsing and errors are tested, with n
 
 import asyncio
 import json
+import re
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -28,6 +29,7 @@ from services.assistant_llm import (
     TextDelta,
     ToolCallEvent,
     UsageEvent,
+    _public_call_id,
     anthropic_messages,
     build_assistant_fallback,
     build_assistant_provider,
@@ -247,11 +249,20 @@ def test_text_streams_and_every_billed_field_is_counted() -> None:
 
 def test_tool_calls_are_assembled_from_their_pieces() -> None:
     events = run(stream_provider(message_start(), *text_block("Reading."), *tool_block("t1", "read_file", '{"pa', 'th": "a.py"}', index=1), *message_end("tool_use")))
-    assert events[-2:] == [ToolCallEvent("t1", "read_file", {"path": "a.py"}), FinishedEvent("tool_calls")]
+    assert events[-2:] == [ToolCallEvent(_public_call_id("t1"), "read_file", {"path": "a.py"}), FinishedEvent("tool_calls")]
 
 
 def test_a_tool_with_no_input_is_an_empty_object() -> None:
-    assert ToolCallEvent("t1", "list_files", {}) in run(stream_provider(message_start(), *tool_block("t1", "list_files"), *message_end("tool_use")))
+    assert ToolCallEvent(_public_call_id("t1"), "list_files", {}) in run(stream_provider(message_start(), *tool_block("t1", "list_files"), *message_end("tool_use")))
+
+
+def test_a_tool_call_id_does_not_show_it_came_from_claude() -> None:
+    events = run(stream_provider(message_start(), *tool_block("toolu_01AbCdEf", "list_files"), *tool_block("toolu_02GhIjKl", "list_files", index=1), *message_end("tool_use")))
+    ids = [event.id for event in events if isinstance(event, ToolCallEvent)]
+    assert len(set(ids)) == 2
+    for call_id in ids:
+        assert "toolu" not in call_id
+        assert re.fullmatch(r"[a-zA-Z0-9_-]+", call_id)
 
 
 def test_broken_tool_json_is_an_invalid_tool_call_and_still_counts_its_tokens() -> None:
@@ -647,7 +658,7 @@ def test_real_sdk_events_drive_the_whole_service() -> None:
     service = AssistantService(settings(), provider, store, ActiveStreamRegistry())  # type: ignore[arg-type]
     events = parse_sse(client_for(service).post("/api/assistant/chat", json={**BODY, "mode": "agent"}).text)
     assert [name for name, _ in events] == ["text", "tool_call", "usage", "done"]
-    assert events[1][1] == {"id": "t1", "name": "read_file", "arguments": {"path": "a.py"}}
+    assert events[1][1] == {"id": _public_call_id("t1"), "name": "read_file", "arguments": {"path": "a.py"}}
     assert events[2][1]["input_tokens"] == 140
     assert events[3][1] == {"finish_reason": "tool_calls"}
     assert store.recorded == [(140, 7)]
@@ -662,7 +673,7 @@ def test_real_sdk_events_drive_the_whole_service() -> None:
 def test_every_prompt_has_the_reply_rules(mode: Any, language: Any) -> None:
     prompt = system_prompt(mode, language)
     assert "Hinglish in Roman letters" in prompt
-    assert "under about 250 words" in prompt
+    assert ("under about 250 words" if mode == "agent" else "about 600 words") in prompt
     assert "Want me to continue?" in prompt
     assert "I can't share my setup, but I'm happy to help with your question." in prompt
     assert "Decline harmful" in prompt
