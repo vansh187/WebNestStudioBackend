@@ -11,12 +11,16 @@ from schemas.coding_schemas import Text
 MAX_BODY_BYTES = 200 * 1024
 MAX_MESSAGES = 60
 MAX_USER_MESSAGE_CHARS = 500
+# Where any question is welcome, a letter or resume to work on has no file to live in.
+MAX_ANY_QUESTION_CHARS = 4000
 MAX_CONTEXT_FILES = 200
 MAX_CONTEXT_CONTENT_CHARS = 12_000
 MAX_FILE_NAME_CHARS = 500
 
 AssistantMode = Literal["ask", "agent"]
-AssistantLanguage = Literal["backend", "python", "java", "web"]
+# "general" is the AI Agent screen's Anything space: no project to run, and Agent mode only.
+AssistantLanguage = Literal["backend", "python", "java", "web", "general"]
+GENERAL_LANGUAGE: AssistantLanguage = "general"
 ContextText = Annotated[Text, Field(max_length=MAX_CONTEXT_CONTENT_CHARS)]
 FileName = Annotated[Text, Field(min_length=1, max_length=MAX_FILE_NAME_CHARS)]
 
@@ -38,8 +42,8 @@ class ChatMessage(BaseModel):
     def check_role_fields(self) -> "ChatMessage":
         if self.role == "user" and not (self.content and self.content.strip()):
             raise ValueError("A user message needs content")
-        if self.role == "user" and len(self.content or "") > MAX_USER_MESSAGE_CHARS:
-            raise ValueError(f"A user message can be at most {MAX_USER_MESSAGE_CHARS} characters")
+        if self.role == "user" and len(self.content or "") > MAX_ANY_QUESTION_CHARS:
+            raise ValueError(f"A user message can be at most {MAX_ANY_QUESTION_CHARS} characters")
         if self.role == "assistant" and not self.content and not self.tool_calls:
             raise ValueError("An assistant message needs content or tool calls")
         if self.role == "tool" and (self.tool_call_id is None or self.content is None):
@@ -63,6 +67,20 @@ class ChatRequest(BaseModel):
     mode: AssistantMode
     messages: list[ChatMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
     context: ChatContext
+
+    @model_validator(mode="after")
+    def check_general_is_agent_only(self) -> "ChatRequest":
+        if self.context.language == GENERAL_LANGUAGE and self.mode != "agent":
+            raise ValueError("The general space is only available in Agent mode")
+        return self
+
+    @model_validator(mode="after")
+    def check_coding_agent_message_length(self) -> "ChatRequest":
+        if self.mode == "agent" and self.context.language != GENERAL_LANGUAGE:
+            for message in self.messages:
+                if message.role == "user" and len(message.content or "") > MAX_USER_MESSAGE_CHARS:
+                    raise ValueError(f"A user message can be at most {MAX_USER_MESSAGE_CHARS} characters")
+        return self
 
 
 class AccessResponse(BaseModel):

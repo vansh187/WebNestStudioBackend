@@ -1,6 +1,7 @@
 """The assistant's provider interface, with its Claude and Groq implementations. Separate
 from services/llm_provider.py, so nothing here can affect the other AI features."""
 
+import hashlib
 import json
 import logging
 import re
@@ -453,7 +454,7 @@ class _AnthropicReply:
         elif kind == "content_block_start":
             block = event.content_block
             if block.type == "tool_use":
-                self.parts[event.index] = _PartialToolCall(id=block.id, name=block.name)
+                self.parts[event.index] = _PartialToolCall(id=_public_call_id(block.id), name=block.name)
         elif kind == "content_block_delta":
             delta = event.delta
             if delta.type == "text_delta":
@@ -467,6 +468,12 @@ class _AnthropicReply:
 
     def usage(self, partial: bool = False) -> UsageEvent:
         return UsageEvent(self.input_tokens, self.output_tokens, self.cached_tokens, partial)
+
+
+def _public_call_id(provider_id: str) -> str:
+    """Clients see and send back this id, and Claude's own has a telltale prefix. Claude only
+    needs a call and its result to share an id, so one that hides where it came from works."""
+    return f"call_{hashlib.sha256(provider_id.encode('utf-8')).hexdigest()[:24]}"
 
 
 def _anthropic_rejection(exc: anthropic.APIStatusError) -> ProviderError:

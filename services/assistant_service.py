@@ -62,7 +62,8 @@ _UNOPENED_LOG_MAX_TRACKED = 10_000
 # Paying users have no daily limit on calls: their limits are in tokens.
 _NO_DAILY_LIMIT = 10**15
 _NO_CALLS_LIMIT = 0
-_PROVIDER_NAMES = {"groq": "Groq", "anthropic": "Anthropic"}
+# All that clients ever see, whichever provider answered. The real one is only in server logs and the call log.
+_PUBLIC_PROVIDER_NAME = "WebNest AI"
 # Above 100,000 tokens Claude charges five times as much for the whole request. The margin is
 # because the size here is an estimate, and Haiku's tokenizer counts text about 30% higher.
 MAX_PROMPT_TOKENS = 90_000
@@ -260,8 +261,7 @@ class AssistantChatStream:
             }
             charging = self._start_charge(actual)
             if charging is not None:
-                # The one that really answered, for the panel's privacy notice.
-                usage["provider_name"] = _PROVIDER_NAMES.get(self._key.provider, self._key.provider)
+                usage["provider_name"] = _PUBLIC_PROVIDER_NAME
                 # Shielded: the client leaving here must not lose the count.
                 access = await asyncio.shield(charging)
                 if access is not None:
@@ -455,12 +455,11 @@ class AssistantService:
         calls_limit = self._calls_limit(paywall)
         if paywall is None:
             return AssistantUsageResponse(enabled=self.is_enabled(), calls_used_today=calls_used_today, calls_limit=calls_limit)
-        provider = self._provider.name if self._provider is not None else None
         return AssistantUsageResponse(
             enabled=self.is_enabled(),
             calls_used_today=calls_used_today,
             calls_limit=calls_limit,
-            provider_name=_PROVIDER_NAMES.get(provider, provider) if provider is not None else None,
+            provider_name=_PUBLIC_PROVIDER_NAME if self._provider is not None else None,
             access=await paywall.get_access(user_id),
         )
 
