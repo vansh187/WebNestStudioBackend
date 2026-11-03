@@ -197,6 +197,19 @@ class Settings(BaseSettings):
     java_playground_timeout_seconds: float = 65.0
     java_playground_daily_cap: int = 1500
 
+    # Spring Boot playground: the same Cloud Run image deployed as its own, larger service for
+    # multi-file Spring Boot projects (logged-in users only). The invoker key falls back to the
+    # Java one when the same service account may call both. A project run starts a JVM and a web
+    # server, so it gets a longer timeout and a smaller daily budget.
+    spring_playground_url: str = ""
+    spring_playground_invoker_key: str = ""
+    spring_playground_timeout_seconds: float = 115.0
+    spring_playground_daily_cap: int = 500
+    # Per logged-in user, so one person cannot use up the site-wide budget. Each run starts a JVM
+    # and a web server, so these are far lower than the plain Java limits.
+    spring_playground_per_minute: int = 4
+    spring_playground_per_day: int = 60
+
     # In-app project chat (user-to-user messaging) attachment storage. Files
     # live in a private Supabase Storage bucket; the backend uses the
     # service-role key to mint short-lived signed upload/download URLs so the

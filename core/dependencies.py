@@ -31,6 +31,7 @@ from services.faq_service import FaqService
 from services.generation_service import GenerationService
 from services.github_service import GitHubService
 from services.java_playground_service import JavaPlaygroundService
+from services.spring_playground_service import SpringPlaygroundService
 from services.lead_service import LeadService
 from services.messaging_service import MessagingService
 from services.newsletter_service import NewsletterService
@@ -143,6 +144,10 @@ def get_coding_service(session: AsyncSession = Depends(get_db_session)) -> Codin
 
 def get_java_playground_service(session: AsyncSession = Depends(get_db_session)) -> JavaPlaygroundService:
     return JavaPlaygroundService(session=session, settings=container.settings)
+
+
+def get_spring_playground_service(session: AsyncSession = Depends(get_db_session)) -> SpringPlaygroundService:
+    return SpringPlaygroundService(session=session, settings=container.settings)
 
 
 def get_codelab_service(session: AsyncSession = Depends(get_db_session)) -> CodelabService:
