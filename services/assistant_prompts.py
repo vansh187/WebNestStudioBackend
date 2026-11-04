@@ -44,6 +44,10 @@ Allowed file types: .py, .sql, .html, .css, .js, .json, .md, .txt.""",
     "python": "\nProject: Python, running in the browser.",
     "java": "\nProject: Java. The entry point is Main.java.",
     "web": "\nProject: HTML, CSS and JavaScript, running in the browser.",
+    "spring": """
+Project: Spring Boot 4.1 on Java 17 with Spring Web MVC, Bean Validation, Spring Data JPA and an in-memory H2 database. No other libraries and no internet.
+Classes go under src/main/java/ in a folder per package; resources are src/main/resources/application.properties, data.sql and schema.sql. pom.xml is for reading only.
+Each run and each API request compiles and starts the app on a server, and counts against the user's daily runs, so make all the changes first, run once, then send only the requests you need.""",
 }
 
 # For the prompts that answer any question: _COMMON's coding persona and short-answer limits don't fit them.
@@ -102,6 +106,7 @@ def _tool(name: str, description: str, **parameters: dict[str, str]) -> dict[str
 
 
 _STRING: dict[str, str] = {"type": "string"}
+_API_LANGUAGES: frozenset[str] = frozenset({"backend", "spring"})
 
 _API_REQUEST_TOOL = _tool(
     "send_api_request",
@@ -127,13 +132,13 @@ _BASE_TOOLS: tuple[dict[str, Any], ...] = (
 
 
 def tools_for(mode: AssistantMode, language: AssistantLanguage) -> list[dict[str, Any]]:
-    """Tools are offered only in Agent mode; only backend projects run an API, and the
-    general space has nothing to run at all."""
+    """Tools are offered only in Agent mode; only API projects (FastAPI, Spring Boot) take
+    requests, and the general space has nothing to run at all."""
     if mode != "agent":
         return []
     if language == GENERAL_LANGUAGE:
         return list(_FILE_TOOLS)
-    return [*_BASE_TOOLS, _API_REQUEST_TOOL] if language == "backend" else list(_BASE_TOOLS)
+    return [*_BASE_TOOLS, _API_REQUEST_TOOL] if language in _API_LANGUAGES else list(_BASE_TOOLS)
 
 
 def tool_names(tools: list[dict[str, Any]]) -> frozenset[str]:

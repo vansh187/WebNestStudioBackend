@@ -19,7 +19,7 @@ MAX_FILE_NAME_CHARS = 500
 
 AssistantMode = Literal["ask", "agent"]
 # "general" is the AI Agent screen's Anything space: no project to run, and Agent mode only.
-AssistantLanguage = Literal["backend", "python", "java", "web", "general"]
+AssistantLanguage = Literal["backend", "python", "java", "web", "spring", "general"]
 GENERAL_LANGUAGE: AssistantLanguage = "general"
 ContextText = Annotated[Text, Field(max_length=MAX_CONTEXT_CONTENT_CHARS)]
 FileName = Annotated[Text, Field(min_length=1, max_length=MAX_FILE_NAME_CHARS)]

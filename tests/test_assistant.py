@@ -338,6 +338,22 @@ def test_tool_list_matches_the_contract() -> None:
     assert tools_for("ask", "backend") == []
 
 
+def test_spring_projects_take_api_requests_and_explain_the_workspace() -> None:
+    assert tool_names(tools_for("agent", "spring")) == tool_names(tools_for("agent", "backend"))
+    assert tools_for("ask", "spring") == []
+    for mode in ("ask", "agent"):
+        prompt = system_prompt(mode, "spring")
+        for rule in ("Spring Boot 4.1", "Java 17", "src/main/java/", "data.sql", "pom.xml is for reading only", "daily runs"):
+            assert rule in prompt, (mode, rule)
+
+
+def test_a_spring_chat_is_accepted() -> None:
+    service, provider, _, _ = make_service()
+    body = body_with(context={"language": "spring", "files": ["src/main/java/com/example/demo/DemoApplication.java"]})
+    assert client_for(service).post("/api/assistant/chat", json=body).status_code == 200
+    assert "send_api_request" in tool_names(provider.requests[0].tools)
+
+
 def test_ask_prompt_requires_complete_path_labelled_files_for_apply() -> None:
     prompt = system_prompt("ask", "backend")
     assert "```python app/main.py" in prompt
@@ -346,7 +362,7 @@ def test_ask_prompt_requires_complete_path_labelled_files_for_apply() -> None:
     assert "```python app/main.py" not in system_prompt("agent", "backend")
 
 
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
 @pytest.mark.parametrize("mode", ["ask", "agent"])
 def test_system_prompt_states_the_security_rules(mode: Any, language: Any) -> None:
     prompt = system_prompt(mode, language)
@@ -381,7 +397,7 @@ def test_prompts_and_tools_of_the_existing_languages_are_unchanged(mode: Any, la
 
 
 @pytest.mark.parametrize("mode", ["ask", "agent"])
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
 def test_every_prompt_gives_the_webnest_identity_and_names_no_provider(mode: Any, language: Any) -> None:
     prompt = system_prompt(mode, language)
     assert 'say: "I am WebNest AI."' in prompt
@@ -438,7 +454,7 @@ def test_any_question_spaces_take_longer_messages_than_the_coding_agent(mode: st
 # ---- Ask mode takes any question --------------------------------------------------------
 
 
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
 def test_ask_mode_answers_any_question_and_keeps_the_ide_rules(language: Any) -> None:
     prompt = system_prompt("ask", language)
     assert "Answer any question" in prompt
@@ -449,7 +465,7 @@ def test_ask_mode_answers_any_question_and_keeps_the_ide_rules(language: Any) ->
         assert rule in prompt
 
 
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
 def test_agent_mode_stays_the_coding_assistant(language: Any) -> None:
     prompt = system_prompt("agent", language)
     assert prompt.startswith("You are the coding assistant inside CodeLab")
