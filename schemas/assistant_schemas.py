@@ -1,10 +1,12 @@
 """Request and response models for the CodeLab AI assistant. Unknown fields such
 as model or system are ignored: the server alone chooses those."""
 
+import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from schemas.coding_schemas import Text
 
@@ -132,3 +134,73 @@ class VerifyRequest(BaseModel):
 
 class VerifyResponse(BaseModel):
     access: AccessResponse
+
+
+class GooglePlayVerifyRequest(BaseModel):
+    """As the Android app sends it. Every field is optional here so the service, not the
+    parser, decides each status: a wrong product is a 404 and a missing token a 400."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    product_id: str | None = None
+    purchase_token: str | None = None
+    # Only for logs and support: Google's own order id is the one that is saved.
+    order_id: str | None = None
+    terms_version: str | None = None
+    terms_accepted_at: str | None = None
+
+
+AssistantReportReason = Literal["harmful", "sexual", "hateful", "misleading", "privacy", "other"]
+MAX_REPORT_DETAILS_CHARS = 1000
+MAX_REPORT_REPLY_CHARS = 8000
+MAX_REPORT_PROMPT_CHARS = 4000
+MAX_REPORT_MESSAGE_ID_CHARS = 64
+
+
+def _cut_to(limit: int) -> Callable[[Any], Any]:
+    """Long text is cut, not refused. NUL bytes go too, since Postgres can't store them."""
+
+    def cut(value: Any) -> Any:
+        return value.replace("\x00", "")[:limit] if isinstance(value, str) else value
+
+    return cut
+
+
+class AssistantReportCreate(BaseModel):
+    reason: AssistantReportReason
+    details: Annotated[Text | None, BeforeValidator(_cut_to(MAX_REPORT_DETAILS_CHARS))] = None
+    reply_text: Annotated[Text, BeforeValidator(_cut_to(MAX_REPORT_REPLY_CHARS))]
+    prompt_text: Annotated[Text | None, BeforeValidator(_cut_to(MAX_REPORT_PROMPT_CHARS))] = None
+    client_message_id: Annotated[Text | None, BeforeValidator(_cut_to(MAX_REPORT_MESSAGE_ID_CHARS))] = None
+
+    @model_validator(mode="after")
+    def check_reply_text(self) -> "AssistantReportCreate":
+        if not self.reply_text.strip():
+            raise ValueError("reply_text is required")
+        return self
+
+
+class AssistantReportCreated(BaseModel):
+    id: uuid.UUID
+    status: Literal["open", "resolved"]
+
+
+class AssistantReportOut(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID | None
+    reporter_email: str | None
+    reason: str
+    details: str | None
+    reply_text: str
+    prompt_text: str | None
+    client_message_id: str | None
+    provider_name: str | None
+    model: str | None
+    status: str
+    created_at: datetime
+    resolved_at: datetime | None
+    resolved_by: uuid.UUID | None
+
+
+class AssistantReportList(BaseModel):
+    reports: list[AssistantReportOut]

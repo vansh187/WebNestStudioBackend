@@ -1,6 +1,7 @@
 """WebNest Prime payments and access. Each method opens its own short session with a time
-limit, so no connection is held during a call to Razorpay. Verify, the webhook and the
-reconciliation job all grant through _grant, so a payment only ever counts once."""
+limit, so no connection is held during a call to Razorpay or Google. Razorpay's verify, webhook
+and reconciliation grant through _grant, so a payment only ever counts once, and Google Play
+claims its unique token. Both extend access through the same _extend_access."""
 
 import asyncio
 import logging
@@ -17,7 +18,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.exceptions import DatabaseError
-from database.models import AssistantAccess, AssistantPayment, AssistantWebhookEvent
+from database.models import AssistantAccess, AssistantPayment, AssistantPlayPurchase, AssistantWebhookEvent
 
 logger = logging.getLogger("webnest.assistant.payments")
 
@@ -81,6 +82,40 @@ class WebhookEvent:
     amount: int | None = None
     currency: str | None = None
     full_refund: bool = False
+
+
+@dataclass(frozen=True)
+class PlayPurchaseRecord:
+    """A Google Play token already granted. user_id is None once that account was deleted."""
+
+    user_id: uuid.UUID | None
+    acknowledged: bool
+
+
+@dataclass(frozen=True)
+class NewPlayPurchase:
+    """A purchase Google has confirmed, ready to grant. Every field comes from Google's answer or
+    from settings, except the terms the user accepted in the app."""
+
+    user_id: uuid.UUID
+    purchase_token: str
+    product_id: str
+    google_order_id: str | None
+    pass_days: int
+    pass_tokens: int
+    region_code: str | None
+    purchase_time: datetime | None
+    terms_version: str | None
+    terms_accepted_at: datetime | None
+    acknowledged: bool
+
+
+class PlayPurchaseStore(Protocol):
+    async def find_play_purchase(self, purchase_token: str) -> PlayPurchaseRecord | None: ...
+
+    async def claim_play_purchase(self, purchase: NewPlayPurchase) -> bool: ...
+
+    async def mark_play_acknowledged(self, purchase_token: str) -> None: ...
 
 
 class AssistantPaymentStore(Protocol):
@@ -287,18 +322,24 @@ class SqlAssistantPaymentStore:
         if paid.user_id is None:
             logger.error("Money taken for a deleted account, refund it by hand: order=%s payment=%s", order_id, payment_id)
             return "no_account"
-        days = timedelta(days=paid.pass_days)
+        await self._extend_access(session, paid.user_id, paid.pass_days, paid.pass_tokens)
+        return "granted"
+
+    async def _extend_access(self, session: AsyncSession, user_id: uuid.UUID, pass_days: int, pass_tokens: int) -> None:
+        """The one grant every payment source uses. A pass still running is extended and keeps
+        its unused tokens; one that has lapsed starts again from now."""
+        days = timedelta(days=pass_days)
         still_running = AssistantAccess.expires_at > func.now()
         upsert = insert(AssistantAccess).values(
-            user_id=paid.user_id, expires_at=func.now() + days, tokens_limit=paid.pass_tokens, tokens_used=0, period_started_at=func.now()
+            user_id=user_id, expires_at=func.now() + days, tokens_limit=pass_tokens, tokens_used=0, period_started_at=func.now()
         )
         await session.execute(
             upsert.on_conflict_do_update(
                 index_elements=[AssistantAccess.user_id],
                 set_={
                     "tokens_limit": case(
-                        (still_running, func.greatest(AssistantAccess.tokens_limit - AssistantAccess.tokens_used, 0) + paid.pass_tokens),
-                        else_=paid.pass_tokens,
+                        (still_running, func.greatest(AssistantAccess.tokens_limit - AssistantAccess.tokens_used, 0) + pass_tokens),
+                        else_=pass_tokens,
                     ),
                     "tokens_used": 0,
                     "period_started_at": case((still_running, AssistantAccess.period_started_at), else_=func.now()),
@@ -307,4 +348,49 @@ class SqlAssistantPaymentStore:
                 },
             )
         )
-        return "granted"
+
+    async def find_play_purchase(self, purchase_token: str) -> PlayPurchaseRecord | None:
+        statement = select(AssistantPlayPurchase.user_id, AssistantPlayPurchase.acknowledged_at).where(
+            AssistantPlayPurchase.purchase_token == purchase_token
+        )
+        async with self._session() as session:
+            row = (await session.execute(statement)).one_or_none()
+            return None if row is None else PlayPurchaseRecord(row.user_id, row.acknowledged_at is not None)
+
+    async def claim_play_purchase(self, purchase: NewPlayPurchase) -> bool:
+        """Records the token and grants in one transaction. False when the token was already
+        claimed: the unique index makes a second claim wait for the first and then do nothing."""
+        claim = (
+            insert(AssistantPlayPurchase)
+            .values(
+                user_id=purchase.user_id,
+                purchase_token=purchase.purchase_token,
+                google_order_id=purchase.google_order_id,
+                product_id=purchase.product_id,
+                pass_days=purchase.pass_days,
+                pass_tokens=purchase.pass_tokens,
+                region_code=purchase.region_code,
+                purchase_time=purchase.purchase_time,
+                terms_version=purchase.terms_version,
+                terms_accepted_at=purchase.terms_accepted_at,
+                acknowledged_at=func.now() if purchase.acknowledged else None,
+            )
+            .on_conflict_do_nothing(index_elements=[AssistantPlayPurchase.purchase_token])
+            .returning(AssistantPlayPurchase.id)
+        )
+        async with self._session() as session:
+            if (await session.execute(claim)).one_or_none() is None:
+                return False
+            await self._extend_access(session, purchase.user_id, purchase.pass_days, purchase.pass_tokens)
+            await session.commit()
+            return True
+
+    async def mark_play_acknowledged(self, purchase_token: str) -> None:
+        statement = (
+            update(AssistantPlayPurchase)
+            .where(AssistantPlayPurchase.purchase_token == purchase_token, AssistantPlayPurchase.acknowledged_at.is_(None))
+            .values(acknowledged_at=func.now())
+        )
+        async with self._session() as session:
+            await session.execute(statement)
+            await session.commit()

@@ -5,19 +5,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from core.dependencies import get_assistant_service, get_current_user, get_db_session
-from core.exceptions import PayloadTooLargeError
+from core.request_limits import read_limited_body
 from database.models import User
 from schemas.assistant_schemas import MAX_BODY_BYTES, AssistantUsageResponse, ChatRequest
 from services.assistant_service import AssistantChatStream, AssistantRateLimitedError, AssistantService
 
 router = APIRouter(prefix="/api/assistant", tags=["ai-assistant"])
-
-_TOO_LARGE_MESSAGE = "This request is too large."
 
 
 class AssistantStreamingResponse(StreamingResponse):
@@ -58,25 +55,6 @@ async def get_assistant_user_id(
     return user_id
 
 
-async def _read_limited_body(request: Request) -> bytes:
-    """FastAPI would read a declared body whole before any check, so it is read here
-    and stopped as soon as it passes the limit."""
-    declared = request.headers.get("content-length")
-    if declared is not None and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
-        raise PayloadTooLargeError(_TOO_LARGE_MESSAGE)
-    chunks: list[bytes] = []
-    size = 0
-    try:
-        async for chunk in request.stream():
-            size += len(chunk)
-            if size > MAX_BODY_BYTES:
-                raise PayloadTooLargeError(_TOO_LARGE_MESSAGE)
-            chunks.append(chunk)
-    except ClientDisconnect as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The request was not completed.") from exc
-    return b"".join(chunks)
-
-
 def _parse_chat_request(body: bytes) -> ChatRequest:
     try:
         return ChatRequest.model_validate_json(body)
@@ -99,7 +77,7 @@ async def chat(
     assistant_service: AssistantService = Depends(get_assistant_service),
 ) -> AssistantStreamingResponse:
     assistant_service.ensure_enabled()
-    payload = _parse_chat_request(await _read_limited_body(request))
+    payload = _parse_chat_request(await read_limited_body(request, MAX_BODY_BYTES))
     try:
         stream = await assistant_service.open_chat(user_id, payload)
     except AssistantRateLimitedError as exc:
