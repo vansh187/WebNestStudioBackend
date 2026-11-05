@@ -692,6 +692,62 @@ class AssistantAccess(Base):
     period_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class AssistantPlayPurchase(Base):
+    """One Google Play purchase token, granted once. The unique token is what stops a second
+    grant, whoever sends it. A deleted account's rows stay, unlinked, like assistant_payments.
+    Row level security comes from migration 021, not from this model."""
+
+    __tablename__ = "assistant_play_purchases"
+    __table_args__ = (
+        CheckConstraint("status IN ('granted')", name="ck_assistant_play_purchase_status"),
+        Index("ix_assistant_play_purchases_user", "user_id"),
+        Index("ix_assistant_play_purchases_order", "google_order_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    purchase_token: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    google_order_id: Mapped[str | None] = mapped_column(Text)
+    product_id: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="granted", server_default=text("'granted'"))
+    pass_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    pass_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    region_code: Mapped[str | None] = mapped_column(Text)
+    purchase_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    terms_version: Mapped[str | None] = mapped_column(Text)
+    terms_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class AssistantReport(Base):
+    """A member reporting an AI reply. The server keeps no chat history, so the report holds
+    the text it is about. Row level security comes from migration 022, not from this model."""
+
+    __tablename__ = "assistant_reports"
+    __table_args__ = (
+        CheckConstraint(
+            "reason IN ('harmful', 'sexual', 'hateful', 'misleading', 'privacy', 'other')", name="ck_assistant_report_reason"
+        ),
+        CheckConstraint("status IN ('open', 'resolved')", name="ck_assistant_report_status"),
+        Index("ix_assistant_reports_status", "status", text("created_at DESC")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    details: Mapped[str | None] = mapped_column(Text)
+    reply_text: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_text: Mapped[str | None] = mapped_column(Text)
+    client_message_id: Mapped[str | None] = mapped_column(Text)
+    provider_name: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open", server_default=text("'open'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+
+
 class AssistantWebhookEvent(Base):
     """Razorpay event ids already handled. Delivery is at-least-once, so duplicates happen."""
 

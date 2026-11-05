@@ -9,6 +9,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from api.admin_router import router as admin_router
 from api.assistant_payment_router import router as assistant_payment_router
 from api.assistant_payment_router import webhook_router as razorpay_webhook_router
+from api.assistant_report_router import admin_router as assistant_report_admin_router
+from api.assistant_report_router import router as assistant_report_router
 from api.assistant_router import router as assistant_router
 from api.auth_router import router as auth_router
 from api.chat_router import router as chat_router
@@ -149,6 +151,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Error while closing the Razorpay HTTP client", exc_info=True)
     try:
+        await container.google_play_client.aclose()
+    except Exception:
+        logger.warning("Error while closing the Google Play HTTP client", exc_info=True)
+    try:
         await container.storage_service.aclose()
     except Exception:
         logger.warning("Error while closing the storage service HTTP client", exc_info=True)
@@ -209,6 +215,8 @@ class WebNestStudioApp:
             assistant_router,
             assistant_payment_router,
             razorpay_webhook_router,
+            assistant_report_router,
+            assistant_report_admin_router,
             java_playground_router,
             spring_playground_router,
             codelab_router,

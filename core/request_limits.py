@@ -1,11 +1,17 @@
 import json
 import logging
 
+from fastapi import HTTPException, Request, status
+from starlette.requests import ClientDisconnect
+
+from core.exceptions import PayloadTooLargeError
+
 logger = logging.getLogger("webnest.request_limits")
 
 # 2 MB of commit content can grow to several times that once JSON-escaped.
 GITHUB_MAX_BODY_BYTES = 16 * 1024 * 1024
 _LIMITED_METHODS = ("POST", "PUT", "PATCH")
+TOO_LARGE = "This request is too large."
 
 
 class GitHubBodyLimitMiddleware:
@@ -80,3 +86,24 @@ class GitHubBodyLimitMiddleware:
         except Exception:
             # The client already went away; nothing left to tell it.
             logger.debug("Could not send the 413 response", exc_info=True)
+
+
+async def read_limited_body(request: Request, limit: int, too_large: str = TOO_LARGE) -> bytes:
+    """A route's raw body, untouched so a signature over it can still be checked. FastAPI would
+    read a declared body whole before any check; this refuses a declared size over the limit
+    before reading anything, and otherwise stops as soon as the bytes pass it, so a chunked
+    body can't get round the limit."""
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        raise PayloadTooLargeError(too_large)
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > limit:
+                raise PayloadTooLargeError(too_large)
+            chunks.append(chunk)
+    except ClientDisconnect as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The request was not completed.") from exc
+    return b"".join(chunks)

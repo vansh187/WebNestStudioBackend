@@ -166,6 +166,11 @@ class Settings(BaseSettings):
     )
     # Also accepted while rotating the secret, because retried events may still use the old one.
     assistant_razorpay_webhook_secret_previous: str = ""
+    # The Android app sells the same pass through Google Play Billing. The key is the service
+    # account's JSON, base64-encoded; without it the Play verify endpoint answers 503.
+    assistant_google_play_package_name: str = "com.webneststudio.app"
+    assistant_google_play_product_id: str = "webnest_prime_30d"
+    assistant_google_play_service_account_json: str = ""
 
     # Coding platform compiler proxy. Executed code runs on JDoodle's hosted
     # sandbox (https://www.jdoodle.com/compiler-api), never inside this API process.

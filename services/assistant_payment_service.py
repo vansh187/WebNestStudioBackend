@@ -9,7 +9,6 @@ import json
 import logging
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -27,6 +26,7 @@ from database.assistant_payment_persistence import AccessState, AssistantPayment
 from schemas.assistant_schemas import AccessResponse, MembershipResponse, OrderResponse, VerifyRequest
 from services.assistant_llm import assistant_can_answer
 from services.razorpay_client import RazorpayClient, RazorpayError, RazorpayPayment
+from services.user_rate_limiter import UserRateLimiter
 
 logger = logging.getLogger("webnest.assistant.payments")
 
@@ -34,7 +34,6 @@ PRIME_LABEL = "WebNest Prime Member"
 CURRENCY = "INR"
 ORDERS_PER_MINUTE = 5
 _ORDER_WINDOW_SECONDS = 60.0
-_MAX_TRACKED_USERS = 10_000
 _RECONCILE_WINDOW = timedelta(hours=24)
 _RECONCILE_MAX_ORDERS = 500
 _RECONCILE_ORDERS_PER_USER = 5
@@ -55,7 +54,7 @@ class OrderRateLimiter:
     """Orders per user per minute, in process memory. On the event loop only, so no lock."""
 
     def __init__(self) -> None:
-        self._orders: dict[uuid.UUID, deque[float]] = {}
+        self._orders = UserRateLimiter(ORDERS_PER_MINUTE, _ORDER_WINDOW_SECONDS)
         self._creating: set[uuid.UUID] = set()
 
     def begin_order(self, user_id: uuid.UUID) -> bool:
@@ -70,16 +69,7 @@ class OrderRateLimiter:
         self._creating.discard(user_id)
 
     def allow(self, user_id: uuid.UUID, now: float) -> bool:
-        cutoff = now - _ORDER_WINDOW_SECONDS
-        if len(self._orders) >= _MAX_TRACKED_USERS:
-            self._orders = {user: times for user, times in self._orders.items() if times and times[-1] > cutoff}
-        times = self._orders.setdefault(user_id, deque())
-        while times and times[0] <= cutoff:
-            times.popleft()
-        if len(times) >= ORDERS_PER_MINUTE:
-            return False
-        times.append(now)
-        return True
+        return self._orders.allow(user_id, now)
 
 
 def _hex_hmac(secret: str, message: bytes) -> str:
