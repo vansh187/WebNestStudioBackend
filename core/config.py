@@ -218,9 +218,11 @@ class Settings(BaseSettings):
     # Node.js playground (scripts and Express apps, logged-in users only): the same Cloud Run
     # image. The URL falls back to the Spring service and the key to the Spring, then the Java
     # one. A Node run takes about a second, so the limits are higher than for Spring Boot.
+    # The timeout covers the worst Express run (the runner's 60 s deadline plus cleanup) and a
+    # cold start of the Spring service, which scales to zero, while staying under its 120 s.
     node_playground_url: str = ""
     node_playground_invoker_key: str = ""
-    node_playground_timeout_seconds: float = 75.0
+    node_playground_timeout_seconds: float = 110.0
     node_playground_daily_cap: int = 3000
     node_playground_per_minute: int = 10
     node_playground_per_day: int = 200
