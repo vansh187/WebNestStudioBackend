@@ -777,6 +777,15 @@ class SpringPlaygroundDailyUsage(Base):
     runs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
 
+class NodePlaygroundDailyUsage(Base):
+    """Site-wide Node.js playground run counter, one row per UTC day (migration 023)."""
+
+    __tablename__ = "node_playground_daily_usage"
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    runs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+
 # =========================================================================== #
 # Webnest CodeLab - Phase 1 learning platform (browser-first execution; the
 # backend never runs visitor code). See CODELAB_LEARNING_API.md.

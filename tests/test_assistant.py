@@ -354,6 +354,28 @@ def test_a_spring_chat_is_accepted() -> None:
     assert "send_api_request" in tool_names(provider.requests[0].tools)
 
 
+def test_node_and_express_projects_explain_the_workspace() -> None:
+    assert tool_names(tools_for("agent", "express")) == tool_names(tools_for("agent", "backend"))
+    # A Node script has no API to call.
+    assert "send_api_request" not in tool_names(tools_for("agent", "node"))
+    assert tools_for("ask", "node") == [] and tools_for("ask", "express") == []
+    for mode in ("ask", "agent"):
+        node = system_prompt(mode, "node")
+        for rule in ("Node.js 24", "main.js", "npm install is not available", "prompt-sync", "daily runs"):
+            assert rule in node, (mode, rule)
+        express = system_prompt(mode, "express")
+        for rule in ("Express 5", "server.js", "npm install is not available", "node:sqlite", "daily runs"):
+            assert rule in express, (mode, rule)
+
+
+@pytest.mark.parametrize(("language", "files", "api"), [("node", ["main.js"], False), ("express", ["server.js", "package.json"], True)])
+def test_node_and_express_chats_are_accepted(language: str, files: list[str], api: bool) -> None:
+    service, provider, _, _ = make_service()
+    body = body_with(context={"language": language, "files": files})
+    assert client_for(service).post("/api/assistant/chat", json=body).status_code == 200
+    assert ("send_api_request" in tool_names(provider.requests[0].tools)) is api
+
+
 def test_ask_prompt_requires_complete_path_labelled_files_for_apply() -> None:
     prompt = system_prompt("ask", "backend")
     assert "```python app/main.py" in prompt
@@ -362,7 +384,7 @@ def test_ask_prompt_requires_complete_path_labelled_files_for_apply() -> None:
     assert "```python app/main.py" not in system_prompt("agent", "backend")
 
 
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring", "node", "express"])
 @pytest.mark.parametrize("mode", ["ask", "agent"])
 def test_system_prompt_states_the_security_rules(mode: Any, language: Any) -> None:
     prompt = system_prompt(mode, language)
@@ -397,7 +419,7 @@ def test_prompts_and_tools_of_the_existing_languages_are_unchanged(mode: Any, la
 
 
 @pytest.mark.parametrize("mode", ["ask", "agent"])
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring", "node", "express"])
 def test_every_prompt_gives_the_webnest_identity_and_names_no_provider(mode: Any, language: Any) -> None:
     prompt = system_prompt(mode, language)
     assert 'say: "I am WebNest AI."' in prompt
@@ -454,7 +476,7 @@ def test_any_question_spaces_take_longer_messages_than_the_coding_agent(mode: st
 # ---- Ask mode takes any question --------------------------------------------------------
 
 
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring", "node", "express"])
 def test_ask_mode_answers_any_question_and_keeps_the_ide_rules(language: Any) -> None:
     prompt = system_prompt("ask", language)
     assert "Answer any question" in prompt
@@ -465,7 +487,7 @@ def test_ask_mode_answers_any_question_and_keeps_the_ide_rules(language: Any) ->
         assert rule in prompt
 
 
-@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring"])
+@pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring", "node", "express"])
 def test_agent_mode_stays_the_coding_assistant(language: Any) -> None:
     prompt = system_prompt("agent", language)
     assert prompt.startswith("You are the coding assistant inside CodeLab")

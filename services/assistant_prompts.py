@@ -48,6 +48,14 @@ Allowed file types: .py, .sql, .html, .css, .js, .json, .md, .txt.""",
 Project: Spring Boot 4.1 on Java 17 with Spring Web MVC, Bean Validation, Spring Data JPA and an in-memory H2 database. No other libraries and no internet.
 Classes go under src/main/java/ in a folder per package; resources are src/main/resources/application.properties, data.sql and schema.sql. pom.xml is for reading only.
 Each run and each API request compiles and starts the app on a server, and counts against the user's daily runs, so make all the changes first, run once, then send only the requests you need.""",
+    "node": """
+Project: Node.js 24 on a server with no internet. The program is one file, main.js: keep all the code there. Input typed for the run arrives on stdin (readline or prompt-sync).
+npm install is not available: use Node's own modules or the preinstalled packages (for example lodash, dayjs, zod, uuid, chalk). A package the run reports as missing can't be added.
+Each run counts against the user's daily runs, so make all the changes first, then run once.""",
+    "express": """
+Project: an Express 5 REST API on Node.js 24 on a server with no internet. The entry point is server.js; routes and helpers go in other .js files. Data lives in memory or in node:sqlite (in memory).
+npm install is not available: use Node's own modules or the preinstalled packages (for example express, cors, zod, joi, uuid, jsonwebtoken, bcryptjs). The app may listen on any port.
+Each run and each API request starts the app on a server, and counts against the user's daily runs, so make all the changes first, run once, then send only the requests you need.""",
 }
 
 # For the prompts that answer any question: _COMMON's coding persona and short-answer limits don't fit them.
@@ -106,7 +114,7 @@ def _tool(name: str, description: str, **parameters: dict[str, str]) -> dict[str
 
 
 _STRING: dict[str, str] = {"type": "string"}
-_API_LANGUAGES: frozenset[str] = frozenset({"backend", "spring"})
+_API_LANGUAGES: frozenset[str] = frozenset({"backend", "spring", "express"})
 
 _API_REQUEST_TOOL = _tool(
     "send_api_request",
