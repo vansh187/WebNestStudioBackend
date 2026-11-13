@@ -25,6 +25,7 @@ from api.github_router import router as github_router
 from api.home_router import router as home_router
 from api.java_playground_router import router as java_playground_router
 from api.spring_playground_router import router as spring_playground_router
+from api.node_playground_router import router as node_playground_router
 from api.leads_router import router as leads_router
 from api.learning_router import admin_router as learning_admin_router
 from api.learning_router import progress_router as learning_progress_router
@@ -219,6 +220,7 @@ class WebNestStudioApp:
             assistant_report_admin_router,
             java_playground_router,
             spring_playground_router,
+            node_playground_router,
             codelab_router,
             codelab_admin_router,
             learning_router,

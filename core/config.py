@@ -215,6 +215,16 @@ class Settings(BaseSettings):
     spring_playground_per_minute: int = 4
     spring_playground_per_day: int = 60
 
+    # Node.js playground (scripts and Express apps, logged-in users only): the same Cloud Run
+    # image. The URL falls back to the Spring service and the key to the Spring, then the Java
+    # one. A Node run takes about a second, so the limits are higher than for Spring Boot.
+    node_playground_url: str = ""
+    node_playground_invoker_key: str = ""
+    node_playground_timeout_seconds: float = 75.0
+    node_playground_daily_cap: int = 3000
+    node_playground_per_minute: int = 10
+    node_playground_per_day: int = 200
+
     # In-app project chat (user-to-user messaging) attachment storage. Files
     # live in a private Supabase Storage bucket; the backend uses the
     # service-role key to mint short-lived signed upload/download URLs so the
