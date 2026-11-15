@@ -1192,7 +1192,12 @@ def test_me_limits_links_and_versions_come_from_settings() -> None:
     assert (me.limits.max_input_tokens, me.limits.max_context_chars, me.limits.chars_per_token) == (20_000, 50_000, 4)
     assert (me.limits.max_message_chars, me.limits.max_body_bytes, me.limits.max_attachments, me.limits.supports_images) == (4000, 524288, 0, False)
     assert me.links.upgrade_url == "https://www.webneststudio.co.in/prime?source=vscode"
-    assert me.links.signup_url == "https://www.webneststudio.co.in/signup?next=%2Fprime&source=vscode"
+    assert me.links.signup_url == "https://www.webneststudio.co.in/login?next=%2Fprime&source=vscode"
+    # The website's real pages: /signup, /account, /terms and /privacy don't exist there.
+    assert me.links.manage_url == "https://www.webneststudio.co.in/portal?source=vscode"
+    assert me.links.terms_url == "https://www.webneststudio.co.in/terms-and-conditions"
+    assert me.links.privacy_url == "https://www.webneststudio.co.in/privacy-policy"
+    assert me.links.support_url == "https://www.webneststudio.co.in/contact"
     assert all(url.startswith("https://") for url in me.links.model_dump().values())
     assert (me.extension.min_version, me.extension.latest_version) == ("0.2.0", "0.3.1")
     assert me.service.message == "Back at 6 pm" and me.service.provider_name == "WebNest AI" and me.service.enabled
