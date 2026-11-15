@@ -408,10 +408,10 @@ class ExtensionChatService:
         base = self._settings.frontend_base_url.strip().rstrip("/")
         return MeLinks(
             upgrade_url=f"{base}/prime?source=vscode",
-            signup_url=f"{base}/signup?next=%2Fprime&source=vscode",
-            manage_url=f"{base}/account?source=vscode",
-            terms_url=f"{base}/terms",
-            privacy_url=f"{base}/privacy",
+            signup_url=f"{base}/login?next=%2Fprime&source=vscode",
+            manage_url=f"{base}/portal?source=vscode",
+            terms_url=f"{base}/terms-and-conditions",
+            privacy_url=f"{base}/privacy-policy",
             support_url=f"{base}/contact",
         )
 
