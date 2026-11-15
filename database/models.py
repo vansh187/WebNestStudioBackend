@@ -626,7 +626,10 @@ class AssistantCallLog(Base):
     before deploying to a new database, because create_all would build the table without it."""
 
     __tablename__ = "assistant_call_log"
-    __table_args__ = (Index("ix_assistant_call_log_user_created", "user_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_assistant_call_log_user_created", "user_id", "created_at"),
+        Index("ix_assistant_call_log_surface_created", "surface", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
@@ -651,6 +654,77 @@ class AssistantCallLog(Base):
     first_output_ms: Mapped[int | None] = mapped_column(Integer)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    # Which app made the call (migration 025). Only the database default, no Python one: a
+    # CodeLab call leaves it out of the insert, so it keeps logging on a database where 025
+    # hasn't been applied yet. VS Code calls write 'vscode'.
+    surface: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'codelab'"))
+
+
+class ExtensionSession(Base):
+    """One connected VS Code (one login); `id` is the session_id the extension sees. Users see
+    and disconnect these on the website. Sessions are credentials, so they go with the account
+    (CASCADE). Row level security comes from migration 024, not from this model: apply it
+    before deploying, because create_all would build the table without it."""
+
+    __tablename__ = "extension_sessions"
+    __table_args__ = (
+        Index("ix_extension_sessions_user", "user_id", postgresql_where=text("revoked_at IS NULL")),
+        CheckConstraint(
+            "revoked_reason IS NULL OR revoked_reason IN ('logout', 'user', 'reuse', 'password_reset', 'admin')",
+            name="ck_extension_session_revoked_reason",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    device_name: Mapped[str | None] = mapped_column(Text)
+    app_name: Mapped[str | None] = mapped_column(Text)
+    ext_version: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # Absolute: refreshing never moves it.
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class ExtensionAuthCode(Base):
+    """A one-time login code handing a website login to VS Code: single use, 5 minutes, bound
+    to a PKCE challenge and a redirect URI. Only the code's SHA-256 hash is stored. Row level
+    security comes from migration 024."""
+
+    __tablename__ = "extension_auth_codes"
+    __table_args__ = (Index("ix_extension_auth_codes_expires", "expires_at"),)
+
+    code_hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    code_challenge: Mapped[str] = mapped_column(Text, nullable=False)
+    redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    device_name: Mapped[str | None] = mapped_column(Text)
+    app_name: Mapped[str | None] = mapped_column(Text)
+    ext_version: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ExtensionRefreshToken(Base):
+    """A rotating VS Code refresh token. A refresh marks the old row used and adds a new one;
+    only the token's SHA-256 hash is stored. Row level security comes from migration 024."""
+
+    __tablename__ = "extension_refresh_tokens"
+    __table_args__ = (
+        Index("ix_extension_refresh_tokens_session", "session_id"),
+        Index("ix_extension_refresh_tokens_expires", "expires_at"),
+    )
+
+    token_hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("extension_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class AssistantPayment(Base):

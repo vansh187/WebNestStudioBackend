@@ -34,7 +34,19 @@ TEST_DB_URL = os.environ.get("EXAMS_TEST_DATABASE_URL", "")
 DAY = date(2026, 10, 31)
 TABLES = [User.__table__, AssistantUsage.__table__, AssistantCallLog.__table__]
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
-CALL_LOG_MIGRATIONS = [MIGRATIONS / "015_assistant_call_log.sql", MIGRATIONS / "016_assistant_call_log_turn_chars.sql"]
+CALL_LOG_MIGRATIONS = [
+    MIGRATIONS / "015_assistant_call_log.sql",
+    MIGRATIONS / "016_assistant_call_log_turn_chars.sql",
+    MIGRATIONS / "025_assistant_call_log_surface.sql",
+]
+
+
+def migration_statements(path: Path) -> list[str]:
+    """A migration as it must be run: CREATE INDEX CONCURRENTLY on its own, outside the
+    transaction, as 025 says."""
+    sql = path.read_text(encoding="utf-8")
+    start = sql.find("CREATE INDEX CONCURRENTLY")
+    return [sql] if start < 0 else [sql[:start], sql[start:]]
 NO_TOKENS = TokenCounts()
 
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="EXAMS_TEST_DATABASE_URL is not set")
@@ -457,7 +469,8 @@ def test_the_migration_builds_the_same_table_as_the_model_and_can_rerun() -> Non
             autocommit = await connection.execution_options(isolation_level="AUTOCOMMIT")
             raw = await autocommit.get_raw_connection()
             for migration in CALL_LOG_MIGRATIONS:
-                await raw.driver_connection.execute(migration.read_text(encoding="utf-8"))
+                for statement in migration_statements(migration):
+                    await raw.driver_connection.execute(statement)
 
     async def body(db: Db) -> None:
         from_model = (await columns(db), await indexes(db))

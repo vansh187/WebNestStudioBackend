@@ -172,6 +172,24 @@ class Settings(BaseSettings):
     assistant_google_play_product_id: str = "webnest_prime_30d"
     assistant_google_play_service_account_json: str = ""
 
+    # WebNest AI for VS Code (/api/extension/*). Off by default, so it can be deployed dark:
+    # while off, every extension route answers 503. Chat goes through the assistant above, so
+    # the Prime pass and its daily and weekly limits are shared with the website and Android.
+    extension_enabled: bool = False
+    extension_min_version: str = "0.1.0"
+    extension_latest_version: str = "0.1.0"
+    # Shown in VS Code's maintenance screen; empty for none.
+    extension_service_message: str = ""
+    extension_access_token_minutes: int = 15
+    # One refresh token's life; it rotates on every use.
+    extension_refresh_token_days: int = 30
+    # A login's absolute life: refreshing never extends it.
+    extension_session_days: int = 90
+    # VS Code's own input budget; CodeLab keeps assistant_max_input_tokens.
+    extension_max_input_tokens: int = 12000
+    # The most file text the extension sends, and what the optimizer's first tier keeps.
+    extension_max_context_chars: int = 40000
+
     # Coding platform compiler proxy. Executed code runs on JDoodle's hosted
     # sandbox (https://www.jdoodle.com/compiler-api), never inside this API process.
     jdoodle_client_id: str = ""

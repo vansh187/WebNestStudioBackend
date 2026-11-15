@@ -16,6 +16,7 @@ from typing import Any
 from core.config import Settings
 from core.exceptions import GenerationUnavailableError, PayloadTooLargeError, RateLimitedError
 from database.assistant_usage_persistence import (
+    DEFAULT_SURFACE,
     AssistantUsageStore,
     CallLogEntry,
     DailyLimits,
@@ -23,7 +24,7 @@ from database.assistant_usage_persistence import (
     TokenCounts,
     UsageKey,
 )
-from schemas.assistant_schemas import AccessResponse, AssistantMode, AssistantUsageResponse, ChatRequest
+from schemas.assistant_schemas import VSCODE_LANGUAGE, AccessResponse, AssistantMode, AssistantUsageResponse, ChatRequest
 from services.assistant_llm import (
     AssistantProvider,
     FinishedEvent,
@@ -42,7 +43,7 @@ from services.assistant_llm import (
     provider_has_key,
 )
 from services.assistant_payment_service import AssistantPaymentService
-from services.assistant_prompt_optimizer import CHARS_PER_TOKEN, optimize_conversation
+from services.assistant_prompt_optimizer import CHARS_PER_TOKEN, optimize_conversation, vscode_tiers
 from services.assistant_prompts import prefix_chars, system_prompt, tool_names, tools_for
 
 logger = logging.getLogger("webnest.assistant")
@@ -64,6 +65,7 @@ _NO_DAILY_LIMIT = 10**15
 _NO_CALLS_LIMIT = 0
 # All that clients ever see, whichever provider answered. The real one is only in server logs and the call log.
 _PUBLIC_PROVIDER_NAME = "WebNest AI"
+VSCODE_SURFACE = "vscode"
 # Above 100,000 tokens Claude charges five times as much for the whole request. The margin is
 # because the size here is an estimate, and Haiku's tokenizer counts text about 30% higher.
 MAX_PROMPT_TOKENS = 90_000
@@ -86,9 +88,13 @@ class _ProviderRefused(Exception):
 
 
 class AssistantRateLimitedError(RateLimitedError):
-    def __init__(self, message: str, retry_after: int | None = None) -> None:
+    """`code` says which limit, for clients that switch on it (VS Code); /api/assistant/chat
+    still answers with the message alone."""
+
+    def __init__(self, message: str, retry_after: int | None = None, code: str = "rate_limited") -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.code = code
 
 
 class ActiveStreamRegistry:
@@ -146,6 +152,11 @@ def _seconds_until_next_utc_day() -> int:
     return max(int((midnight - now).total_seconds()) + 1, 1)
 
 
+def surface_of(payload: ChatRequest) -> str:
+    """Which app a request came from, for the call log."""
+    return VSCODE_SURFACE if payload.context.language == VSCODE_LANGUAGE else DEFAULT_SURFACE
+
+
 def _sse(event: str, data: dict[str, Any]) -> bytes:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8", "replace")
@@ -182,7 +193,9 @@ class AssistantChatStream:
         ping_interval: float,
         max_seconds: float,
         charge: Callable[[int], Awaitable[AccessResponse | None]] | None = None,
+        surface: str = DEFAULT_SURFACE,
     ) -> None:
+        self._surface = surface
         self._key = key
         self._reserved = reserved
         self._store = store
@@ -311,13 +324,15 @@ class AssistantChatStream:
                     sizes=self._sizes,
                     first_output_ms=self._first_output_ms,
                     duration_ms=duration_ms,
+                    surface=self._surface,
                 ),
             ),
         )
         logger.info(
-            "Assistant call: user=%s model=%s outcome=%s input_tokens=%d output_tokens=%d exact_usage=%s "
+            "Assistant call: user=%s surface=%s model=%s outcome=%s input_tokens=%d output_tokens=%d exact_usage=%s "
             "first_output_ms=%s duration_ms=%d request_chars=%d sent_chars=%d",
             self._key.user_id,
+            self._surface,
             self._key.model,
             self._outcome,
             actual.input_tokens,
@@ -471,9 +486,13 @@ class AssistantService:
         tools = tools_for(payload.mode, language)
         prefix = prefix_chars(system, tools)
         prefix_tokens = prefix // CHARS_PER_TOKEN
-        optimized = optimize_conversation(
-            payload.messages, payload.context, payload.mode, self._settings.assistant_max_input_tokens, prefix_tokens
-        )
+        # VS Code has its own budget and tiers, for bigger files; CodeLab's are unchanged.
+        if language == VSCODE_LANGUAGE:
+            budget = self._settings.extension_max_input_tokens
+            tiers = vscode_tiers(self._settings.extension_max_context_chars)
+        else:
+            budget, tiers = self._settings.assistant_max_input_tokens, None
+        optimized = optimize_conversation(payload.messages, payload.context, payload.mode, budget, prefix_tokens, tiers)
         request = ProviderRequest(
             system=system,
             messages=optimized.messages,
@@ -498,7 +517,7 @@ class AssistantService:
             raise GenerationUnavailableError(_UNAVAILABLE_MESSAGE)
         # Checked first because it needs no database, so a double-send costs nothing.
         if not self._registry.acquire(user_id):
-            raise AssistantRateLimitedError("Another reply is still streaming. Wait for it to finish.")
+            raise AssistantRateLimitedError("Another reply is still streaming. Wait for it to finish.", code="stream_in_progress")
         try:
             return await self._open_reserved(user_id, payload, provider)
         except BaseException:
@@ -582,16 +601,19 @@ class AssistantService:
             raise AssistantRateLimitedError(
                 f"You have used all {self._settings.assistant_user_daily_calls} AI assistant calls for today.",
                 retry_after=_seconds_until_next_utc_day(),
+                code="rate_limited",
             )
         if reservation.denied == "user_tokens":
             raise AssistantRateLimitedError(
                 "You have used your AI assistant allowance for today.",
                 retry_after=_seconds_until_next_utc_day(),
+                code="daily_allowance_used",
             )
         if reservation.denied == "user_weekly_tokens":
             raise AssistantRateLimitedError(
                 "You have used your AI assistant allowance for this week. It frees up day by day.",
                 retry_after=_seconds_until_next_utc_day(),
+                code="weekly_allowance_used",
             )
 
         queue: asyncio.Queue[ProviderEvent | ProviderError | None] = asyncio.Queue(maxsize=_QUEUE_SIZE)
@@ -601,13 +623,13 @@ class AssistantService:
         except BaseException:
             pump.cancel()
             # This task is being cancelled, so the writes can't be awaited here.
-            entry = self._unopened_entry(key, payload.mode, built.sizes, "cancelled_before_reply", started_at)
+            entry = self._unopened_entry(key, payload, built.sizes, "cancelled_before_reply", started_at)
             self._registry.keep(asyncio.create_task(self._refund_and_log(key, reserved, entry)))
             raise
         if not isinstance(first, StreamOpened):
             # Normally already finished; this covers a provider that broke its contract.
             pump.cancel()
-            entry = self._unopened_entry(key, payload.mode, built.sizes, _refusal_outcome(first), started_at)
+            entry = self._unopened_entry(key, payload, built.sizes, _refusal_outcome(first), started_at)
             writes = asyncio.create_task(self._refund_and_log(key, reserved, entry))
             self._registry.keep(writes)
             # Normally done at once. With a stuck database the user still gets their error
@@ -631,10 +653,11 @@ class AssistantService:
             ping_interval=self._ping_interval,
             max_seconds=self._max_stream_seconds,
             charge=partial(paywall.settle_pass, user_id, pass_reserved) if paywall is not None else None,
+            surface=surface_of(payload),
         )
 
     def _unopened_entry(
-        self, key: UsageKey, mode: AssistantMode, sizes: PromptSizes, outcome: str, started_at: float
+        self, key: UsageKey, payload: ChatRequest, sizes: PromptSizes, outcome: str, started_at: float
     ) -> CallLogEntry | None:
         """The audit row for a call that never opened a reply, or None once this user has
         had one recently. Such a call spent no tracked tokens."""
@@ -642,7 +665,7 @@ class AssistantService:
             return None
         return CallLogEntry(
             key=key,
-            mode=mode,
+            mode=payload.mode,
             outcome=outcome,
             tokens=TokenCounts(),
             cached_tokens=0,
@@ -650,6 +673,7 @@ class AssistantService:
             sizes=sizes,
             first_output_ms=None,
             duration_ms=int((time.perf_counter() - started_at) * 1000),
+            surface=surface_of(payload),
         )
 
     async def _refund_and_log(self, key: UsageKey, reserved: TokenCounts, entry: CallLogEntry | None) -> None:
@@ -667,7 +691,9 @@ class AssistantService:
 
     def _pre_stream_error(self, failure: ProviderEvent | ProviderError | None) -> Exception:
         if isinstance(failure, ProviderRateLimitedError):
-            return AssistantRateLimitedError("The AI service is busy. Please try again in a moment.", failure.retry_after)
+            return AssistantRateLimitedError(
+                "The AI service is busy. Please try again in a moment.", failure.retry_after, code="provider_busy"
+            )
         if isinstance(failure, ProviderRequestTooLargeError):
             return PayloadTooLargeError("This conversation is too large. Please start a new chat.")
         return GenerationUnavailableError(_UNAVAILABLE_MESSAGE)

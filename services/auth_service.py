@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import Settings
 from core.exceptions import ConflictError, NotFoundError, RateLimitedError, UnauthorizedError, ValidationError
 from core.security import JWTHandler, OtpGenerator, PasswordHasher
+from database.extension_session_persistence import ExtensionSessionPersistence
 from database.models import User
 from database.otp_persistence import OtpPersistence
 from database.refresh_token_persistence import RefreshTokenPersistence
@@ -46,6 +47,8 @@ class AuthService:
         self._users = UserPersistence(session)
         self._otps = OtpPersistence(session)
         self._refresh_tokens = RefreshTokenPersistence(session)
+        # VS Code's sessions: ended in the same commit as the website's own tokens.
+        self._extension_sessions = ExtensionSessionPersistence(session)
         self._settings = settings
         self._password_hasher = password_hasher
         self._jwt_handler = jwt_handler
@@ -193,7 +196,8 @@ class AuthService:
             raise ValidationError(INVALID_OTP_MESSAGE)
         await self._users.update_password_hash(user, password_hash, commit=False)
         # A stolen refresh token shouldn't survive its owner resetting their
-        # password because they suspected exactly that.
+        # password because they suspected exactly that. Nor a VS Code login.
+        await self._extension_sessions.revoke_all_for_user(user_id, datetime.now(timezone.utc), "password_reset")
         await self._refresh_tokens.revoke_all_for_user(user_id)
 
     async def login(
@@ -269,6 +273,7 @@ class AuthService:
             await self._refresh_tokens.revoke(stored)
 
     async def logout_all_devices(self, user_id) -> None:
+        await self._extension_sessions.revoke_all_for_user(user_id, datetime.now(timezone.utc), "user")
         await self._refresh_tokens.revoke_all_for_user(user_id)
 
     async def delete_account(self, user: User) -> None:
@@ -285,6 +290,7 @@ class AuthService:
         if user is None:
             raise NotFoundError("User not found")
         if not is_active:
+            await self._extension_sessions.revoke_all_for_user(user.id, datetime.now(timezone.utc), "admin")
             await self._refresh_tokens.revoke_all_for_user(user.id)
         return await self._users.set_active(user, is_active)
 
@@ -294,6 +300,10 @@ class AuthService:
         except ValueError as exc:
             raise UnauthorizedError("Invalid or expired access token") from exc
         if payload.get("type") != "access":
+            raise UnauthorizedError("Invalid token type")
+        # Least privilege: a scoped token (VS Code's "extension") works only on the routes that
+        # ask for its scope, never on admin, payments, account deletion or any other route.
+        if payload.get("scope") is not None:
             raise UnauthorizedError("Invalid token type")
 
         try:

@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from jose import JWTError, jwt
+from jose import ExpiredSignatureError, JWTError, jwt
 from passlib.context import CryptContext
 from passlib.exc import PasslibSecurityError
 
@@ -15,6 +15,9 @@ from core.config import Settings
 logger = logging.getLogger("webnest.security")
 
 BCRYPT_MAX_PASSWORD_BYTES = 72
+# The scope claim of a VS Code token. Website routes refuse any token with a scope, so such a
+# token works only where a route asks for that scope explicitly (/api/extension/*).
+EXTENSION_SCOPE = "extension"
 
 
 class PasswordHasher:
@@ -87,6 +90,39 @@ class JWTHandler:
         except JWTError as exc:
             logger.error("Failed to create refresh token", exc_info=True)
             raise ValueError("Could not create refresh token") from exc
+
+    def create_extension_access_token(self, subject: str, role: str, session_id: str, minutes: int) -> str:
+        """A VS Code access token: the usual access claims plus `scope` and `sid`, the session
+        it belongs to, so revoking the session ends it before it expires."""
+        if not subject or not session_id:
+            raise ValueError("Cannot create an extension token without a subject and a session")
+        try:
+            expire = datetime.now(timezone.utc) + timedelta(minutes=max(minutes, 1))
+            payload = {
+                "sub": subject,
+                "role": role,
+                "type": "access",
+                "scope": EXTENSION_SCOPE,
+                "sid": session_id,
+                "exp": expire,
+            }
+            return jwt.encode(payload, self._settings.jwt_secret_key, algorithm=self._settings.jwt_algorithm)
+        except JWTError as exc:
+            logger.error("Failed to create extension access token", exc_info=True)
+            raise ValueError("Could not create access token") from exc
+
+    def decode_token_or_reason(self, token: str) -> tuple[dict[str, Any] | None, str | None]:
+        """(claims, None) for a valid token, else (None, "expired" or "invalid"), so a caller
+        can tell a token worth refreshing from one to throw away."""
+        if not token or not isinstance(token, str):
+            return None, "invalid"
+        try:
+            claims = jwt.decode(token, self._settings.jwt_secret_key, algorithms=[self._settings.jwt_algorithm])
+        except ExpiredSignatureError:
+            return None, "expired"
+        except (JWTError, ValueError, TypeError):
+            return None, "invalid"
+        return (claims, None) if isinstance(claims, dict) else (None, "invalid")
 
     def decode_token(self, token: str) -> dict[str, Any]:
         if not token or not isinstance(token, str):

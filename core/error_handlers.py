@@ -4,15 +4,18 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core.exceptions import (
     BadRequestError,
     ConflictError,
     ContentRejectedError,
     DatabaseError,
+    ExtensionError,
     ExternalServiceError,
     ForbiddenError,
     GenerationUnavailableError,
@@ -27,10 +30,23 @@ from core.exceptions import (
     ValidationError,
 )
 
+from core.extension_http import (
+    code_for_status,
+    extension_error_response,
+    is_extension_path,
+    retry_after_from,
+    validation_errors,
+)
 from exams.errors import ExamDomainError
 from exams.routing import ExamContractRoute
 
 logger = logging.getLogger("webnest.errors")
+
+# Shown for a database or unexpected failure on the VS Code extension's routes. Never the
+# exception's own text, which could hold a query or a value.
+_EXTENSION_DATABASE_MESSAGE = "WebNest AI can't reach its records right now. Please try again in a moment."
+_EXTENSION_DATABASE_RETRY_SECONDS = 5
+_EXTENSION_INTERNAL_MESSAGE = "An unexpected error occurred. Please try again later."
 
 def _is_exam_contract_route(request: Request) -> bool:
     """Routes declared with ExamContractRoute (exams/routing.py) use the
@@ -68,12 +84,28 @@ def register_error_handlers(app: FastAPI) -> None:
     for exception_type, status_code in _STATUS_BY_EXCEPTION:
 
         def _make_domain_handler(code: int):
-            async def _handler(request: Request, exc: Exception) -> JSONResponse:
+            async def _handler(request: Request, exc: Exception) -> Response:
+                if is_extension_path(request.url.path):
+                    return _extension_domain_response(request, code, exc)
                 return JSONResponse(status_code=code, content={"detail": str(exc)})
 
             return _handler
 
         app.add_exception_handler(exception_type, _make_domain_handler(status_code))
+
+    @app.exception_handler(ExtensionError)
+    async def _extension_exception_handler(request: Request, exc: ExtensionError) -> Response:
+        return extension_error_response(request, exc.status_code, exc.code, exc.message, exc.retry_after, exc.errors)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> Response:
+        """Unchanged everywhere else; under /api/extension/ it gets the coded shape, which also
+        covers FastAPI's own 404 and 405 there."""
+        if not is_extension_path(request.url.path):
+            return await http_exception_handler(request, exc)
+        detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+        retry_after = retry_after_from(exc.headers.get("Retry-After")) if exc.headers else None
+        return extension_error_response(request, exc.status_code, code_for_status(exc.status_code), detail, retry_after)
 
     @app.exception_handler(GitHubError)
     async def _github_exception_handler(request: Request, exc: GitHubError) -> JSONResponse:
@@ -101,6 +133,10 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> Response:
+        if is_extension_path(request.url.path):
+            return extension_error_response(
+                request, 422, "validation_error", "Request validation failed", errors=validation_errors(list(exc.errors()))
+            )
         if _is_exam_contract_route(request):
             # Never echo the input back (answers, names); detail is the first
             # problem as a plain string.
@@ -150,17 +186,41 @@ def register_error_handlers(app: FastAPI) -> None:
             )
 
     @app.exception_handler(SQLAlchemyError)
-    async def _database_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    async def _database_exception_handler(request: Request, exc: SQLAlchemyError) -> Response:
         logger.error("Unhandled database error on %s %s", request.method, request.url.path, exc_info=True)
+        if is_extension_path(request.url.path):
+            return extension_error_response(
+                request, 503, "service_unavailable", _EXTENSION_DATABASE_MESSAGE, _EXTENSION_DATABASE_RETRY_SECONDS
+            )
         return JSONResponse(
             status_code=503,
             content={"detail": "A database error occurred. Please try again in a moment."},
         )
 
     @app.exception_handler(Exception)
-    async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    async def _unhandled_exception_handler(request: Request, exc: Exception) -> Response:
         logger.error("Unhandled exception on %s %s", request.method, request.url.path, exc_info=True)
+        if is_extension_path(request.url.path):
+            return extension_error_response(request, 500, "internal_error", _EXTENSION_INTERNAL_MESSAGE)
         return JSONResponse(
             status_code=500,
             content={"detail": "An unexpected error occurred. Please try again later."},
         )
+
+
+def _extension_domain_response(request: Request, status_code: int, exc: Exception) -> Response:
+    """A service-layer error on an extension route: its status, the code for that status,
+    and any wait it carries. A database failure shows a fixed message, never its own text."""
+    if status_code == 503 and isinstance(exc, DatabaseError):
+        return extension_error_response(
+            request, 503, "service_unavailable", _EXTENSION_DATABASE_MESSAGE, _EXTENSION_DATABASE_RETRY_SECONDS
+        )
+    code = getattr(exc, "code", None)
+    retry_after = retry_after_from(getattr(exc, "retry_after", None))
+    return extension_error_response(
+        request,
+        status_code,
+        code if isinstance(code, str) and code else code_for_status(status_code),
+        str(exc) or "Request failed",
+        retry_after,
+    )

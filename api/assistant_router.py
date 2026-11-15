@@ -1,4 +1,6 @@
 import uuid
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -11,20 +13,30 @@ from starlette.types import Receive, Scope, Send
 from core.dependencies import get_assistant_service, get_current_user, get_db_session
 from core.request_limits import read_limited_body
 from database.models import User
-from schemas.assistant_schemas import MAX_BODY_BYTES, AssistantUsageResponse, ChatRequest
+from schemas.assistant_schemas import MAX_BODY_BYTES, VSCODE_LANGUAGE, AssistantUsageResponse, ChatRequest
 from services.assistant_service import AssistantChatStream, AssistantRateLimitedError, AssistantService
 
 router = APIRouter(prefix="/api/assistant", tags=["ai-assistant"])
 
 
+async def _first_then(first: bytes, events: AsyncIterator[bytes]) -> AsyncGenerator[bytes, None]:
+    """`first`, then every event unchanged. Closing this closes the events too."""
+    yield first
+    async with aclosing(events) as remaining:  # type: ignore[type-var]
+        async for chunk in remaining:
+            yield chunk
+
+
 class AssistantStreamingResponse(StreamingResponse):
     """Closes the chat stream however the response ends: finished, failed, the client
     gone, even before the first byte when the generator never starts, or a client that
-    stays connected but stops reading, which the time limit ends."""
+    stays connected but stops reading, which the time limit ends.
 
-    def __init__(self, chat: AssistantChatStream) -> None:
+    `first` is sent before the chat's own events (VS Code's `start` event)."""
+
+    def __init__(self, chat: AssistantChatStream, first: bytes | None = None) -> None:
         super().__init__(
-            chat.events(),
+            chat.events() if first is None else _first_then(first, chat.events()),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -57,11 +69,17 @@ async def get_assistant_user_id(
 
 def _parse_chat_request(body: bytes) -> ChatRequest:
     try:
-        return ChatRequest.model_validate_json(body)
+        payload = ChatRequest.model_validate_json(body)
     except PydanticValidationError as exc:
         # include_input=False: the input is the user's code, which must not be echoed.
         errors = exc.errors(include_url=False, include_input=False)
         raise RequestValidationError([{**error, "loc": ("body", *error["loc"])} for error in errors]) from exc
+    if payload.context.language == VSCODE_LANGUAGE:
+        # Internal to the VS Code extension's routes, which build it themselves.
+        raise RequestValidationError(
+            [{"type": "literal_error", "loc": ("body", "context", "language"), "msg": "This language is not available here"}]
+        )
+    return payload
 
 
 @router.post(
