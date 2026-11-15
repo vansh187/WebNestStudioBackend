@@ -20,6 +20,7 @@ from api.codelab_router import router as codelab_router
 from api.coding_router import router as coding_router
 from api.content_router import router as content_router
 from api.devices_router import router as devices_router
+from api.extension_router import router as extension_router
 from api.generation_router import router as generation_router
 from api.github_router import router as github_router
 from api.home_router import router as home_router
@@ -47,6 +48,7 @@ from codelab_relay.router import register_relay_error_handlers
 from codelab_relay.router import router as relay_router
 from core.dependencies import container
 from core.error_handlers import register_error_handlers
+from core.extension_http import ExtensionRequestIdMiddleware, extension_cors_policies
 from core.logging_config import LoggingConfigurator
 from core.path_scoped_cors import PathScopedCORSMiddleware
 from core.request_limits import GitHubBodyLimitMiddleware
@@ -56,7 +58,7 @@ from exams.router_admin import router as exam_admin_router
 from exams.router_learner import router as exam_learner_router
 from exams.router_public import router as exam_public_router
 from exams.schema_upgrade import SchemaUpgradeError, upgrade_schema
-from services.assistant_jobs import register_assistant_jobs
+from services.assistant_jobs import register_assistant_jobs, register_extension_jobs
 from services.assistant_payment_jobs import register_payment_jobs
 from services.blog_scheduler import register_blog_jobs
 from services.codelab_scheduler import register_codelab_jobs
@@ -124,6 +126,11 @@ async def lifespan(app: FastAPI):
         logger.critical("Could not register the assistant call log cleanup job", exc_info=True)
 
     try:
+        register_extension_jobs(container.scheduler, container.extension_auth)
+    except Exception:
+        logger.critical("Could not register the VS Code session cleanup job", exc_info=True)
+
+    try:
         register_payment_jobs(
             container.scheduler,
             container.assistant_payments,
@@ -183,12 +190,17 @@ class WebNestStudioApp:
     def _configure_middleware(self) -> None:
         # Added before CORS so CORS wraps it and its 413 still reaches the browser.
         self.instance.add_middleware(GitHubBodyLimitMiddleware)
+        # X-Request-Id on every /api/extension/* response; inside CORS, like the rest.
+        self.instance.add_middleware(ExtensionRequestIdMiddleware)
         # /api/codelab/relay/* and /api/codelab/db/* get their own strict
         # policies (explicit origins and headers, no credentials, their error
-        # headers exposed); every other route keeps this one.
+        # headers exposed). Under /api/extension/ only the two routes the website
+        # calls allow its origin; the rest send no CORS headers. Every other
+        # route keeps the default.
+        extension_cors = extension_cors_policies(container.settings.frontend_base_url, container.settings.cors_origin_list)
         self.instance.add_middleware(
             PathScopedCORSMiddleware,
-            scoped=((RELAY_PATH, relay_cors_options()), (DB_PATH, db_cors_options())),
+            scoped=((RELAY_PATH, relay_cors_options()), (DB_PATH, db_cors_options()), *extension_cors),
             default_options=dict(
                 allow_origins=container.settings.cors_origin_list,
                 allow_credentials=True,
@@ -218,6 +230,7 @@ class WebNestStudioApp:
             razorpay_webhook_router,
             assistant_report_router,
             assistant_report_admin_router,
+            extension_router,
             java_playground_router,
             spring_playground_router,
             node_playground_router,

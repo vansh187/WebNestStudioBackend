@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from schemas.assistant_schemas import GENERAL_LANGUAGE, AssistantMode, ChatContext, ChatMessage, ChatToolCall
+from schemas.assistant_schemas import GENERAL_LANGUAGE, VSCODE_LANGUAGE, AssistantMode, ChatContext, ChatMessage, ChatToolCall
 
 ProviderMessage = dict[str, Any]
 
@@ -69,7 +69,7 @@ _FLAT_OUTPUT_NOTE = "Part of this earlier output is no longer available"
 
 
 @dataclass(frozen=True)
-class _Limits:
+class TierLimits:
     """How much of each kind of text one attempt keeps, in characters."""
 
     older_turn_tool: int
@@ -81,12 +81,36 @@ class _Limits:
 
 # Tried in order until the conversation fits. Later attempts give up history
 # first, then the open file, and only last the newest tool result.
-_TIERS: tuple[_Limits, ...] = (
-    _Limits(older_turn_tool=400, current_turn_tool=4000, latest_tool=16_000, open_file=12_000, last_error=2000),
-    _Limits(older_turn_tool=200, current_turn_tool=1000, latest_tool=16_000, open_file=6000, last_error=1500),
-    _Limits(older_turn_tool=200, current_turn_tool=400, latest_tool=8000, open_file=0, last_error=1000),
-    _Limits(older_turn_tool=200, current_turn_tool=200, latest_tool=4000, open_file=0, last_error=500),
+_TIERS: tuple[TierLimits, ...] = (
+    TierLimits(older_turn_tool=400, current_turn_tool=4000, latest_tool=16_000, open_file=12_000, last_error=2000),
+    TierLimits(older_turn_tool=200, current_turn_tool=1000, latest_tool=16_000, open_file=6000, last_error=1500),
+    TierLimits(older_turn_tool=200, current_turn_tool=400, latest_tool=8000, open_file=0, last_error=1000),
+    TierLimits(older_turn_tool=200, current_turn_tool=200, latest_tool=4000, open_file=0, last_error=500),
 )
+# VS Code's file is the point of most of its questions, so its tiers give up history first and
+# keep the file longest, as a share of the most file text the extension sends. With the default
+# 40,000 characters: 40,000, 24,000, 12,000 and 6,000.
+_VSCODE_FILE_SHARES: tuple[float, ...] = (1.0, 0.6, 0.3, 0.15)
+_VSCODE_ERRORS: tuple[int, ...] = (4000, 3000, 2000, 1500)
+_VSCODE_CURRENT_TOOL: tuple[int, ...] = (4000, 2000, 1000, 500)
+_VSCODE_OLDER_TOOL: tuple[int, ...] = (400, 200, 0, 0)
+_VSCODE_CUT_NOTE = "The rest of this file was not shared to save space. If you need it, ask the user to select those lines"
+
+
+def vscode_tiers(max_context_chars: int) -> tuple[TierLimits, ...]:
+    """The tiers for language "vscode". The first keeps all the file text the extension may
+    send (`max_context_chars`, also sent to it in /me), so nothing is cut silently."""
+    file_chars = max(int(max_context_chars), 1000)
+    return tuple(
+        TierLimits(
+            older_turn_tool=older,
+            current_turn_tool=current,
+            latest_tool=max(current, 4000),
+            open_file=int(file_chars * share),
+            last_error=error,
+        )
+        for share, error, current, older in zip(_VSCODE_FILE_SHARES, _VSCODE_ERRORS, _VSCODE_CURRENT_TOOL, _VSCODE_OLDER_TOOL)
+    )
 
 
 @dataclass
@@ -227,13 +251,13 @@ def _last_tool_round(turn: list[ChatMessage]) -> int:
     return max((i for i, message in enumerate(turn) if message.role == "assistant" and message.tool_calls), default=-1)
 
 
-def _tool_limit(position: int, last_round: int, turn_is_current: bool, limits: _Limits) -> int:
+def _tool_limit(position: int, last_round: int, turn_is_current: bool, limits: TierLimits) -> int:
     if not turn_is_current:
         return limits.older_turn_tool
     return limits.latest_tool if position > last_round else limits.current_turn_tool
 
 
-def _has_whole_read(turn: list[ChatMessage], path: str, limits: _Limits) -> bool:
+def _has_whole_read(turn: list[ChatMessage], path: str, limits: TierLimits) -> bool:
     """True when the model will see all of `path` from a read_file since the user's last
     message: the read must have worked, and its result must not be cut when sent."""
     call_ids = {
@@ -252,7 +276,17 @@ def _has_whole_read(turn: list[ChatMessage], path: str, limits: _Limits) -> bool
     )
 
 
-def _cut_open_file(content: str, limits: _Limits, mode: AssistantMode) -> str:
+def cut_keeping_start(text: str, limit: int, note: str) -> str:
+    """Keeps the start of `text`, with a marker for what was left out."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n[... {len(text) - limit} characters cut. {note} ...]"
+
+
+def _cut_open_file(content: str, limits: TierLimits, mode: AssistantMode, language: str) -> str:
+    if language == VSCODE_LANGUAGE:
+        # The selection comes first in VS Code's file text, so keeping the start keeps it.
+        return cut_keeping_start(content, limits.open_file, _VSCODE_CUT_NOTE)
     note = (
         "You have not seen this part, so don't use a path-labelled block for this file"
         if mode == "ask"
@@ -262,7 +296,7 @@ def _cut_open_file(content: str, limits: _Limits, mode: AssistantMode) -> str:
 
 
 def _context_block(
-    context: ChatContext, turn: list[ChatMessage], mentioned: list[str], limits: _Limits, mode: AssistantMode, parts: SentParts
+    context: ChatContext, turn: list[ChatMessage], mentioned: list[str], limits: TierLimits, mode: AssistantMode, parts: SentParts
 ) -> str:
     lines = [f"language: {context.language}"]
     if context.files:
@@ -283,7 +317,7 @@ def _context_block(
         elif limits.open_file == 0:
             lines.append(f"open_file: {name} (content left out to save space)")
         else:
-            sent_file = _cut_open_file(context.open_file.content, limits, mode)
+            sent_file = _cut_open_file(context.open_file.content, limits, mode, context.language)
             parts.file_chars += len(sent_file)
             lines.append(f"open_file: {name}\n{sent_file}")
     if context.last_error:
@@ -312,7 +346,7 @@ def _tool_text(message: ChatMessage, limit: int, note: str) -> str:
     return f"ERROR: {text}" if message.is_error else text
 
 
-def _render_tool_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _Limits, parts: SentParts) -> list[ProviderMessage]:
+def _render_tool_turn(turn: list[ChatMessage], turn_is_current: bool, limits: TierLimits, parts: SentParts) -> list[ProviderMessage]:
     """Assistant and tool messages in the provider's tool-call format."""
     last_assistant = _last_tool_round(turn)
     rendered: list[ProviderMessage] = []
@@ -340,7 +374,7 @@ def _render_tool_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _L
     return rendered
 
 
-def _render_flat_turn(turn: list[ChatMessage], turn_is_current: bool, limits: _Limits, parts: SentParts) -> list[ProviderMessage]:
+def _render_flat_turn(turn: list[ChatMessage], turn_is_current: bool, limits: TierLimits, parts: SentParts) -> list[ProviderMessage]:
     """Ask mode has no tools, so earlier tool activity becomes plain text. That is valid
     whether or not the provider accepts tool messages without tools. A result is untrusted,
     so it goes in a data block like the context, not in the assistant's own words."""
@@ -366,7 +400,7 @@ def _render(
     turns: list[list[ChatMessage]],
     context: ChatContext,
     mode: AssistantMode,
-    limits: _Limits,
+    limits: TierLimits,
     mentioned: list[str],
     dropped_turns: int,
 ) -> _Rendered:
@@ -401,7 +435,7 @@ def _current_user_text(
     turn: list[ChatMessage],
     context: ChatContext,
     mode: AssistantMode,
-    limits: _Limits,
+    limits: TierLimits,
     mentioned: list[str],
     dropped_turns: int,
     parts: SentParts,
@@ -472,18 +506,20 @@ def _first_kept_turn(turns: list[list[ChatMessage]]) -> int:
     return first
 
 
-def _fit_to_budget(turns: list[list[ChatMessage]], context: ChatContext, mode: AssistantMode, budget: int) -> _Rendered:
+def _fit_to_budget(
+    turns: list[list[ChatMessage]], context: ChatContext, mode: AssistantMode, budget: int, tiers: tuple[TierLimits, ...]
+) -> _Rendered:
     mentioned = mentioned_files(turns[-1][0].content or "", context.files)
     # First give up the oldest turns, with history trimmed but the current turn whole.
     for start in range(_first_kept_turn(turns), len(turns)):
-        rendered = _render(turns[start:], context, mode, _TIERS[0], mentioned, start)
+        rendered = _render(turns[start:], context, mode, tiers[0], mentioned, start)
         if _estimate_tokens(rendered.messages) <= budget:
             return rendered
 
     # The current turn alone is too big: trim its text, keeping the newest result longest.
     current = turns[-1]
     dropped = len(turns) - 1
-    for limits in _TIERS[1:-1]:
+    for limits in tiers[1:-1]:
         rendered = _render([current], context, mode, limits, mentioned, dropped)
         if _estimate_tokens(rendered.messages) <= budget:
             return rendered
@@ -493,13 +529,13 @@ def _fit_to_budget(turns: list[list[ChatMessage]], context: ChatContext, mode: A
     while remaining is not None:
         current = remaining
         dropped += 1
-        rendered = _render([current], context, mode, _TIERS[-2], mentioned, dropped)
+        rendered = _render([current], context, mode, tiers[-2], mentioned, dropped)
         if _estimate_tokens(rendered.messages) <= budget:
             return rendered
         remaining = _without_oldest_round(current)
 
     # Last resort. If even this is too big, the provider's refusal becomes our 413.
-    return _render([current], context, mode, _TIERS[-1], mentioned, dropped)
+    return _render([current], context, mode, tiers[-1], mentioned, dropped)
 
 
 def optimize_conversation(
@@ -508,11 +544,14 @@ def optimize_conversation(
     mode: AssistantMode,
     max_input_tokens: int,
     prefix_tokens: int = 0,
+    tiers: tuple[TierLimits, ...] | None = None,
 ) -> OptimizedConversation:
     """The conversation to send: history trimmed by age, the newest user message
-    tidied and given its context, and the whole fitted to `max_input_tokens`."""
+    tidied and given its context, and the whole fitted to `max_input_tokens`. `tiers` replaces
+    the default limits (VS Code's); it needs at least two."""
     budget = max(max_input_tokens - prefix_tokens, 1)
-    fitted = _fit_to_budget(_split_turns(_tidied(_repair(messages), context, mode)), context, mode, budget)
+    chosen = tiers if tiers is not None and len(tiers) >= 2 else _TIERS
+    fitted = _fit_to_budget(_split_turns(_tidied(_repair(messages), context, mode)), context, mode, budget, chosen)
     return OptimizedConversation(
         messages=fitted.messages,
         estimated_tokens=_estimate_tokens(fitted.messages),

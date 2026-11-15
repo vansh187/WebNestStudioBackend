@@ -1,4 +1,5 @@
-"""Daily cleanup of old assistant_call_log rows. A failing run is logged, never fatal."""
+"""Daily cleanup of old assistant_call_log rows and of spent VS Code logins. A failing run is
+logged, never fatal."""
 
 import logging
 from datetime import datetime, timedelta, timezone
@@ -7,6 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from database.assistant_usage_persistence import AssistantUsageStore
+from services.extension_auth_service import ExtensionAuthService
 
 logger = logging.getLogger("webnest.assistant")
 
@@ -31,6 +33,30 @@ def register_assistant_jobs(scheduler: AsyncIOScheduler, store: AssistantUsageSt
         IntervalTrigger(hours=24),
         args=[store, retention_days],
         id="assistant_call_log_purge",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + FIRST_RUN_DELAY,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+
+async def purge_extension_sessions(auth: ExtensionAuthService) -> None:
+    """VS Code login codes and refresh tokens that expired over a day ago, and sessions that
+    ended over 30 days ago. Never fatal."""
+    try:
+        removed = await auth.purge()
+        if removed:
+            logger.info("VS Code session purge removed %s rows", removed)
+    except Exception as exc:
+        logger.error("VS Code session purge failed: %s", type(exc).__name__)
+
+
+def register_extension_jobs(scheduler: AsyncIOScheduler, auth: ExtensionAuthService) -> None:
+    scheduler.add_job(
+        purge_extension_sessions,
+        IntervalTrigger(hours=24),
+        args=[auth],
+        id="extension_session_purge",
         replace_existing=True,
         next_run_time=datetime.now(timezone.utc) + FIRST_RUN_DELAY,
         misfire_grace_time=3600,

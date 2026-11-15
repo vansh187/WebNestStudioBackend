@@ -41,6 +41,7 @@ SECRET_RESULT = "SECRET_TOOL_RESULT"
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 MIGRATION = MIGRATIONS / "015_assistant_call_log.sql"
 ADDED_COLUMN = MIGRATIONS / "016_assistant_call_log_turn_chars.sql"
+SURFACE_COLUMN = MIGRATIONS / "025_assistant_call_log_surface.sql"
 HUGE_FILE = "x" * 11_000
 
 
@@ -536,7 +537,9 @@ def test_the_migration_has_every_column_and_index_of_the_model() -> None:
     sql = MIGRATION.read_text(encoding="utf-8")
     body = sql[sql.index("CREATE TABLE") : sql.index(");")]
     in_file = set(re.findall(r"^\s{4}([a-z_]+) ", body, re.MULTILINE))
-    in_file |= set(re.findall(r"ADD COLUMN IF NOT EXISTS ([a-z_]+) ", ADDED_COLUMN.read_text(encoding="utf-8")))
+    surface_sql = SURFACE_COLUMN.read_text(encoding="utf-8")
+    for added in (ADDED_COLUMN.read_text(encoding="utf-8"), surface_sql):
+        in_file |= set(re.findall(r"ADD COLUMN IF NOT EXISTS ([a-z_]+) ", added))
     assert in_file == {column.name for column in AssistantCallLog.__table__.columns}
     for index in AssistantCallLog.__table__.indexes:
-        assert f"IF NOT EXISTS {index.name} " in sql
+        assert f"IF NOT EXISTS {index.name}" in sql + surface_sql

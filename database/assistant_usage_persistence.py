@@ -22,6 +22,8 @@ from database.models import AssistantCallLog, AssistantUsage
 DB_TIMEOUT_SECONDS = 10.0
 WEEK_DAYS = 7
 PURGE_BATCH_SIZE = 5000
+# The call log's surface for the website and Android, and the column's database default.
+DEFAULT_SURFACE = "codelab"
 _READ_ERROR = "Could not read assistant usage right now. Please try again shortly."
 _WRITE_ERROR = "Could not save assistant usage right now. Please try again shortly."
 
@@ -93,6 +95,16 @@ class CallLogEntry:
     sizes: PromptSizes
     first_output_ms: int | None
     duration_ms: int
+    surface: str = DEFAULT_SURFACE
+
+
+@dataclass(frozen=True)
+class TokenTotals:
+    """One user's tokens, all apps and providers: on a UTC day, and over the rolling 7 days
+    ending on it that reserve_call checks."""
+
+    today: int
+    week: int
 
 
 class AssistantUsageStore(Protocol):
@@ -103,6 +115,8 @@ class AssistantUsageStore(Protocol):
     async def settle_tokens(self, key: UsageKey, reserved: TokenCounts, actual: TokenCounts) -> None: ...
 
     async def calls_today(self, user_id: uuid.UUID, day: date) -> int: ...
+
+    async def token_totals(self, user_id: uuid.UUID, day: date) -> TokenTotals: ...
 
     async def log_call(self, entry: CallLogEntry) -> None: ...
 
@@ -208,9 +222,28 @@ class SqlAssistantUsageStore:
         async with self._session(_READ_ERROR) as session:
             return int((await session.execute(statement)).scalar_one())
 
+    async def token_totals(self, user_id: uuid.UUID, day: date) -> TokenTotals:
+        """The meters VS Code shows, in one read over the same window reserve_call checks."""
+        row_tokens = AssistantUsage.input_tokens + AssistantUsage.output_tokens
+        statement = select(
+            func.coalesce(func.sum(case((AssistantUsage.day == day, row_tokens), else_=0)), 0),
+            func.coalesce(func.sum(row_tokens), 0),
+        ).where(
+            AssistantUsage.user_id == user_id,
+            AssistantUsage.day > day - timedelta(days=WEEK_DAYS),
+            AssistantUsage.day <= day,
+        )
+        async with self._session(_READ_ERROR) as session:
+            today, week = (await session.execute(statement)).one()
+        return TokenTotals(today=int(today), week=int(week))
+
     async def log_call(self, entry: CallLogEntry) -> None:
+        # Written only when it isn't the default, so the website and Android keep logging on a
+        # database where migration 025 hasn't added the column yet.
+        surface: dict[str, str] = {} if entry.surface == DEFAULT_SURFACE else {"surface": entry.surface}
         await self._write(
             insert(AssistantCallLog).values(
+                **surface,
                 user_id=entry.key.user_id,
                 provider=entry.key.provider,
                 model=entry.key.model,

@@ -69,6 +69,26 @@ class GenerationUnavailableError(DomainError):
     """Raised when every configured LLM provider failed to produce a result."""
 
 
+class ExtensionError(DomainError):
+    """A VS Code extension refusal with the contract's machine-readable `code`
+    (VSCODE_EXTENSION_BACKEND.md section 2). `retry_after` is in seconds and is also sent as
+    the Retry-After header; `errors` is the {loc, msg} list of a validation error."""
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        retry_after: int | None = None,
+        errors: list[dict[str, object]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.retry_after = retry_after
+        self.errors = errors
+
+
 class GitHubError(DomainError):
     """A CodeLab GitHub sync failure with the contract's machine-readable
     `code` (GITHUB_INTEGRATION_BACKEND.md section 2). `extra` fields are merged

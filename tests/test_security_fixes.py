@@ -143,6 +143,16 @@ class FakeRefreshTokens:
         self._otps.commit_pending()
 
 
+class FakeExtensionSessions:
+    """VS Code sessions: ended in the caller's transaction, so nothing is committed here."""
+
+    def __init__(self):
+        self.revoked = []
+
+    async def revoke_all_for_user(self, user_id, now, reason):
+        self.revoked.append((user_id, reason))
+
+
 class FakeHasher:
     async def hash(self, password):
         return f"hashed:{password}"
@@ -154,6 +164,7 @@ def make_auth(email_enabled=True):
     service._otps = FakeOtps()
     service._users = FakeUsers(service._otps)
     service._refresh_tokens = FakeRefreshTokens(service._otps)
+    service._extension_sessions = FakeExtensionSessions()
     return service
 
 
@@ -163,6 +174,8 @@ def test_correct_code_resets_password_and_is_single_use():
     asyncio.run(service.reset_password(EMAIL, "123456", "new-password"))
     assert service._users.user.password_hash == "hashed:new-password"
     assert service._refresh_tokens.revoked_for == [service._users.user.id]
+    # VS Code logins end with the reset, in the same commit.
+    assert service._extension_sessions.revoked == [(service._users.user.id, "password_reset")]
     with pytest.raises(ValidationError):
         asyncio.run(service.reset_password(EMAIL, "123456", "again"))
 

@@ -10,12 +10,16 @@ from core.security import JWTHandler, OtpGenerator, PasswordHasher
 from database.assistant_payment_persistence import SqlAssistantPaymentStore
 from database.assistant_report_persistence import SqlAssistantReportStore
 from database.assistant_usage_persistence import SqlAssistantUsageStore
+from database.extension_session_persistence import SqlExtensionSessionStore
 from database.models import User
 from database.session import Database
 from services.assistant_llm import build_assistant_fallback, build_assistant_provider
 from services.assistant_payment_service import AssistantPaymentService, OrderRateLimiter
 from services.assistant_report_service import REPORTS_PER_HOUR, AssistantReportService
 from services.assistant_service import ActiveStreamRegistry, AssistantService
+from services.extension_auth_service import ExtensionAuthService
+from services.extension_chat import ExtensionChatService
+from services.extension_rate_limits import ExtensionRateLimits
 from services.google_play_client import HttpGooglePlayClient
 from services.google_play_payment_service import VERIFY_ATTEMPTS_PER_MINUTE, GooglePlayPaymentService
 from services.razorpay_client import HttpRazorpayClient
@@ -86,6 +90,10 @@ class DependencyContainer:
             UserRateLimiter(REPORTS_PER_HOUR, 3600.0),
             self.assistant_provider,
         )
+        # WebNest AI for VS Code. Chat reuses the assistant above (same registry, pass and limits).
+        self.extension_session_store = SqlExtensionSessionStore(self.database.session_scope)
+        self.extension_auth = ExtensionAuthService(app_settings, self.extension_session_store, self.jwt_handler)
+        self.extension_rate_limits = ExtensionRateLimits()
 
 
 container = DependencyContainer(settings)
@@ -211,6 +219,27 @@ def get_google_play_payment_service() -> GooglePlayPaymentService:
 
 def get_assistant_report_service() -> AssistantReportService:
     return container.assistant_reports
+
+
+def get_app_settings() -> Settings:
+    return container.settings
+
+
+def get_extension_auth_service() -> ExtensionAuthService:
+    return container.extension_auth
+
+
+def get_extension_chat_service() -> ExtensionChatService:
+    return ExtensionChatService(
+        settings=container.settings,
+        assistant=get_assistant_service(),
+        payments=container.assistant_payments,
+        usage=container.assistant_usage_store,
+    )
+
+
+def get_extension_rate_limits() -> ExtensionRateLimits:
+    return container.extension_rate_limits
 
 
 def get_plan_pdf_service() -> PlanPdfService:
