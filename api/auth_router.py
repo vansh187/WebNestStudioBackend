@@ -1,6 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 
-from core.dependencies import get_auth_service, get_client_ip, get_current_user, get_email_service
+from core.dependencies import get_auth_service, get_client_ip, get_current_user, get_email_service, get_login_rate_limiter
+from core.exceptions import UnauthorizedError
 from database.models import User
 from schemas.auth_schemas import (
     LoginRequest,
@@ -17,6 +18,7 @@ from schemas.auth_schemas import (
 )
 from services.auth_service import AuthService
 from services.email_service import EmailService
+from services.login_rate_limiter import LoginRateLimiter
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -67,10 +69,27 @@ async def login(
     request: Request,
     auth_service: AuthService = Depends(get_auth_service),
     client_ip: str | None = Depends(get_client_ip),
+    limiter: LoginRateLimiter = Depends(get_login_rate_limiter),
 ) -> TokenResponse:
-    access_token, refresh_token, _ = await auth_service.login(
-        payload.email, payload.password, request.headers.get("user-agent"), client_ip
-    )
+    attempt, retry_after = limiter.begin_attempt(payload.email)
+    if attempt is None:
+        retry_after = retry_after or 1
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed login attempts. Try again in {retry_after}s",
+            headers={"Retry-After": str(retry_after)},
+        )
+    try:
+        access_token, refresh_token, _ = await auth_service.login(
+            payload.email, payload.password, request.headers.get("user-agent"), client_ip
+        )
+    except UnauthorizedError:
+        limiter.finish_failure(payload.email, attempt)
+        raise
+    except BaseException:
+        limiter.release_attempt(payload.email, attempt)
+        raise
+    limiter.finish_success(payload.email, attempt)
     return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 

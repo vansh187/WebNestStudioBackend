@@ -190,6 +190,8 @@ No auth required.
 { "detail": "Please verify your email address before logging in" }
 ```
 
+**Error `429`** — 10 failed login attempts for the same account within 15 minutes. Concurrent attempts reserve a slot before credential verification. The response includes a `Retry-After` header with the remaining wait in seconds. A successful login clears recorded failures.
+
 ---
 
 ### `POST /api/auth/refresh`

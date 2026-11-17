@@ -20,6 +20,7 @@ from services.assistant_service import ActiveStreamRegistry, AssistantService
 from services.extension_auth_service import ExtensionAuthService
 from services.extension_chat import ExtensionChatService
 from services.extension_rate_limits import ExtensionRateLimits
+from services.login_rate_limiter import LoginRateLimiter
 from services.google_play_client import HttpGooglePlayClient
 from services.google_play_payment_service import VERIFY_ATTEMPTS_PER_MINUTE, GooglePlayPaymentService
 from services.razorpay_client import HttpRazorpayClient
@@ -94,6 +95,7 @@ class DependencyContainer:
         self.extension_session_store = SqlExtensionSessionStore(self.database.session_scope)
         self.extension_auth = ExtensionAuthService(app_settings, self.extension_session_store, self.jwt_handler)
         self.extension_rate_limits = ExtensionRateLimits()
+        self.login_rate_limiter = LoginRateLimiter()
 
 
 container = DependencyContainer(settings)
@@ -240,6 +242,10 @@ def get_extension_chat_service() -> ExtensionChatService:
 
 def get_extension_rate_limits() -> ExtensionRateLimits:
     return container.extension_rate_limits
+
+
+def get_login_rate_limiter() -> LoginRateLimiter:
+    return container.login_rate_limiter
 
 
 def get_plan_pdf_service() -> PlanPdfService:
