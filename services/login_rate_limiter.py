@@ -26,8 +26,7 @@ class LoginRateLimiter:
         self._clock = clock
         self._account_attempts: dict[str, deque[_Attempt]] = {}
 
-    @staticmethod
-    def _account_key(email: str) -> str:
+    def _account_key(self, email: str) -> str:
         # Match the exact identifier used by UserPersistence.get_by_email().
         normalized = email.strip()
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -83,15 +82,13 @@ class LoginRateLimiter:
             events = self._account_attempts.setdefault(key, deque())
         return events
 
-    @staticmethod
-    def _remove(events: deque[_Attempt], target: _Attempt) -> None:
+    def _remove(self, events: deque[_Attempt], target: _Attempt) -> None:
         for event in events:
             if event is target:
                 events.remove(event)
                 return
 
-    @staticmethod
-    def _retry_after(oldest: float, now: float) -> int:
+    def _retry_after(self, oldest: float, now: float) -> int:
         return max(1, int(oldest + ACCOUNT_WINDOW_SECONDS - now + 0.999))
 
     def _trim(self) -> None:
