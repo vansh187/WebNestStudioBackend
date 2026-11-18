@@ -317,7 +317,7 @@ class ExtContext(_Lenient):
 class ExtensionChatRequest(_Lenient):
     conversation_id: Annotated[str | None, BeforeValidator(_clean(MAX_ID_CHARS, single_line=True))] = None
     client_request_id: Annotated[str | None, BeforeValidator(_clean(MAX_ID_CHARS, single_line=True))] = None
-    # Accepted and ignored: VS Code chat is always Ask mode (no tools).
+    # Unknown or missing values are handled as Ask by the backend adapter.
     mode: Annotated[str | None, BeforeValidator(_clean(20, single_line=True))] = None
     messages: Annotated[list[ExtMessage], BeforeValidator(_newest(MAX_RECEIVED_MESSAGES)), Field(min_length=1)]
     context: ExtContext | None = None

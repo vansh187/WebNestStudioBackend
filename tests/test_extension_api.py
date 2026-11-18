@@ -20,6 +20,7 @@ from services.assistant_llm import (
     ProviderUnavailableError,
     StreamOpened,
     TextDelta,
+    ToolCallEvent,
     UsageEvent,
 )
 from tests.test_assistant import FakeProvider, parse_sse
@@ -720,6 +721,54 @@ def test_an_empty_context_still_answers_over_http(world: World) -> None:
         if context is None:
             body.pop("context")
         assert world.client.post("/api/extension/chat", json=body, headers=world.headers(tokens)).status_code == 200
+
+
+def test_agent_mode_streams_vscode_tools_and_keeps_the_environment_private() -> None:
+    provider = FakeProvider([
+        StreamOpened(),
+        ToolCallEvent("call-1", "read_file", {"path": "src/main.py"}),
+        UsageEvent(20, 5),
+        FinishedEvent("tool_calls"),
+    ])
+    world = World(provider=provider)
+    world.give_prime()
+    tokens = world.login()
+    body = chat_body(
+        "Inspect the source",
+        context={"os": "win32", "shell": r"C:\Users\Private Name\pwsh.exe"},
+        mode="  AgEnT ",
+    )
+
+    response = world.client.post("/api/extension/chat", json=body, headers=world.headers(tokens))
+    events = parse_sse(response.text)
+    assert response.status_code == 200
+    assert [event for event, _ in events] == ["start", "tool_call", "usage", "done"]
+    assert events[1][1]["name"] == "read_file"
+    sent = provider.requests[0]
+    assert [tool["function"]["name"] for tool in sent.tools] == [
+        "list_dir", "read_file", "search_text", "get_diagnostics",
+        "create_file", "edit_file", "delete_file", "run_command",
+    ]
+    assert "run_project" not in sent.system
+    assert "(VS Code on Windows; commands run in pwsh.exe.)" in str(sent.messages)
+    assert "Private Name" not in str(sent.messages)
+    assert world.usage.call_log[-1].mode == "agent"
+
+
+def test_unknown_tool_in_agent_history_is_refused_before_provider_call(world: World) -> None:
+    world.give_prime()
+    tokens = world.login()
+    body = chat_body()
+    body["mode"] = "agent"
+    body["messages"] = [
+        {"role": "user", "content": "Continue"},
+        {"role": "assistant", "tool_calls": [{"id": "bad-1", "name": "run_project", "arguments": {}}]},
+    ]
+
+    response = world.client.post("/api/extension/chat", json=body, headers=world.headers(tokens))
+    assert_error(response, 422, "validation_error")
+    assert response.json()["detail"] == "This chat uses a tool WebNest AI doesn't offer in VS Code. Please start a new chat."
+    assert world.provider.requests == []
 
 
 def test_a_withheld_file_sends_the_note_and_none_of_the_file(world: World) -> None:

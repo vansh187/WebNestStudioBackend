@@ -94,10 +94,11 @@ _VSCODE_FILE_SHARES: tuple[float, ...] = (1.0, 0.6, 0.3, 0.15)
 _VSCODE_ERRORS: tuple[int, ...] = (4000, 3000, 2000, 1500)
 _VSCODE_CURRENT_TOOL: tuple[int, ...] = (4000, 2000, 1000, 500)
 _VSCODE_OLDER_TOOL: tuple[int, ...] = (400, 200, 0, 0)
+_VSCODE_AGENT_LATEST_TOOL: tuple[int, ...] = (16_000, 12_000, 8_000, 4_000)
 _VSCODE_CUT_NOTE = "The rest of this file was not shared to save space. If you need it, ask the user to select those lines"
 
 
-def vscode_tiers(max_context_chars: int) -> tuple[TierLimits, ...]:
+def vscode_tiers(max_context_chars: int, mode: AssistantMode = "ask") -> tuple[TierLimits, ...]:
     """The tiers for language "vscode". The first keeps all the file text the extension may
     send (`max_context_chars`, also sent to it in /me), so nothing is cut silently."""
     file_chars = max(int(max_context_chars), 1000)
@@ -105,11 +106,17 @@ def vscode_tiers(max_context_chars: int) -> tuple[TierLimits, ...]:
         TierLimits(
             older_turn_tool=older,
             current_turn_tool=current,
-            latest_tool=max(current, 4000),
+            latest_tool=latest if mode == "agent" else max(current, 4000),
             open_file=int(file_chars * share),
             last_error=error,
         )
-        for share, error, current, older in zip(_VSCODE_FILE_SHARES, _VSCODE_ERRORS, _VSCODE_CURRENT_TOOL, _VSCODE_OLDER_TOOL)
+        for share, error, current, older, latest in zip(
+            _VSCODE_FILE_SHARES,
+            _VSCODE_ERRORS,
+            _VSCODE_CURRENT_TOOL,
+            _VSCODE_OLDER_TOOL,
+            _VSCODE_AGENT_LATEST_TOOL,
+        )
     )
 
 
@@ -442,7 +449,7 @@ def _current_user_text(
 ) -> str:
     pieces = [_context_block(context, turn, mentioned, limits, mode, parts)]
     # The hint's choices are about code, and would send a plain question towards run_project.
-    if mode == "agent" and context.language != GENERAL_LANGUAGE:
+    if mode == "agent" and context.language not in (GENERAL_LANGUAGE, VSCODE_LANGUAGE):
         pieces.append(task_hint(text, bool(context.last_error)))
     if dropped_turns:
         pieces.append("Earlier messages in this chat were left out to save space.")

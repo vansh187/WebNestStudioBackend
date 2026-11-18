@@ -81,7 +81,7 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def check_coding_agent_message_length(self) -> "ChatRequest":
-        if self.mode == "agent" and self.context.language != GENERAL_LANGUAGE:
+        if self.mode == "agent" and self.context.language not in (GENERAL_LANGUAGE, VSCODE_LANGUAGE):
             for message in self.messages:
                 if message.role == "user" and len(message.content or "") > MAX_USER_MESSAGE_CHARS:
                     raise ValueError(f"A user message can be at most {MAX_USER_MESSAGE_CHARS} characters")
