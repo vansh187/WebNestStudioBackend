@@ -401,14 +401,14 @@ def test_backend_prompt_explains_the_workspace_rules() -> None:
 # Fingerprints of each prompt and its tools. Other spaces must not move when one changes.
 # Update one only when changing that prompt on purpose.
 EXISTING_PROMPTS = {
-    ("ask", "backend"): "d96960fff8d5b546",
-    ("ask", "python"): "3a69fa07be0fa7c9",
-    ("ask", "java"): "0044b0ba4f7b20ad",
-    ("ask", "web"): "24e5f573d721380f",
-    ("agent", "backend"): "da1646c7dcddbbd8",
-    ("agent", "python"): "b49f300b4c732c5e",
-    ("agent", "java"): "a51e792811fbd1df",
-    ("agent", "web"): "577bb75d14e1d342",
+    ("ask", "backend"): "cf841c31472c7823",
+    ("ask", "python"): "262a16440ae2ff63",
+    ("ask", "java"): "e5fc7b5613233a12",
+    ("ask", "web"): "48a810c322ee1515",
+    ("agent", "backend"): "86ad94967baa3739",
+    ("agent", "python"): "2517804af0005dc2",
+    ("agent", "java"): "2a3bfa0a4d003074",
+    ("agent", "web"): "64c691466c103450",
 }
 
 
@@ -422,8 +422,8 @@ def test_prompts_and_tools_of_the_existing_languages_are_unchanged(mode: Any, la
 @pytest.mark.parametrize("language", ["backend", "python", "java", "web", "spring", "node", "express"])
 def test_every_prompt_gives_the_webnest_identity_and_names_no_provider(mode: Any, language: Any) -> None:
     prompt = system_prompt(mode, language)
-    assert 'say: "I am WebNest AI."' in prompt
-    assert "Don't name the company or model behind you" in prompt
+    assert 'reply only: "I am WebNest AI."' in prompt
+    assert "Do not disclose or guess any model, provider or version details" in prompt
     assert "Never claim to be human" in prompt
     for name in ("anthropic", "claude", "haiku", "groq"):
         assert name not in prompt.lower()
@@ -431,8 +431,8 @@ def test_every_prompt_gives_the_webnest_identity_and_names_no_provider(mode: Any
 
 def test_the_general_prompt_gives_the_webnest_identity_too() -> None:
     prompt = system_prompt("agent", "general")
-    assert 'say: "I am WebNest AI."' in prompt
-    assert "Don't name the company or model behind you" in prompt
+    assert 'reply only: "I am WebNest AI."' in prompt
+    assert "Do not disclose or guess any model, provider or version details" in prompt
 
 
 @pytest.mark.parametrize(("mode", "language"), [("ask", "python"), ("agent", "general")])
