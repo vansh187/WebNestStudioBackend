@@ -489,7 +489,7 @@ class AssistantService:
         # VS Code has its own budget and tiers, for bigger files; CodeLab's are unchanged.
         if language == VSCODE_LANGUAGE:
             budget = self._settings.extension_max_input_tokens
-            tiers = vscode_tiers(self._settings.extension_max_context_chars)
+            tiers = vscode_tiers(self._settings.extension_max_context_chars, payload.mode)
         else:
             budget, tiers = self._settings.assistant_max_input_tokens, None
         optimized = optimize_conversation(payload.messages, payload.context, payload.mode, budget, prefix_tokens, tiers)

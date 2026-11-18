@@ -1,7 +1,7 @@
 """WebNest AI for VS Code on top of the existing CodeLab assistant.
 
-A VS Code request becomes an ordinary ChatRequest (language "vscode", Ask mode) and goes
-through AssistantService.open_chat unchanged, so the prompt optimizer, the Prime pass, the
+A VS Code request becomes an ordinary ChatRequest (language "vscode", Ask or Agent mode) and
+goes through AssistantService.open_chat unchanged, so the prompt optimizer, the Prime pass, the
 daily and weekly limits shared with the website and Android, the provider fallback, the
 one-stream-per-user rule and the call log all apply. Nothing here calls the AI provider
 itself. The assistant's refusals become the contract's coded errors, and each is logged with
@@ -64,6 +64,7 @@ from schemas.extension_schemas import (
 )
 from services.assistant_payment_service import AssistantPaymentService
 from services.assistant_prompt_optimizer import CHARS_PER_TOKEN, cut_middle
+from services.assistant_prompts import tool_names, tools_for
 from services.assistant_service import AssistantChatStream, AssistantRateLimitedError, AssistantService
 
 logger = logging.getLogger("webnest.extension.chat")
@@ -127,9 +128,14 @@ class VSCodeRequestAdapter:
 
     def to_chat_request(self, payload: ExtensionChatRequest) -> ChatRequest:
         context = payload.context or ExtContext()
+        self._validate_history_tools(payload.messages)
+        agent_mode = bool(payload.mode and payload.mode.strip().casefold() == "agent")
+        if agent_mode and self._agent_steps(payload.messages) >= MAX_AGENT_STEPS:
+            agent_mode = False
         active = context.active_file
         self._check_segments(active)
-        note = self._withheld_note(active)
+        notes = [note for note in (self._withheld_note(active), self._environment_line(context) if agent_mode else None) if note]
+        note = "\n".join(notes) or None
         messages = self._messages(payload.messages, note)
         chat_context = ChatContext.model_construct(
             language=VSCODE_LANGUAGE,
@@ -138,11 +144,47 @@ class VSCodeRequestAdapter:
             last_error=self._problems(context.diagnostics, active.path if active is not None else None),
         )
         try:
-            return ChatRequest(mode="ask", messages=messages, context=chat_context)
+            return ChatRequest(mode="agent" if agent_mode else "ask", messages=messages, context=chat_context)
         except PydanticValidationError as exc:
             # Not expected: everything was checked above. Still a 422, never a 500.
             logger.warning("VS Code request could not be converted: %s errors", exc.error_count())
             raise _validation(["body", "messages"], "The messages could not be read") from exc
+
+    def _validate_history_tools(self, messages: list[ExtMessage]) -> None:
+        allowed = tool_names(tools_for("agent", VSCODE_LANGUAGE))
+        if any(
+            call.name not in allowed
+            for message in messages
+            if message.role == "assistant"
+            for call in message.tool_calls or []
+        ):
+            raise ExtensionError(
+                422,
+                "validation_error",
+                "This chat uses a tool WebNest AI doesn't offer in VS Code. Please start a new chat.",
+            )
+
+    def _agent_steps(self, messages: list[ExtMessage]) -> int:
+        steps = 0
+        for message in reversed(messages):
+            if message.role == "user" and (message.content or "").strip():
+                break
+            if message.role == "assistant" and message.tool_calls:
+                steps += 1
+        return steps
+
+    def _environment_line(self, context: ExtContext) -> str:
+        os_names = {"win32": "Windows", "darwin": "macOS", "linux": "Linux"}
+        os_name = os_names.get((context.os or "").strip().casefold())
+        parts = ["VS Code on " + os_name] if os_name else ["VS Code"]
+        raw_shell = (context.shell or "").replace("\\", "/").rsplit("/", 1)[-1]
+        shell = "".join(
+            char for char in raw_shell
+            if char.isascii() and (char.isalpha() or char.isdigit() or char in "._+-")
+        )[:40]
+        if shell:
+            parts.append(f"commands run in {shell}")
+        return "(" + "; ".join(parts) + ".)"
 
     def _check_segments(self, active: ActiveFile | None) -> None:
         if active is None or not active.segments:
